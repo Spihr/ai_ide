@@ -1,0 +1,22 @@
+[package]
+name = "ai-ide-workspace"
+description = "AI IDE 工作区：路径安全、文件读写、目录树与文件监听"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ai-ide-protocol = { workspace = true }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+ignore = { workspace = true }
+notify = { workspace = true }
+encoding_rs = { workspace = true }
+sha2 = { workspace = true }
+trash = { workspace = true }

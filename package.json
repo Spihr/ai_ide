@@ -1,0 +1,30 @@
+{
+  "name": "ai-ide",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AI IDE —— Electron 外壳 + Rust 内核的桌面 AI 开发环境",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "scripts": {
+    "dev": "pnpm --filter @ai-ide/desktop dev",
+    "build": "pnpm --filter @ai-ide/desktop build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "clean": "pnpm -r exec node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "core:build": "cargo build -p ai-ide-core",
+    "core:build:release": "cargo build --release -p ai-ide-core",
+    "core:test": "cargo test --workspace",
+    "smoke:core": "node scripts/smoke-core.mjs",
+    "smoke:m1": "node scripts/smoke-m1.mjs",
+    "e2e:m1": "node scripts/e2e-m1.mjs",
+    "bench:m1": "node scripts/bench-m1.mjs",
+    "types:gen": "node scripts/gen-types.mjs",
+    "verify:m0": "cargo test --workspace && cargo build -p ai-ide-core && node scripts/smoke-core.mjs && pnpm typecheck && pnpm test",
+    "verify:m1": "cargo test --workspace && cargo build -p ai-ide-core && node scripts/smoke-core.mjs && node scripts/smoke-m1.mjs && pnpm build && node scripts/e2e-m1.mjs && pnpm typecheck && pnpm test"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.64.1"
+  }
+}

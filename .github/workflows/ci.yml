@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust（协议 + 内核）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 格式检查
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        # 注：ts-rs 会输出若干 "failed to parse serde attribute" 的宏诊断，
+        # 它们不参与 -D warnings 的升级，因此这里可以安全地要求零告警。
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 单元测试
+        run: cargo test --workspace
+
+      - name: 构建内核
+        run: cargo build -p ai-ide-core
+
+      # 直接对内核二进制做协议冒烟：握手、ping 往返、错误路径、优雅退出。
+      - name: 协议冒烟
+        run: node scripts/smoke-core.mjs
+
+  desktop:
+    name: Desktop（类型 + 检查 + 测试）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 重新生成协议类型
+        run: pnpm types:gen
+
+      # generated/ 是构建产物但入库，因此必须保证「重新生成后无差异」，
+      # 否则说明有人手改了生成文件、或忘了把 Rust 侧的改动同步过来。
+      - name: 校验协议类型无漂移
+        run: git diff --exit-code -- packages/shared-types/src/generated
+
+      - name: 类型检查
+        run: pnpm typecheck
+
+      - name: 单元测试
+        run: pnpm test
+
+      - name: 构建外壳
+        run: pnpm --filter @ai-ide/desktop build

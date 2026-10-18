@@ -1,0 +1,13 @@
+[package]
+name = "ai-ide-protocol"
+description = "Main <-> Core 的 JSON-RPC 2.0 协议契约（唯一来源）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+ts-rs = { version = "10", features = ["serde-json-impl"] }

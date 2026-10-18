@@ -1,0 +1,31 @@
+{
+  "name": "@ai-ide/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Electron 外壳：进程编排、策略闸门与 UI 宿主",
+  "main": "./out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@ai-ide/shared-types": "workspace:*",
+    "monaco-editor": "^0.57.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "electron": "^44.9.0",
+    "electron-vite": "^6.0.0",
+    "typescript": "^5.6.0",
+    "vite": "^8.3.4",
+    "vitest": "^3.0.0"
+  }
+}

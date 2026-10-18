@@ -1,0 +1,19 @@
+[package]
+name = "ai-ide-indexer"
+description = "AI IDE 检索内核：文件路径索引与内容检索"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ai-ide-protocol = { workspace = true }
+# 复用工作区的忽略规则，避免「树里看不见、搜索却搜得到」这类漂移。
+ai-ide-workspace = { workspace = true }
+
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+ignore = { workspace = true }
+globset = { workspace = true }
+regex = { workspace = true }

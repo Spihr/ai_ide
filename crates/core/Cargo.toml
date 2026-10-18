@@ -1,0 +1,28 @@
+[package]
+name = "ai-ide-core"
+description = "AI IDE 内核：索引 / 解析 / LLM / Agent（M0 阶段仅实现通信骨架）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ai-ide-core"
+path = "src/main.rs"
+
+[dependencies]
+ai-ide-protocol = { workspace = true }
+ai-ide-workspace = { workspace = true }
+ai-ide-indexer = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -1,0 +1,201 @@
+//! 内核运行期状态。
+//!
+//! M0 只保存两样东西：进程启动时刻（用于上报 uptime）与取消登记表。
+//! 后续里程碑会把工作区句柄、索引、会话、Provider 配置等挂到这里。
+
+use crate::peer::Peer;
+use ai_ide_indexer::FileIndex;
+use ai_ide_workspace::{Workspace, WorkspaceError, WorkspaceManager};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+/// 全局状态。
+///
+/// M0 只保存进程启动时刻与取消登记表；M1 起挂上工作区注册表、文件索引缓存
+/// 与对端句柄（用于主动推送 `workspace.changed` / `workspace.indexed` 事件）。
+pub struct AppState {
+    started_at: Instant,
+    /// 已请求取消、但尚未被对应处理器消费的请求 id。
+    cancelled: Mutex<HashSet<String>>,
+    /// 已打开的工作区。协议里每个工作区都有独立 id，注册表天然支持多例。
+    workspaces: WorkspaceManager,
+    /// 各工作区的文件路径索引，键为 `workspace_id`。
+    indices: Mutex<HashMap<String, Arc<FileIndex>>>,
+    /// 当前活动工作区；协议中不带 `workspace_id` 的方法默认作用于它。
+    active: Mutex<Option<String>>,
+    /// 对端句柄，用于主动推送事件。单测里不注入，事件静默丢弃。
+    peer: Mutex<Option<Arc<Peer>>>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AppState {
+    pub fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            cancelled: Mutex::new(HashSet::new()),
+            workspaces: WorkspaceManager::new(),
+            indices: Mutex::new(HashMap::new()),
+            active: Mutex::new(None),
+            peer: Mutex::new(None),
+        }
+    }
+
+    /// 进程已运行时长（毫秒）。
+    pub fn uptime_ms(&self) -> u64 {
+        self.started_at.elapsed().as_millis() as u64
+    }
+
+    /// 登记一条取消请求。
+    pub fn mark_cancelled(&self, id: &str) {
+        if let Ok(mut set) = self.cancelled.lock() {
+            set.insert(id.to_string());
+        }
+    }
+
+    /// 该请求是否已被取消。
+    pub fn is_cancelled(&self, id: &str) -> bool {
+        self.cancelled
+            .lock()
+            .map(|set| set.contains(id))
+            .unwrap_or(false)
+    }
+
+    /// 消费掉取消登记（请求处理结束时调用，避免登记表无限增长）。
+    pub fn clear_cancellation(&self, id: &str) {
+        if let Ok(mut set) = self.cancelled.lock() {
+            set.remove(id);
+        }
+    }
+
+    /// 当前待消费的取消登记数量（测试用）。
+    pub fn pending_cancellations(&self) -> usize {
+        self.cancelled.lock().map(|set| set.len()).unwrap_or(0)
+    }
+
+    // -----------------------------------------------------------------------
+    // 工作区与索引（M1）
+    // -----------------------------------------------------------------------
+
+    /// 工作区注册表。
+    pub fn workspaces(&self) -> &WorkspaceManager {
+        &self.workspaces
+    }
+
+    /// 注入对端句柄；注入后事件才能推给主进程。
+    pub fn attach_peer(&self, peer: Arc<Peer>) {
+        if let Ok(mut slot) = self.peer.lock() {
+            *slot = Some(peer);
+        }
+    }
+
+    /// 对端句柄；未注入时为 `None`。
+    pub fn peer(&self) -> Option<Arc<Peer>> {
+        self.peer.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// 记为当前活动工作区。
+    pub fn set_active(&self, workspace_id: &str) {
+        if let Ok(mut slot) = self.active.lock() {
+            *slot = Some(workspace_id.to_string());
+        }
+    }
+
+    /// 清掉活动标记（仅当它正是给定的工作区）。
+    pub fn clear_active(&self, workspace_id: &str) {
+        if let Ok(mut slot) = self.active.lock() {
+            if slot.as_deref() == Some(workspace_id) {
+                *slot = None;
+            }
+        }
+    }
+
+    /// 当前活动工作区 id。
+    pub fn active_id(&self) -> Option<String> {
+        self.active.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// 取工作区：给了 id 就按 id 取，没给就退回活动工作区。
+    ///
+    /// 协议里 `workspace.tree` 带 `workspace_id`，而 `read_file` / `write_file`
+    /// 这类高频方法不带——它们默认作用于活动工作区，路径越界仍由 `PathGuard` 拦。
+    pub fn workspace(&self, workspace_id: Option<&str>) -> Result<Arc<Workspace>, WorkspaceError> {
+        let id = match workspace_id {
+            Some(id) if !id.trim().is_empty() => id.to_string(),
+            _ => self
+                .active_id()
+                .ok_or_else(|| WorkspaceError::NotOpened("尚未打开任何工作区".to_string()))?,
+        };
+        self.workspaces.get(&id)
+    }
+
+    /// 取已建好的索引。
+    pub fn index(&self, workspace_id: &str) -> Option<Arc<FileIndex>> {
+        self.indices.lock().ok()?.get(workspace_id).map(Arc::clone)
+    }
+
+    /// 缓存索引。
+    pub fn put_index(&self, workspace_id: &str, index: Arc<FileIndex>) {
+        if let Ok(mut map) = self.indices.lock() {
+            map.insert(workspace_id.to_string(), index);
+        }
+    }
+
+    /// 丢弃索引（关闭工作区时调用）。
+    pub fn drop_index(&self, workspace_id: &str) {
+        if let Ok(mut map) = self.indices.lock() {
+            map.remove(workspace_id);
+        }
+    }
+
+    /// 已打开的工作区数量。
+    pub fn workspace_count(&self) -> usize {
+        self.workspaces.count()
+    }
+}
+
+/// 当前 Unix 毫秒时间戳。系统时钟异常时回退为 `0`。
+pub fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uptime_is_monotonic() {
+        let state = AppState::new();
+        let first = state.uptime_ms();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(state.uptime_ms() >= first);
+    }
+
+    #[test]
+    fn cancellation_roundtrip() {
+        let state = AppState::new();
+        assert!(!state.is_cancelled("abc"));
+        state.mark_cancelled("abc");
+        assert!(state.is_cancelled("abc"));
+        assert_eq!(state.pending_cancellations(), 1);
+        state.clear_cancellation("abc");
+        assert!(!state.is_cancelled("abc"));
+        assert_eq!(state.pending_cancellations(), 0);
+    }
+
+    #[test]
+    fn now_ms_is_plausible() {
+        // 2020-01-01 之后、2100 之前
+        let ts = now_ms();
+        assert!(ts > 1_577_836_800_000, "时间戳看起来不对: {ts}");
+        assert!(ts < 4_102_444_800_000, "时间戳看起来不对: {ts}");
+    }
+}

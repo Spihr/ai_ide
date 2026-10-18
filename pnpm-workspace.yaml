@@ -1,0 +1,10 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+
+# 依赖的安装脚本默认被 pnpm 拦截，这里显式放行需要的两个：
+#   - esbuild：落位平台原生可执行文件（vite / electron-vite 依赖）
+#   - electron：postinstall 下载 Chromium 二进制
+allowBuilds:
+  esbuild: true
+  electron: true

@@ -1,0 +1,65 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/protocol",
+    "crates/workspace",
+    "crates/indexer",
+    "crates/core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.79"
+license = "MIT"
+repository = "https://example.invalid/ai-ide"
+
+[workspace.dependencies]
+# 序列化
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# 错误处理
+thiserror = "2.0"
+anyhow = "1.0"
+
+# 异步运行时
+tokio = { version = "1.40", features = [
+    "rt-multi-thread",
+    "macros",
+    "io-std",
+    "io-util",
+    "sync",
+    "time",
+    "signal",
+] }
+
+# 可观测性
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# 工具
+uuid = { version = "1.10", features = ["v4", "serde"] }
+
+# 文件系统与检索
+ignore = "0.4"
+globset = "0.4"
+regex = "1.11"
+notify = "6.1"
+encoding_rs = "0.8"
+sha2 = "0.10"
+trash = "3.3"
+
+# 内部 crate
+ai-ide-protocol = { path = "crates/protocol" }
+ai-ide-workspace = { path = "crates/workspace" }
+ai-ide-indexer = { path = "crates/indexer" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+# 内核开发期需要可用的 panic 信息，不做 abort
+panic = "unwind"

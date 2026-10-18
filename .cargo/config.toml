@@ -1,0 +1,12 @@
+# 项目级 cargo 配置：使用国内镜像加速索引与下载。
+#
+# 之所以放在项目内而不是用户级 `~/.cargo/config.toml`：影响范围只限本仓库，
+# 不会影响用户其它 Rust 项目，也不需要动全局环境。
+[source.crates-io]
+replace-with = "ustc"
+
+[source.ustc]
+registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"
+
+[net]
+git-fetch-with-cli = true
