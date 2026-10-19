@@ -29,6 +29,21 @@ import {
 
 import type { AiEvent, CredentialStatus } from '../../shared/ipc'
 import { aiApi } from './ai-api'
+import {
+  buildChatContext,
+  chipLabel,
+  contextKey,
+  makeTokenEstimate,
+  normalizePath,
+  rankCompletions,
+  toRelativePath,
+  type ChipKind,
+  type CompletionItem,
+  type ContextChip,
+  type TokenEstimate
+} from './context-completion'
+import { getEditorState } from './store'
+import { workspaceApi } from './workspace-api'
 
 /** 协议错误码 → 人话提示（Rust `error.rs` 的 2xxx 分区）。 */
 const ERROR_HINTS: Record<number, string> = {
@@ -72,6 +87,22 @@ export interface ProviderFormInput {
   timeout_ms: number | null
 }
 
+/** `@` 补全菜单状态：候选、选中项、失败原因都在这里。 */
+export interface CompletionState {
+  open: boolean
+  /** `@` 后面那截查询串（不含 `@`，可能含目录前缀）。 */
+  query: string
+  items: CompletionItem[]
+  activeIndex: number
+  loading: boolean
+  /** 拉候选失败时的可读原因（如「先打开一个工作区」）。 */
+  error: string | null
+}
+
+function emptyCompletion(): CompletionState {
+  return { open: false, query: '', items: [], activeIndex: 0, loading: false, error: null }
+}
+
 export interface AiState {
   providers: ProviderView[]
   models: ModelView[]
@@ -91,6 +122,11 @@ export interface AiState {
   finishReason: FinishReason | null
   /** 最近一条可读错误提示（异常路径呈现用）。 */
   hint: string | null
+  /** 已选的上下文引用（chip）；数组顺序即注入顺序。 */
+  chips: ContextChip[]
+  completion: CompletionState
+  /** 最近一次发送前的 token 估算（超限时含提示）。 */
+  tokenEstimate: TokenEstimate | null
 }
 
 function initialState(): AiState {
@@ -109,7 +145,10 @@ function initialState(): AiState {
     streamId: null,
     usage: null,
     finishReason: null,
-    hint: null
+    hint: null,
+    chips: [],
+    completion: emptyCompletion(),
+    tokenEstimate: null
   }
 }
 
@@ -148,6 +187,218 @@ function describe(error: unknown): string {
   const code = errorCodeFromMessage(message)
   const hint = code !== null ? hintForErrorCode(code) : ''
   return hint.length > 0 && !message.includes(hint) ? `${message}｜${hint}` : message
+}
+
+// ---------------------------------------------------------------------------
+// 上下文引用（M3 外壳侧）
+// ---------------------------------------------------------------------------
+
+/** 当前工作区句柄；引用必须归属某个工作区，没打开时只能提示用户。 */
+function activeWorkspace(): { id: string; root: string } | null {
+  const workspace = getEditorState().workspace
+  return workspace ? { id: workspace.workspace_id, root: workspace.root } : null
+}
+
+/** 已选引用的去重键，用于「已经加进来的别再出现在候选里」。 */
+function selectedKeys(): string[] {
+  return state.chips.map((chip) => contextKey(chip.kind, chip.path))
+}
+
+/**
+ * 从内核取候选：目录靠 `workspace.tree` 列一层，文件靠 `search.files` 模糊匹配。
+ *
+ * 两者都是内核既有能力，外壳不自己遍历磁盘——这样补全看到的和文件树、搜索结果
+ * 永远是同一份数据。`@src/` 这种带目录前缀的查询只列该目录，不再叠加全库模糊命中
+ * （否则候选里会混进一堆看起来毫不相干的文件）。
+ */
+async function fetchCompletionItems(
+  query: string
+): Promise<{ items: CompletionItem[]; error: string | null }> {
+  const workspace = activeWorkspace()
+  if (!workspace) return { items: [], error: '先打开一个工作区，再用 @ 引用文件或文件夹。' }
+
+  const slash = query.lastIndexOf('/')
+  const dirPrefix = slash >= 0 ? query.slice(0, slash) : null
+  const nameQuery = slash >= 0 ? query.slice(slash + 1) : query
+
+  try {
+    // `@/xx` 这种以斜杠开头的查询等价于从根开始（目录前缀为空串时回落到根）。
+    const treePath = dirPrefix !== null && dirPrefix.length > 0 ? dirPrefix : undefined
+    const treePromise = workspaceApi.tree(workspace.id, treePath, 1)
+    const searchPromise =
+      dirPrefix === null && nameQuery.trim().length > 0
+        ? workspaceApi.searchFiles(workspace.id, nameQuery)
+        : Promise.resolve(null)
+
+    const [tree, search] = await Promise.all([treePromise, searchPromise])
+
+    const items: CompletionItem[] = []
+    for (const entry of tree.entries) {
+      if (entry.ignored) continue
+      // `symlink` / `other` 按文件对待：能不能读交给内核判断，补全只负责列出来。
+      const kind: ChipKind = entry.kind === 'dir' ? 'folder' : 'file'
+      const path = toRelativePath(entry.path, workspace.root)
+      if (path.length === 0) continue
+      items.push({ kind, path, label: entry.name })
+    }
+    // `search.files` 的 `path` 已经是相对工作区根的路径，直接用。
+    for (const match of search?.matches ?? []) {
+      items.push({ kind: 'file', path: normalizePath(match.path), label: chipLabel(match.path) })
+    }
+    return { items, error: null }
+  } catch (error) {
+    return { items: [], error: describe(error) }
+  }
+}
+
+/** 补全请求序号：慢回来的旧结果不许覆盖新结果。 */
+let completionSeq = 0
+
+/**
+ * 打开 / 刷新补全菜单。
+ *
+ * 同一个 query 重复调用直接返回：`onKeyUp` 会在「上下键选择」之后再调一次，
+ * 重新拉取会把用户刚选中的那一项打回第一项。
+ */
+export async function openCompletion(query: string): Promise<void> {
+  if (
+    state.completion.open &&
+    state.completion.query === query &&
+    state.completion.items.length > 0
+  ) {
+    return
+  }
+  completionSeq += 1
+  const seq = completionSeq
+  setState({
+    completion: { open: true, query, items: [], activeIndex: 0, loading: true, error: null }
+  })
+
+  const { items, error } = await fetchCompletionItems(query)
+  // 结果回来时用户可能已经继续打字（甚至关掉了菜单）：旧结果一律丢弃。
+  if (seq !== completionSeq || !state.completion.open) return
+
+  setState({
+    completion: {
+      open: true,
+      query,
+      items: rankCompletions(items, query.slice(query.lastIndexOf('/') + 1), {
+        exclude: selectedKeys()
+      }),
+      activeIndex: 0,
+      loading: false,
+      error
+    }
+  })
+}
+
+/** 关闭补全菜单（光标离开 `@` 触发区 / Escape / 接受候选 / 发送后）。 */
+export function closeCompletion(): void {
+  const { open, items, error } = state.completion
+  if (!open && items.length === 0 && error === null) return
+  setState({ completion: emptyCompletion() })
+}
+
+/** 上下移动选中项；走到头绕回另一头（菜单只有几条，循环比卡住好用）。 */
+export function moveCompletion(delta: number): void {
+  const { open, items, activeIndex } = state.completion
+  if (!open || items.length === 0) return
+  const next = (activeIndex + delta + items.length) % items.length
+  setState({ completion: { ...state.completion, activeIndex: next } })
+}
+
+/** 鼠标悬停到某项：让键盘与鼠标共用同一个「选中项」。 */
+export function setCompletionActive(index: number): void {
+  const { open, items, activeIndex } = state.completion
+  if (!open || items.length === 0) return
+  const next = Math.max(0, Math.min(index, items.length - 1))
+  if (next === activeIndex) return
+  setState({ completion: { ...state.completion, activeIndex: next } })
+}
+
+/** 确认当前候选：生成 chip 并关菜单；没有候选时返回 null（调用方不要动草稿）。 */
+export function acceptCompletion(): ContextChip | null {
+  const { open, items, activeIndex } = state.completion
+  const item = open ? items[activeIndex] : undefined
+  if (!item) return null
+  const chip: ContextChip = { kind: item.kind, path: item.path, label: item.label }
+  addChip(chip)
+  closeCompletion()
+  return chip
+}
+
+/** 加入一条引用；同类型同路径视为重复，返回是否真的新增。 */
+export function addChip(chip: ContextChip): boolean {
+  const path = normalizePath(chip.path)
+  const key = contextKey(chip.kind, path)
+  if (state.chips.some((item) => contextKey(item.kind, item.path) === key)) return false
+  setState({
+    chips: [
+      ...state.chips,
+      { kind: chip.kind, path, label: chip.label.length > 0 ? chip.label : chipLabel(path) }
+    ],
+    // 引用变了，上一次的 token 估算就过期了：留着会拿旧数字误导用户。
+    tokenEstimate: null
+  })
+  return true
+}
+
+/** 点 chip 上的 × 移除一条引用。 */
+export function removeChip(kind: ChipKind, path: string): void {
+  const key = contextKey(kind, path)
+  const chips = state.chips.filter((chip) => contextKey(chip.kind, chip.path) !== key)
+  if (chips.length === state.chips.length) return
+  setState({ chips, tokenEstimate: null })
+}
+
+export function clearChips(): void {
+  if (state.chips.length === 0) return
+  setState({ chips: [], tokenEstimate: null })
+}
+
+function modelViewOf(modelRef: ModelRef): ModelView | undefined {
+  return state.models.find(
+    (model) => model.provider_id === modelRef.provider_id && model.model_id === modelRef.model_id
+  )
+}
+
+/** 模型窗口；模型没声明时为 null（此时只报估算值，不判超限）。 */
+function contextWindowOf(modelRef: ModelRef): number | null {
+  const window = modelViewOf(modelRef)?.caps.context_window ?? null
+  return typeof window === 'number' && window > 0 ? window : null
+}
+
+/**
+ * 发送前估算：消息走 `messages` 口径，引用片段走 `texts` 口径（协议里 `texts` 就是
+ * 给「还没组装成消息的引用片段」用的）。
+ *
+ * 这里估的是**引用本身**的开销，不是被引用文件的体积——外壳不读正文，真实注入量由内核
+ * 按预算裁剪。它的价值只有一个：在发出去之前先告诉用户「这次大概撑爆窗口了」，别等上游
+ * 用 2004 把整轮对话打回来。所以取不到就静默放弃，绝不因为它失败而挡住发送。
+ */
+async function estimateTokens(
+  messages: ChatMessage[],
+  chips: ContextChip[]
+): Promise<TokenEstimate | null> {
+  const modelRef = state.selectedModel
+  if (!modelRef) return null
+  try {
+    const result = await aiApi.countTokens({
+      model_ref: modelRef,
+      messages,
+      texts: chips.map((chip) => `@${chip.kind} ${chip.path}`)
+    })
+    const tokens =
+      typeof result?.tokens === 'number' && Number.isFinite(result.tokens) ? result.tokens : 0
+    const view = modelViewOf(modelRef)
+    return makeTokenEstimate(
+      tokens,
+      contextWindowOf(modelRef),
+      view?.display_name ?? view?.model_id ?? null
+    )
+  } catch {
+    return null
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -293,7 +544,8 @@ export async function removeModel(modelPk: string): Promise<boolean> {
 }
 
 export function selectModel(modelRef: ModelRef | null): void {
-  setState({ selectedModel: modelRef })
+  // 换了模型，上下文窗口跟着变：上一次的估算与超限判定都得作废。
+  setState({ selectedModel: modelRef, tokenEstimate: null })
 }
 
 // ---------------------------------------------------------------------------
@@ -330,6 +582,8 @@ export async function sendMessage(text: string): Promise<boolean> {
   }
 
   const streamId = newStreamId()
+  // 这一条消息引用的是「发送那一刻的 chips」：之后用户再加删 chip 不该影响已经发出的消息。
+  const chips = state.chips
   const messages: ChatMessage[] = [
     ...state.bubbles
       .filter((bubble) => bubble.status !== 'error' && bubble.text.trim().length > 0)
@@ -354,8 +608,14 @@ export async function sendMessage(text: string): Promise<boolean> {
     hint: null,
     error: null,
     usage: null,
-    finishReason: null
+    finishReason: null,
+    // 先清掉上一轮的估算：这一条消息的内容已经变了，留着旧数字就是误导。
+    tokenEstimate: null
   })
+
+  // 发送前估一次：超限时提前说一声，别等上游用 2004 把整轮对话打回来。
+  const estimate = await estimateTokens(messages, chips)
+  if (estimate) setState({ tokenEstimate: estimate })
 
   try {
     const ack = await aiApi.chatStream({
@@ -366,9 +626,8 @@ export async function sendMessage(text: string): Promise<boolean> {
       tools: [],
       tool_choice: null,
       params: null,
-      // M3 的上下文引用目前只在内核侧落地（@文件/@文件夹 的 UI 接入属后续切片），
-      // 这里显式传 null，保持 M2 的「不注入」行为。
-      context: null
+      // chips 为空时 `context` 为 null：内核不注入任何内容，行为与 M2 一致。
+      context: buildChatContext(chips, activeWorkspace()?.id ?? null)
     })
     // 协议约定内核原样回执调用方给的 `stream_id`（`llm.chat_stream` 的时序是
     // 「先回 id 再开流」），这里仍然以回执为准对齐一次：万一哪天内核改成自己生成
@@ -413,7 +672,17 @@ export async function cancelStream(): Promise<boolean> {
 }
 
 export function clearChat(): void {
-  setState({ bubbles: [], usage: null, finishReason: null, hint: null, streaming: false, streamId: null })
+  setState({
+    bubbles: [],
+    usage: null,
+    finishReason: null,
+    hint: null,
+    streaming: false,
+    streamId: null,
+    // 只清「这一轮对话」的东西：输入框里的草稿与已选引用留着——点「新对话」通常是
+    // 想换个话题，不是想丢掉刚挑好的文件。
+    tokenEstimate: null
+  })
 }
 
 // ---------------------------------------------------------------------------
