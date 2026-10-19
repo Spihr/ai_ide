@@ -568,6 +568,18 @@ button {
   width: 100%;
 }
 
+/* 编辑器侧引用的快捷入口：没有活动文件 / 没有选区时按钮置灰 */
+.ai-refs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ai-refs .ai-button {
+  font-size: 11px;
+  padding: 2px 8px;
+}
+
 /* @ 引用 chip 行：一条引用一个 chip，点 × 移除 */
 .ai-chips {
   display: flex;

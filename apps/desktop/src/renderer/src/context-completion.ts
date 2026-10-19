@@ -1,5 +1,5 @@
 /**
- * M3 外壳侧：`@` 引用的纯逻辑（触发解析、候选过滤排序、请求体构造、超限提示）。
+ * M3 外壳侧：引用的纯逻辑（触发解析、候选过滤排序、chip → 请求体、超限提示）。
  *
  * 这里刻意不碰 IPC 与 React：补全怎么触发、候选怎么筛、chip 怎么变成
  * `context.refs`、超限那句话怎么说，全都是「输入 → 输出」的纯函数，能被单测直接钉死；
@@ -8,16 +8,29 @@
 
 import type { ChatContext, ContextRef, ContextRefKind } from '@ai-ide/shared-types'
 
-/** 本轮只支持文件与文件夹两类引用（选区 / 当前文件留后续切片）。 */
-export type ChipKind = Extract<ContextRefKind, 'file' | 'folder'>
+/** 四条引用通道与内核 `ContextRefKind` 同名同形，外壳不做自己的那套命名。 */
+export type ChipKind = Extract<ContextRefKind, 'file' | 'folder' | 'current_file' | 'selection'>
 
-/** 一条已选中的引用（UI 上的 chip）。 */
+/** 行区间（1-based、含端点），只有 `selection` 引用用得上。 */
+export interface LineRange {
+  startLine: number
+  endLine: number
+}
+
+/**
+ * 一条已选中的引用（UI 上的 chip）。
+ *
+ * `range` 只对 `selection` 有意义：行号是这一路引用唯一的「范围」信息，缺了它内核
+ * 就只能整文件注入，与用户选中的东西对不上；因此没有合法行号的选区引用不允许存在。
+ */
 export interface ContextChip {
   kind: ChipKind
   /** 相对工作区根、以 `/` 分隔的路径——内核按工作区根展开，别塞绝对路径。 */
   path: string
   /** chip 文案；只用于界面，不注入对话内容。 */
   label: string
+  /** 选区行区间；其余类型不带（`undefined` 与 `null` 都表示「整文件 / 整目录」）。 */
+  range?: LineRange | null
 }
 
 /** 补全候选。 */
@@ -58,9 +71,31 @@ export function normalizePath(path: string): string {
   return path.replace(/\\/g, '/').replace(/\/{2,}/g, '/').replace(/^\.\//, '')
 }
 
-/** 一条引用的稳定键，用于去重与「已选过的别再出现在候选里」。 */
-export function contextKey(kind: ChipKind, path: string): string {
-  return `${kind}:${normalizePath(path)}`.toLowerCase()
+/**
+ * 规范化行区间：只接受 ≥1 的整数行号，端点写反了就对调。
+ *
+ * 拿不到合法行号时返回 `null`——宁可不引用，也不编一个区间出来：行号错了，注入的
+ * 内容就跟用户选中的东西不一样，而且这种错在界面上看不出来。
+ */
+export function normalizeRange(range: LineRange | null | undefined): LineRange | null {
+  if (!range) return null
+  const { startLine, endLine } = range
+  if (!Number.isInteger(startLine) || !Number.isInteger(endLine)) return null
+  if (startLine < 1 || endLine < 1) return null
+  return startLine <= endLine
+    ? { startLine, endLine }
+    : { startLine: endLine, endLine: startLine }
+}
+
+/**
+ * 一条引用的稳定键，用于去重与「已选过的别再出现在候选里」。
+ *
+ * 行区间参与键：同一个文件选了两段代码就是两条引用，不能互相顶掉。
+ */
+export function contextKey(kind: ChipKind, path: string, range?: LineRange | null): string {
+  const base = `${kind}:${normalizePath(path)}`.toLowerCase()
+  const normalized = normalizeRange(range ?? null)
+  return normalized ? `${base}#${normalized.startLine}-${normalized.endLine}` : base
 }
 
 /** 绝对路径 → 相对工作区根的路径；落在工作区外时原样返回（交给内核报错）。 */
@@ -83,6 +118,23 @@ export function baseNameOf(path: string): string {
 /** chip 文案：默认取末段名（`src/main.ts` → `main.ts`）。 */
 export function chipLabel(path: string): string {
   return baseNameOf(path)
+}
+
+/** 选区 chip 文案：`main.ts:3-10`——行号是这条引用最关键的信息，必须露在 chip 上。 */
+export function selectionLabel(path: string, range: LineRange | null | undefined): string {
+  const normalized = normalizeRange(range)
+  if (!normalized) return chipLabel(path)
+  return `${chipLabel(path)}:${normalized.startLine}-${normalized.endLine}`
+}
+
+/** 估算 token 用的一行描述：带 kind 与行区间，选区引用长短不一，用假描述估不准。 */
+export function chipEstimateText(chip: ContextChip): string {
+  const path = normalizePath(chip.path)
+  const range = normalizeRange(chip.range ?? null)
+  if (chip.kind === 'selection' && range) {
+    return `@selection ${path}:${range.startLine}-${range.endLine}`
+  }
+  return `@${chip.kind} ${path}`
 }
 
 /**
@@ -167,17 +219,37 @@ export function rankCompletions(
 /**
  * chip 按顺序变成内核要的 `context.refs`。**数组顺序即注入顺序**，所以这里不排序、
  * 不去重（去重发生在 `addChip`，那时才知道用户是不是重复选）。
+ *
+ * 两条硬约束：
+ * 1. `path` 只用相对工作区根的真实路径，行号只用编辑器上报的真实行号——引用内容不落盘，
+ *    因此这里也拿不到正文，`text` 一律 `null`，由内核按路径现取；
+ * 2. 选区引用缺合法行号时整条丢弃（见下），不补默认区间。
  */
 export function buildContextRefs(chips: ContextChip[]): ContextRef[] {
-  return chips.map((chip) => ({
-    kind: chip.kind,
-    path: normalizePath(chip.path),
-    // 行区间与选区原文属「选区 / 当前文件」切片，本轮一律为 null（整文件注入）。
-    start_line: null,
-    end_line: null,
-    text: null,
-    label: chip.label
-  }))
+  const refs: ContextRef[] = []
+  for (const chip of chips) {
+    const path = normalizePath(chip.path)
+    const label = chip.label.length > 0 ? chip.label : chipLabel(path)
+
+    if (chip.kind === 'selection') {
+      const range = normalizeRange(chip.range ?? null)
+      // 没有行号就没有「选区」可言：补一个区间等于伪造用户没选过的内容。
+      if (!range) continue
+      refs.push({
+        kind: 'selection',
+        path,
+        start_line: range.startLine,
+        end_line: range.endLine,
+        text: null,
+        label: chip.label.length > 0 ? chip.label : selectionLabel(path, range)
+      })
+      continue
+    }
+
+    // file / folder / current_file 都是「整文件 / 整目录」：行区间与原文为 null。
+    refs.push({ kind: chip.kind, path, start_line: null, end_line: null, text: null, label })
+  }
+  return refs
 }
 
 /** 组装 `llm.chat_stream` 的 `context`；没有引用时返回 `null`（与 M2 行为一致）。 */
@@ -185,8 +257,11 @@ export function buildChatContext(
   chips: ContextChip[],
   workspaceId: string | null
 ): ChatContext | null {
-  if (chips.length === 0) return null
-  return { workspace_id: workspaceId, refs: buildContextRefs(chips), compress: null }
+  const refs = buildContextRefs(chips)
+  // 注意判的是 refs 而不是 chips：选区引用缺行号会被 `buildContextRefs` 丢弃，
+  // 那种情况下同样「没有东西要注入」，给内核一个空壳 context 没有意义。
+  if (refs.length === 0) return null
+  return { workspace_id: workspaceId, refs, compress: null }
 }
 
 /** 千分位：12,345 比 12345 更容易一眼看出量级。 */

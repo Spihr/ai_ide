@@ -11,7 +11,34 @@
 import { useEffect, useRef } from 'react'
 
 import { languageForPath, monaco } from '../monaco-setup'
-import { clearReveal, updateContent, useEditor } from '../store'
+import { clearReveal, setEditorSelection, updateContent, useEditor } from '../store'
+
+/**
+ * 把 Monaco 的选区读成 store 里那对真实行号。
+ *
+ * 只有「真的选中了东西」才上报：光标停在某一行时 `isEmpty()` 为真，此时的
+ * `startLineNumber` 只是一个光标位置，报上去会凭空多出一条用户没选过的单行引用。
+ * 行号取 1-based（Monaco 与内核 `ContextRef` 的约定正好一致），不在这里做任何换算。
+ */
+function reportSelection(
+  editor: monaco.editor.IStandaloneCodeEditor | null,
+  path: string | null
+): void {
+  if (!editor || !path) {
+    setEditorSelection(null)
+    return
+  }
+  const selection = editor.getSelection()
+  if (!selection || selection.isEmpty()) {
+    setEditorSelection(null)
+    return
+  }
+  setEditorSelection({
+    path,
+    startLine: Math.min(selection.startLineNumber, selection.endLineNumber),
+    endLine: Math.max(selection.startLineNumber, selection.endLineNumber)
+  })
+}
 
 export function CodeEditor() {
   const state = useEditor()
@@ -51,12 +78,18 @@ export function CodeEditor() {
       if (path) updateContent(path, editor.getValue())
     })
 
+    // 选区变化就是「编辑器侧引用」的数据源：只如实上报，怎么用交给对话面板。
+    const selectionSubscription = editor.onDidChangeCursorSelection(() => {
+      reportSelection(editorRef.current, currentRef.current)
+    })
+
     // 卸载时 ref 可能已被改写，先取快照再清理
     const models = modelsRef.current
     const views = viewsRef.current
 
     return () => {
       subscription.dispose()
+      selectionSubscription.dispose()
       editor.dispose()
       for (const model of models.values()) model.dispose()
       models.clear()
@@ -89,6 +122,7 @@ export function CodeEditor() {
     if (!active) {
       currentRef.current = null
       editor.setModel(null)
+      reportSelection(null, null)
       return
     }
 
@@ -113,6 +147,9 @@ export function CodeEditor() {
       editor.focus()
     }
     currentRef.current = active
+    // 换文件 / 换模型之后 Monaco 的光标位置属于新内容，不是用户选过的东西：
+    // 以当前真实选区重报一次（多半是空选），免得 chip 拿着上一个文件的行号。
+    reportSelection(editor, active)
   }, [state.activePath, state.tabs])
 
   // 搜索命中跳转

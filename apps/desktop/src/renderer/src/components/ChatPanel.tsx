@@ -6,8 +6,9 @@
  * （错误码 → 人话），而不是把 `[2002] ...` 直接甩给用户。
  *
  * M3 加进来的是「输入框里怎么引用文件」：敲 `@` 弹补全（候选来自内核的
- * `workspace.tree` / `search.files`），选中后 chip 挂到输入框上方，发送时 chip 按顺序
- * 变成 `context.refs`；token 估算与超限提示都在 store 里，这里只负责显示。
+ * `workspace.tree` / `search.files`），选中后 chip 挂到输入框上方；编辑器里打开着的
+ * 文件与选中的代码段也能一键变 chip（`+ 当前文件` / `+ 选区`，行号取自 Monaco 的真实选区）。
+ * 发送时 chip 按顺序变成 `context.refs`；token 估算与超限提示都在 store 里，这里只负责显示。
  * 组件本身仍然只持有一个草稿字符串，没有引入新的状态库。
  */
 
@@ -15,6 +16,8 @@ import { useEffect, useRef, useState } from 'react'
 
 import {
   acceptCompletion,
+  addCurrentFileRef,
+  addSelectionRef,
   cancelStream,
   clearChat,
   closeCompletion,
@@ -26,11 +29,35 @@ import {
   setCompletionActive,
   useAi
 } from '../ai-store'
-import { findTrigger, stripTrigger, toRelativePath } from '../context-completion'
-import { getEditorState } from '../store'
+import {
+  contextKey,
+  findTrigger,
+  stripTrigger,
+  toRelativePath,
+  type ContextChip
+} from '../context-completion'
+import { getEditorState, useEditorReference } from '../store'
+
+/** chip 前缀图标：文件夹 `▸`、选区 `≡`、其余一律 `#`。 */
+function chipIcon(chip: ContextChip): string {
+  if (chip.kind === 'folder') return '▸'
+  if (chip.kind === 'selection') return '≡'
+  return '#'
+}
+
+/** chip 悬停文案：选区要把行号写出来——同一文件的两段选区只靠文件名分不清。 */
+function chipTitle(chip: ContextChip): string {
+  const range = chip.range ?? null
+  if (chip.kind === 'selection' && range) {
+    return `${chip.path} 第 ${range.startLine}-${range.endLine} 行`
+  }
+  return chip.path
+}
 
 export function ChatPanel(): React.JSX.Element {
   const state = useAi()
+  // 只订阅「活动文件 + 选区」这一小块编辑器状态：打字不会让对话面板跟着重渲染。
+  const reference = useEditorReference()
   const [draft, setDraft] = useState('')
   const bubblesRef = useRef<HTMLDivElement | null>(null)
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
@@ -201,21 +228,57 @@ export function ChatPanel(): React.JSX.Element {
         </div>
       ) : null}
 
+      <div className="ai-refs" data-testid="chat-ref-actions">
+        <button
+          className="ai-button"
+          type="button"
+          data-testid="chat-add-current-file"
+          disabled={reference.path === null}
+          title={
+            reference.path === null
+              ? '先在编辑器里打开一个文件'
+              : `引用当前文件：${displayPath(reference.path)}`
+          }
+          onClick={() => addCurrentFileRef()}
+        >
+          + 当前文件
+        </button>
+        <button
+          className="ai-button"
+          type="button"
+          data-testid="chat-add-selection"
+          disabled={reference.selection === null}
+          title={
+            reference.selection === null
+              ? '先在编辑器里选中一段代码'
+              : `引用选区：${displayPath(reference.selection.path)} 第 ${reference.selection.startLine}-${reference.selection.endLine} 行`
+          }
+          onClick={() => addSelectionRef()}
+        >
+          + 选区
+        </button>
+      </div>
+
       {state.chips.length > 0 ? (
         <div className="ai-chips" data-testid="chat-chips">
           {state.chips.map((chip) => (
-            <span className="ai-chip" key={`${chip.kind}:${chip.path}`} title={chip.path}>
+            <span
+              className="ai-chip"
+              key={contextKey(chip.kind, chip.path, chip.range ?? null)}
+              title={chipTitle(chip)}
+              data-testid="chat-chip"
+            >
               <span className="ai-chip__kind" aria-hidden="true">
-                {chip.kind === 'folder' ? '▸' : '#'}
+                {chipIcon(chip)}
               </span>
               <span className="ai-chip__label">{chip.label}</span>
               <button
                 className="ai-chip__remove"
                 type="button"
                 data-testid="chat-chip-remove"
-                aria-label={`移除引用 ${chip.path}`}
-                title={`移除引用 ${chip.path}`}
-                onClick={() => removeChip(chip.kind, chip.path)}
+                aria-label={`移除引用 ${chipTitle(chip)}`}
+                title={`移除引用 ${chipTitle(chip)}`}
+                onClick={() => removeChip(chip.kind, chip.path, chip.range ?? null)}
               >
                 ×
               </button>
@@ -230,7 +293,7 @@ export function ChatPanel(): React.JSX.Element {
           className="ai-input ai-textarea"
           data-testid="chat-input"
           value={draft}
-          placeholder="说点什么…（@ 引用文件或文件夹，Enter 发送，Shift+Enter 换行）"
+          placeholder="说点什么…（@ 引用文件或文件夹，也可用下方按钮引用当前文件 / 选区；Enter 发送，Shift+Enter 换行）"
           onChange={(event) => handleChange(event.target.value, event.currentTarget.selectionStart)}
           onKeyDown={handleKeyDown}
           onClick={() => closeCompletion()}

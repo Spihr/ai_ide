@@ -52,6 +52,22 @@ export interface Notice {
   text: string
 }
 
+/**
+ * 编辑器里的选区（M3 下一切片）。
+ *
+ * 只有**真的选中了内容**才算选区：光标停在某处不动是「没有选区」，此时不能拿它去
+ * 构造 `selection` 引用——否则用户会把整行、甚至当前位置之后的内容当成自己选中的东西送出去。
+ * 行号一律 1-based 且含端点，与内核 `ContextRef.start_line` / `end_line` 同一口径。
+ */
+export interface EditorSelection {
+  /** 绝对路径。 */
+  path: string
+  /** 起始行（1-based，含）。 */
+  startLine: number
+  /** 结束行（1-based，含）。 */
+  endLine: number
+}
+
 /** 内容搜索点击后要在编辑器里定位的位置。 */
 export interface RevealTarget {
   /** 绝对路径。 */
@@ -77,6 +93,8 @@ export interface EditorState {
   loadingDirs: string[]
   tabs: Tab[]
   activePath: string | null
+  /** 活动编辑器上报的选区；没有活动文件或没选中内容时为 `null`。 */
+  selection: EditorSelection | null
   fileQuery: string
   fileMatches: FileMatch[]
   contentQuery: string
@@ -99,6 +117,7 @@ const initialState: EditorState = {
   loadingDirs: [],
   tabs: [],
   activePath: null,
+  selection: null,
   fileQuery: '',
   fileMatches: [],
   contentQuery: '',
@@ -301,7 +320,7 @@ export async function refreshTree(): Promise<void> {
 export async function openFile(absPath: string): Promise<void> {
   const existing = state.tabs.find((tab) => tab.path === absPath)
   if (existing) {
-    set({ activePath: absPath })
+    activateTab(absPath)
     return
   }
 
@@ -318,7 +337,7 @@ export async function openFile(absPath: string): Promise<void> {
     saving: false,
     error: null
   }
-  set({ tabs: [...state.tabs, tab], activePath: absPath })
+  set({ tabs: [...state.tabs, tab], activePath: absPath, selection: null })
 
   try {
     const result = await workspaceApi.readFile(absPath)
@@ -356,7 +375,10 @@ export async function reloadTab(path: string): Promise<void> {
 }
 
 export function activateTab(path: string): void {
-  set({ activePath: path })
+  if (state.activePath === path) return
+  // 换活动编辑器 = 换选区：上一个文件的选区行号套到新文件上就是一条错引用。
+  // 这里先清掉，随后由编辑器把新模型的选区重新报上来。
+  set({ activePath: path, selection: null })
 }
 
 export function closeTab(path: string, force = false): void {
@@ -367,7 +389,12 @@ export function closeTab(path: string, force = false): void {
   }
   const tabs = state.tabs.filter((item) => item.path !== path)
   const fallback = tabs.length > 0 ? (tabs[tabs.length - 1]?.path ?? null) : null
-  set({ tabs, activePath: state.activePath === path ? fallback : state.activePath })
+  const activePath = state.activePath === path ? fallback : state.activePath
+  set({
+    tabs,
+    activePath,
+    selection: activePath === state.activePath ? state.selection : null
+  })
 }
 
 export function updateContent(path: string, content: string): void {
@@ -393,6 +420,72 @@ export async function saveTab(path?: string): Promise<boolean> {
     patchTab(tab.path, { saving: false, error: cleanMessage(error) })
     return false
   }
+}
+
+// ---------------------------------------------------------------------------
+// 编辑器选区与对话面板可用的引用（M3 下一切片）
+// ---------------------------------------------------------------------------
+
+function sameSelection(a: EditorSelection | null, b: EditorSelection | null): boolean {
+  if (a === b) return true
+  if (!a || !b) return false
+  return a.path === b.path && a.startLine === b.startLine && a.endLine === b.endLine
+}
+
+/**
+ * 编辑器上报选区，`null` 表示「没有选区」（光标停在某处不算选中内容）。
+ *
+ * 编辑器是唯一知道选区的角色，外壳只负责把真实值存下来：行号不是 ≥1 的整数就整条忽略
+ * （不往状态里塞一个可能错的行号），上报的文件与当前活动文件不一致则等同于没有选区。
+ */
+export function setEditorSelection(selection: EditorSelection | null): void {
+  if (!selection || selection.path !== state.activePath) {
+    if (state.selection !== null) set({ selection: null })
+    return
+  }
+  const { startLine, endLine } = selection
+  if (!Number.isInteger(startLine) || !Number.isInteger(endLine) || startLine < 1 || endLine < 1) {
+    return
+  }
+  const next: EditorSelection = {
+    path: selection.path,
+    startLine: Math.min(startLine, endLine),
+    endLine: Math.max(startLine, endLine)
+  }
+  if (sameSelection(state.selection, next)) return
+  set({ selection: next })
+}
+
+/** 对话面板用得到的编辑器侧引用信息：活动文件 + 选区。 */
+export interface EditorReference {
+  /** 活动文件绝对路径；没有活动文件时为 `null`。 */
+  path: string | null
+  /** 选区；没有活动文件或没选中内容时为 `null`。 */
+  selection: EditorSelection | null
+}
+
+const emptyReference: EditorReference = { path: null, selection: null }
+let referenceCache: EditorReference = emptyReference
+
+/** `useSyncExternalStore` 的快照必须是稳定引用：只有真的变了才换新对象。 */
+function referenceSnapshot(): EditorReference {
+  if (
+    referenceCache.path === state.activePath &&
+    sameSelection(referenceCache.selection, state.selection)
+  ) {
+    return referenceCache
+  }
+  referenceCache = { path: state.activePath, selection: state.selection }
+  return referenceCache
+}
+
+/**
+ * 订阅「当前文件 + 选区」这一小块状态。
+ *
+ * 不订阅整个编辑器状态：打字会不断改 `tabs`，对话面板没必要跟着重渲染。
+ */
+export function useEditorReference(): EditorReference {
+  return useSyncExternalStore(subscribe, referenceSnapshot)
 }
 
 // ---------------------------------------------------------------------------

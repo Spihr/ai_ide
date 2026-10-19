@@ -25,6 +25,8 @@ import type { AiEvent, AiIdeApi } from '../../shared/ipc'
 import {
   acceptCompletion,
   addChip,
+  addCurrentFileRef,
+  addSelectionRef,
   cancelStream,
   clearChat,
   closeCompletion,
@@ -42,7 +44,7 @@ import {
   sendMessage,
   testProvider
 } from './ai-store'
-import { closeWorkspace, getEditorState, openWorkspace } from './store'
+import { closeWorkspace, getEditorState, openFile, openWorkspace, setEditorSelection } from './store'
 
 interface Call {
   method: string
@@ -193,6 +195,9 @@ function installHarness(): Harness {
           }
         case Methods.workspace.close:
           return { ok: true }
+        case Methods.workspace.readFile:
+          // 编辑器侧引用只需要「有活动文件」，不读正文；给个最小可解析的结果即可。
+          return { content: '', hash: 'h-test', eol: 'lf', encoding: 'utf-8', truncated: false }
         case Methods.workspace.tree:
           return {
             entries: treeEntries((params as { path?: string | null } | undefined)?.path ?? null)
@@ -664,6 +669,204 @@ describe('引用随请求透传与 token 预算（M3）', () => {
 
     addChip({ kind: 'file', path: 'src/app.ts', label: 'app.ts' })
     expect(getAiState().tokenEstimate).toBeNull()
+  })
+})
+
+describe('编辑器侧引用（M3 下一切片）', () => {
+  const FILE_A = `${WORKSPACE_ROOT}\\src\\app.ts`
+  const FILE_B = `${WORKSPACE_ROOT}\\main.ts`
+
+  /** 打开工作区后打开一个文件：编辑器侧引用必须先有「活动编辑器」。 */
+  async function openEditor(absPath: string): Promise<void> {
+    await openProject()
+    await openFile(absPath)
+    expect(getEditorState().activePath).toBe(absPath)
+  }
+
+  it('没有活动文件时两个入口都给可读提示，不会造出一条空引用', async () => {
+    await openProject()
+
+    expect(addCurrentFileRef()).toBe(false)
+    expect(getAiState().hint).toContain('先打开一个文件')
+    expect(addSelectionRef()).toBe(false)
+    expect(getAiState().hint).toContain('再引用选区')
+    expect(getAiState().chips).toHaveLength(0)
+  })
+
+  it('活动文件一键加入 current_file 引用：路径相对工作区根，重复点不新增', async () => {
+    await openEditor(FILE_A)
+
+    expect(addCurrentFileRef()).toBe(true)
+    expect(getAiState().chips).toEqual([
+      { kind: 'current_file', path: 'src/app.ts', label: 'app.ts' }
+    ])
+
+    expect(addCurrentFileRef()).toBe(false)
+    expect(getAiState().chips).toHaveLength(1)
+    expect(getAiState().hint).toContain('已经在引用里')
+
+    removeChip('current_file', 'src/app.ts')
+    expect(getAiState().chips).toHaveLength(0)
+  })
+
+  it('切换活动文件后引用的是新文件：旧文件的引用不会被静默带过去', async () => {
+    await openEditor(FILE_A)
+    addCurrentFileRef()
+
+    await openFile(FILE_B)
+    addCurrentFileRef()
+
+    expect(getAiState().chips.map((chip) => chip.path)).toEqual(['src/app.ts', 'main.ts'])
+  })
+
+  it('活动文件在工作区外时不产引用：越界路径不该由外壳悄悄塞进 chip', async () => {
+    await openProject()
+    await openFile('E:\\other\\outside.ts')
+
+    expect(addCurrentFileRef()).toBe(false)
+    expect(addSelectionRef()).toBe(false)
+    expect(getAiState().chips).toHaveLength(0)
+  })
+
+  it('选区按真实行号构造 selection 引用，端点写反也对调（以行号为准）', async () => {
+    await openEditor(FILE_A)
+    // 从下往上拖时 Monaco 给出的起止行也是反的，外壳负责摆正。
+    setEditorSelection({ path: FILE_A, startLine: 12, endLine: 3 })
+
+    expect(addSelectionRef()).toBe(true)
+    expect(getAiState().chips).toEqual([
+      {
+        kind: 'selection',
+        path: 'src/app.ts',
+        label: 'app.ts:3-12',
+        range: { startLine: 3, endLine: 12 }
+      }
+    ])
+  })
+
+  it('光标停着（没有选中内容）不算选区：只给提示，不引用整文件', async () => {
+    await openEditor(FILE_A)
+    setEditorSelection(null)
+
+    expect(addSelectionRef()).toBe(false)
+    expect(getAiState().hint).toContain('没有选中内容')
+    expect(getAiState().chips).toHaveLength(0)
+  })
+
+  it('行号不是 ≥1 的整数时整条忽略：错的行号在界面上看不出来，宁可不记', async () => {
+    await openEditor(FILE_A)
+
+    setEditorSelection({ path: FILE_A, startLine: 0, endLine: 5 })
+    expect(getEditorState().selection).toBeNull()
+    setEditorSelection({ path: FILE_A, startLine: 1.5, endLine: 5 })
+    expect(getEditorState().selection).toBeNull()
+
+    expect(addSelectionRef()).toBe(false)
+    expect(getAiState().chips).toHaveLength(0)
+  })
+
+  it('上报的文件与活动文件不一致时等同于没有选区（行号不能跑到别的文件上）', async () => {
+    await openEditor(FILE_A)
+    setEditorSelection({ path: FILE_B, startLine: 2, endLine: 4 })
+
+    expect(getEditorState().selection).toBeNull()
+    expect(addSelectionRef()).toBe(false)
+  })
+
+  it('切换活动文件会清掉上一个文件的选区', async () => {
+    await openEditor(FILE_A)
+    setEditorSelection({ path: FILE_A, startLine: 2, endLine: 4 })
+    expect(getEditorState().selection).not.toBeNull()
+
+    await openFile(FILE_B)
+
+    expect(getEditorState().selection).toBeNull()
+    expect(addSelectionRef()).toBe(false)
+  })
+
+  it('同一文件的两段选区是两条引用，移除要连行区间一起给', async () => {
+    await openEditor(FILE_A)
+    setEditorSelection({ path: FILE_A, startLine: 1, endLine: 3 })
+    addSelectionRef()
+    setEditorSelection({ path: FILE_A, startLine: 20, endLine: 25 })
+    addSelectionRef()
+
+    expect(getAiState().chips).toHaveLength(2)
+    removeChip('selection', 'src/app.ts', { startLine: 1, endLine: 3 })
+    expect(getAiState().chips.map((chip) => chip.label)).toEqual(['app.ts:20-25'])
+  })
+
+  it('混排时 context.refs 严格按 chip 顺序，且 current_file / selection 字段各就各位', async () => {
+    await openProject()
+    addChip({ kind: 'file', path: 'docs/notes.md', label: 'notes.md' })
+
+    await openFile(FILE_A)
+    setEditorSelection({ path: FILE_A, startLine: 5, endLine: 9 })
+    addSelectionRef()
+    addCurrentFileRef()
+
+    await sendMessage('看看这段')
+
+    const params = callsOf(Methods.llm.chatStream)[0]?.params as LlmChatStreamParams
+    expect(params.context?.workspace_id).toBe(WORKSPACE_ID)
+    expect(params.context?.refs).toEqual([
+      {
+        kind: 'file',
+        path: 'docs/notes.md',
+        start_line: null,
+        end_line: null,
+        text: null,
+        label: 'notes.md'
+      },
+      {
+        kind: 'selection',
+        path: 'src/app.ts',
+        start_line: 5,
+        end_line: 9,
+        text: null,
+        label: 'app.ts:5-9'
+      },
+      {
+        kind: 'current_file',
+        path: 'src/app.ts',
+        start_line: null,
+        end_line: null,
+        text: null,
+        label: 'app.ts'
+      }
+    ])
+  })
+
+  it('只有选区引用时同样构造 context（不是 null）', async () => {
+    await openEditor(FILE_A)
+    setEditorSelection({ path: FILE_A, startLine: 1, endLine: 2 })
+    addSelectionRef()
+
+    await sendMessage('这两行')
+
+    const params = callsOf(Methods.llm.chatStream)[0]?.params as LlmChatStreamParams
+    expect(params.context?.refs.map((ref) => ref.kind)).toEqual(['selection'])
+  })
+
+  it('开着文件、有选区但没加引用时仍传 context: null：当前文件不会自动注入', async () => {
+    await openEditor(FILE_A)
+    setEditorSelection({ path: FILE_A, startLine: 1, endLine: 3 })
+
+    await sendMessage('普通提问')
+
+    expect((callsOf(Methods.llm.chatStream)[0]?.params as LlmChatStreamParams).context).toBeNull()
+  })
+
+  it('选区引用的估算文本带真实行区间，而不是笼统的整文件', async () => {
+    await openEditor(FILE_A)
+    h.setCountTokens(120)
+    setEditorSelection({ path: FILE_A, startLine: 3, endLine: 8 })
+    addSelectionRef()
+
+    await sendMessage('看看这几行')
+
+    const countCall = callsOf(Methods.llm.countTokens)[0]?.params as LlmCountTokensParams
+    expect(countCall.texts).toEqual(['@selection src/app.ts:3-8'])
   })
 })
 

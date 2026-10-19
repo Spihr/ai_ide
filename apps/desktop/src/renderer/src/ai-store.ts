@@ -31,15 +31,19 @@ import type { AiEvent, CredentialStatus } from '../../shared/ipc'
 import { aiApi } from './ai-api'
 import {
   buildChatContext,
+  chipEstimateText,
   chipLabel,
   contextKey,
   makeTokenEstimate,
   normalizePath,
+  normalizeRange,
   rankCompletions,
+  selectionLabel,
   toRelativePath,
   type ChipKind,
   type CompletionItem,
   type ContextChip,
+  type LineRange,
   type TokenEstimate
 } from './context-completion'
 import { getEditorState } from './store'
@@ -201,7 +205,7 @@ function activeWorkspace(): { id: string; root: string } | null {
 
 /** 已选引用的去重键，用于「已经加进来的别再出现在候选里」。 */
 function selectedKeys(): string[] {
-  return state.chips.map((chip) => contextKey(chip.kind, chip.path))
+  return state.chips.map((chip) => contextKey(chip.kind, chip.path, chip.range ?? null))
 }
 
 /**
@@ -327,26 +331,44 @@ export function acceptCompletion(): ContextChip | null {
   return chip
 }
 
-/** 加入一条引用；同类型同路径视为重复，返回是否真的新增。 */
+/**
+ * 加入一条引用；同类型同路径同区间视为重复，返回是否真的新增。
+ *
+ * `selection` 引用必须有合法行区间：行号是这条引用唯一的内容线索，缺了就只能整文件注入，
+ * 与用户「只发这几行」的意图不符——所以这种引用直接拒收，而不是悄悄降级成整文件。
+ */
 export function addChip(chip: ContextChip): boolean {
   const path = normalizePath(chip.path)
-  const key = contextKey(chip.kind, path)
-  if (state.chips.some((item) => contextKey(item.kind, item.path) === key)) return false
+  if (path.length === 0) return false
+  const range = chip.kind === 'selection' ? normalizeRange(chip.range ?? null) : null
+  if (chip.kind === 'selection' && !range) return false
+
+  const key = contextKey(chip.kind, path, range)
+  if (state.chips.some((item) => contextKey(item.kind, item.path, item.range ?? null) === key)) {
+    return false
+  }
+
+  const fallbackLabel = range ? selectionLabel(path, range) : chipLabel(path)
+  const next: ContextChip = {
+    kind: chip.kind,
+    path,
+    label: chip.label.length > 0 ? chip.label : fallbackLabel
+  }
+  if (range) next.range = range
   setState({
-    chips: [
-      ...state.chips,
-      { kind: chip.kind, path, label: chip.label.length > 0 ? chip.label : chipLabel(path) }
-    ],
+    chips: [...state.chips, next],
     // 引用变了，上一次的 token 估算就过期了：留着会拿旧数字误导用户。
     tokenEstimate: null
   })
   return true
 }
 
-/** 点 chip 上的 × 移除一条引用。 */
-export function removeChip(kind: ChipKind, path: string): void {
-  const key = contextKey(kind, path)
-  const chips = state.chips.filter((chip) => contextKey(chip.kind, chip.path) !== key)
+/** 点 chip 上的 × 移除一条引用；选区引用要连行区间一起给（同一文件可以有好几条）。 */
+export function removeChip(kind: ChipKind, path: string, range?: LineRange | null): void {
+  const key = contextKey(kind, path, range ?? null)
+  const chips = state.chips.filter(
+    (chip) => contextKey(chip.kind, chip.path, chip.range ?? null) !== key
+  )
   if (chips.length === state.chips.length) return
   setState({ chips, tokenEstimate: null })
 }
@@ -354,6 +376,99 @@ export function removeChip(kind: ChipKind, path: string): void {
 export function clearChips(): void {
   if (state.chips.length === 0) return
   setState({ chips: [], tokenEstimate: null })
+}
+
+// ---------------------------------------------------------------------------
+// 编辑器侧引用（当前文件 / 选区）
+// ---------------------------------------------------------------------------
+
+/** 编辑器当前能提供的引用：活动文件（相对工作区根）+ 选区行号。 */
+interface EditorRefSource {
+  /** 相对工作区根、以 `/` 分隔。 */
+  path: string
+  /** 编辑器里真的选中了内容时才有值。 */
+  range: LineRange | null
+}
+
+/** `toRelativePath` 没能相对化时会原样返回绝对路径，这里用形状把它认出来。 */
+function looksAbsolute(path: string): boolean {
+  return path.startsWith('/') || /^[a-zA-Z]:\//.test(path)
+}
+
+/**
+ * 读编辑器侧引用源。
+ *
+ * 三条「不给」的规矩：
+ * 1. 没打开工作区 / 没活动文件 → 没有引用可言；
+ * 2. 活动文件落在工作区外 → 不给：内核按工作区根展开路径，工作区外的文件只能靠绝对路径
+ *    越界，那是内核要报错的东西，不该由外壳悄悄塞进 chip；
+ * 3. 行号只取编辑器上报的真实值，外壳不读文件正文、更不推断行号。
+ */
+function editorRefSource(): EditorRefSource | null {
+  const editor = getEditorState()
+  const workspace = editor.workspace
+  const absPath = editor.activePath
+  if (!workspace || !absPath) return null
+
+  const path = toRelativePath(absPath, workspace.root)
+  if (path.length === 0 || looksAbsolute(path)) return null
+
+  const selection = editor.selection
+  const range =
+    selection && normalizePath(selection.path) === normalizePath(absPath)
+      ? normalizeRange({ startLine: selection.startLine, endLine: selection.endLine })
+      : null
+  return { path, range }
+}
+
+/**
+ * 拿不到引用源时给一句对得上的话。
+ *
+ * 不分清「没打开文件」和「文件在工作区外」的话，用户会照着「先打开一个文件」的提示
+ * 反复打开同一个（工作区外的）文件，却永远加不进来。
+ */
+function refBlockHint(what: string): string {
+  const editor = getEditorState()
+  if (editor.workspace && editor.activePath) {
+    return `当前文件不在工作区内：对话只能引用工作区内的文件，无法加入${what}。`
+  }
+  return `编辑器里还没有打开的文件：先打开一个文件，再引用${what}。`
+}
+
+/** 把编辑器里的活动文件作为 `current_file` 引用加入 chip。 */
+export function addCurrentFileRef(): boolean {
+  const source = editorRefSource()
+  if (!source) {
+    setState({ hint: refBlockHint('当前文件') })
+    return false
+  }
+  const label = chipLabel(source.path)
+  if (!addChip({ kind: 'current_file', path: source.path, label })) {
+    setState({ hint: `「${label}」已经在引用里了。` })
+    return false
+  }
+  setState({ hint: null })
+  return true
+}
+
+/** 把编辑器当前选区（行号区间）作为 `selection` 引用加入 chip。 */
+export function addSelectionRef(): boolean {
+  const source = editorRefSource()
+  if (!source) {
+    setState({ hint: refBlockHint('选区') })
+    return false
+  }
+  if (!source.range) {
+    setState({ hint: '编辑器里没有选中内容：选中要引用的代码段（行号会一并带上）再试。' })
+    return false
+  }
+  const label = selectionLabel(source.path, source.range)
+  if (!addChip({ kind: 'selection', path: source.path, label, range: source.range })) {
+    setState({ hint: `「${label}」已经在引用里了。` })
+    return false
+  }
+  setState({ hint: null })
+  return true
 }
 
 function modelViewOf(modelRef: ModelRef): ModelView | undefined {
@@ -386,7 +501,9 @@ async function estimateTokens(
     const result = await aiApi.countTokens({
       model_ref: modelRef,
       messages,
-      texts: chips.map((chip) => `@${chip.kind} ${chip.path}`)
+      // 引用片段按 chip 顺序排：`texts` 的口径就是「还没组装成消息的引用片段」。
+      // 选区引用长短不一，描述里要带行区间，交给 `chipEstimateText` 拼。
+      texts: chips.map((chip) => chipEstimateText(chip))
     })
     const tokens =
       typeof result?.tokens === 'number' && Number.isFinite(result.tokens) ? result.tokens : 0

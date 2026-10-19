@@ -12,6 +12,7 @@ import {
   MAX_COMPLETIONS,
   buildChatContext,
   buildContextRefs,
+  chipEstimateText,
   chipLabel,
   contextKey,
   estimateExceeded,
@@ -19,7 +20,9 @@ import {
   formatTokenHint,
   makeTokenEstimate,
   normalizePath,
+  normalizeRange,
   rankCompletions,
+  selectionLabel,
   stripTrigger,
   toRelativePath,
   type CompletionItem
@@ -146,6 +149,85 @@ describe('请求体构造', () => {
       refs: buildContextRefs(CHIPS),
       compress: null
     })
+  })
+})
+
+describe('编辑器侧引用：行区间与 refs 对齐', () => {
+  it('行区间只认 ≥1 的整数；端点写反就对调，非法一律 null（宁可不引用，也不编一个区间）', () => {
+    expect(normalizeRange({ startLine: 5, endLine: 9 })).toEqual({ startLine: 5, endLine: 9 })
+    expect(normalizeRange({ startLine: 9, endLine: 5 })).toEqual({ startLine: 5, endLine: 9 })
+    expect(normalizeRange({ startLine: 0, endLine: 5 })).toBeNull()
+    expect(normalizeRange({ startLine: 1, endLine: -1 })).toBeNull()
+    expect(normalizeRange({ startLine: 1.5, endLine: 5 })).toBeNull()
+    expect(normalizeRange(null)).toBeNull()
+  })
+
+  it('选区 chip 文案带行号：同一个文件的两段代码要能一眼分清', () => {
+    expect(selectionLabel('src/app.ts', { startLine: 3, endLine: 8 })).toBe('app.ts:3-8')
+    expect(selectionLabel('src/app.ts', null)).toBe('app.ts')
+  })
+
+  it('行区间参与 contextKey：同文件两段选区是两条引用，不会互相顶掉', () => {
+    expect(contextKey('selection', 'src/app.ts', { startLine: 1, endLine: 3 })).toBe(
+      'selection:src/app.ts#1-3'
+    )
+    expect(contextKey('selection', 'src/app.ts', { startLine: 4, endLine: 6 })).not.toBe(
+      contextKey('selection', 'src/app.ts', { startLine: 1, endLine: 3 })
+    )
+    // 整文件引用不带区间，且路径归一后大小写无关
+    expect(contextKey('current_file', 'SRC\\App.ts')).toBe('current_file:src/app.ts')
+  })
+
+  it('current_file 只给路径、selection 只给真实行号，text 一律 null（正文不落盘就不伪造）', () => {
+    expect(
+      buildContextRefs([
+        { kind: 'current_file', path: 'src/app.ts', label: 'app.ts' },
+        {
+          kind: 'selection',
+          path: 'src/app.ts',
+          label: 'app.ts:5-9',
+          range: { startLine: 5, endLine: 9 }
+        }
+      ])
+    ).toEqual([
+      {
+        kind: 'current_file',
+        path: 'src/app.ts',
+        start_line: null,
+        end_line: null,
+        text: null,
+        label: 'app.ts'
+      },
+      {
+        kind: 'selection',
+        path: 'src/app.ts',
+        start_line: 5,
+        end_line: 9,
+        text: null,
+        label: 'app.ts:5-9'
+      }
+    ])
+  })
+
+  it('选区缺合法行号时整条丢弃，也不会因此给内核一个空壳 context', () => {
+    const broken = [{ kind: 'selection' as const, path: 'src/app.ts', label: 'app.ts' }]
+    expect(buildContextRefs(broken)).toEqual([])
+    expect(buildChatContext(broken, 'ws-1')).toBeNull()
+  })
+
+  it('估算文本带上 kind 与行区间：选区长短不一，用整文件描述会估不准', () => {
+    expect(
+      chipEstimateText({
+        kind: 'selection',
+        path: 'src/app.ts',
+        label: 'app.ts:3-8',
+        range: { startLine: 3, endLine: 8 }
+      })
+    ).toBe('@selection src/app.ts:3-8')
+    expect(chipEstimateText({ kind: 'current_file', path: 'src/app.ts', label: 'app.ts' })).toBe(
+      '@current_file src/app.ts'
+    )
+    expect(chipEstimateText({ kind: 'folder', path: 'src', label: 'src' })).toBe('@folder src')
   })
 })
 
