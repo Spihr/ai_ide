@@ -40,41 +40,63 @@ impl SseDecoder {
         self.buffer.push_str(chunk);
         let mut frames = Vec::new();
         while let Some(index) = self.buffer.find('\n') {
-            let line = self.buffer[..index].trim_end_matches('\r').to_string();
+            let line = self.buffer[..index].to_string();
             self.buffer.drain(..=index);
-            if line.is_empty() {
-                if let Some(frame) = self.current.take() {
-                    frames.push(frame);
-                }
-                continue;
-            }
-            if line.starts_with(':') {
-                // 注释行（常见于心跳 `: ping`），忽略。
-                continue;
-            }
-            let (field, value) = match line.split_once(':') {
-                Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
-                None => (line.as_str(), ""),
-            };
-            let frame = self.current.get_or_insert_with(SseFrame::default);
-            match field {
-                "event" => frame.event = Some(value.to_string()),
-                "data" => {
-                    if !frame.data.is_empty() {
-                        frame.data.push('\n');
-                    }
-                    frame.data.push_str(value);
-                }
-                // `id:` / `retry:` 与对话内容无关，M2 不需要。
-                _ => {}
-            }
+            self.consume_line(&line, &mut frames);
         }
         frames
     }
 
     /// 流结束时收尾：上游没以空行结尾时补出最后一帧。
+    ///
+    /// 「没以空行结尾」有两种形态，都必须补出：
+    /// 1. 最后一行**连换行符都没有**（流恰好在 `}` 之后断掉）——它还在 `buffer` 里、
+    ///    从未进过解析器，必须先按整行喂一遍，否则这一帧会被静默丢掉；
+    ///    OpenAI 兼容网关在流被代理截断时就是这种形态，丢掉的往往是 `[DONE]`
+    ///    或带 `finish_reason` 的那一帧，调用方会误判成「上游提前中断」。
+    /// 2. 最后一行有换行符、但没有跟空行——它已在 [`Self::push`] 阶段进了 `current`，
+    ///    直接取出即可。
     pub fn finish(&mut self) -> Option<SseFrame> {
-        self.current.take()
+        let mut frames = Vec::new();
+        if !self.buffer.is_empty() {
+            let rest = std::mem::take(&mut self.buffer);
+            self.consume_line(&rest, &mut frames);
+        }
+        frames.pop().or_else(|| self.current.take())
+    }
+
+    /// 消费一行原始文本（行尾 `\n` 已剥离，可能残留 `\r`）。
+    ///
+    /// 只有在遇到空行时才把 `current` 关帧推入 `frames`——这是 SSE 的分帧规则，
+    /// [`Self::finish`] 复用同一套语义来补出流末尾没被空行关掉的那一帧。
+    fn consume_line(&mut self, raw: &str, frames: &mut Vec<SseFrame>) {
+        let line = raw.trim_end_matches('\r');
+        if line.is_empty() {
+            if let Some(frame) = self.current.take() {
+                frames.push(frame);
+            }
+            return;
+        }
+        if line.starts_with(':') {
+            // 注释行（常见于心跳 `: ping`），忽略。
+            return;
+        }
+        let (field, value) = match line.split_once(':') {
+            Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
+            None => (line, ""),
+        };
+        let frame = self.current.get_or_insert_with(SseFrame::default);
+        match field {
+            "event" => frame.event = Some(value.to_string()),
+            "data" => {
+                if !frame.data.is_empty() {
+                    frame.data.push('\n');
+                }
+                frame.data.push_str(value);
+            }
+            // `id:` / `retry:` 与对话内容无关，M2 不需要。
+            _ => {}
+        }
     }
 }
 
@@ -107,8 +129,9 @@ pub fn translate_openai_chunk(data: &str) -> Result<TranslatedChunk, LlmError> {
         });
     }
 
-    let envelope: ChunkEnvelope = serde_json::from_str(trimmed)
-        .map_err(|err| LlmError::BadResponse(format!("分片不是合法 JSON: {err}; 原文: {trimmed}")))?;
+    let envelope: ChunkEnvelope = serde_json::from_str(trimmed).map_err(|err| {
+        LlmError::BadResponse(format!("分片不是合法 JSON: {err}; 原文: {trimmed}"))
+    })?;
 
     let mut out = TranslatedChunk {
         message_id: envelope.id.clone(),
@@ -126,7 +149,12 @@ pub fn translate_openai_chunk(data: &str) -> Result<TranslatedChunk, LlmError> {
     }
 
     for choice in envelope.choices {
-        if let Some(text) = choice.delta.content.as_ref().filter(|text| !text.is_empty()) {
+        if let Some(text) = choice
+            .delta
+            .content
+            .as_ref()
+            .filter(|text| !text.is_empty())
+        {
             out.events.push(StreamEvent::Delta { text: text.clone() });
         }
         if let Some(reasoning) = choice
@@ -248,7 +276,10 @@ mod tests {
     #[test]
     fn frames_survive_split_across_chunks() {
         let mut decoder = SseDecoder::new();
-        assert!(decoder.push("data: {\"a\"").is_empty(), "没凑齐空行前不该出帧");
+        assert!(
+            decoder.push("data: {\"a\"").is_empty(),
+            "没凑齐空行前不该出帧"
+        );
         let frames = decoder.push(":1}\n\n");
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].data, "{\"a\":1}");
@@ -257,7 +288,8 @@ mod tests {
     #[test]
     fn frames_handle_crlf_and_comments_and_multiline_data() {
         let mut decoder = SseDecoder::new();
-        let frames = decoder.push(": ping\r\n\r\nevent: message\r\ndata: line1\r\ndata: line2\r\n\r\n");
+        let frames =
+            decoder.push(": ping\r\n\r\nevent: message\r\ndata: line1\r\ndata: line2\r\n\r\n");
         assert_eq!(frames.len(), 1, "心跳注释不该产出帧");
         assert_eq!(frames[0].event.as_deref(), Some("message"));
         assert_eq!(frames[0].data, "line1\nline2");
@@ -269,6 +301,39 @@ mod tests {
         assert!(decoder.push("data: [DONE]").is_empty());
         let trailing = decoder.finish().expect("残留帧应被补出");
         assert_eq!(trailing.data, "[DONE]");
+        assert!(decoder.finish().is_none(), "收尾后不应重复出帧");
+    }
+
+    #[test]
+    fn finish_flushes_frame_that_ended_with_newline_but_no_blank_line() {
+        // 第二种形态：最后一行带换行，但整段流没有以空行收尾。
+        // 它已在 push 里进了 current，finish 必须原样取出。
+        let mut decoder = SseDecoder::new();
+        assert!(decoder.push("data: {\"a\":1}\n").is_empty());
+        let trailing = decoder.finish().expect("未闭合的帧应被补出");
+        assert_eq!(trailing.data, "{\"a\":1}");
+        assert!(decoder.finish().is_none());
+    }
+
+    #[test]
+    fn finish_keeps_event_and_multiline_fields_of_trailing_frame() {
+        let mut decoder = SseDecoder::new();
+        decoder.push("event: message\ndata: line1\ndata: line2");
+        let trailing = decoder.finish().expect("多行 data 的残留帧应被补出");
+        assert_eq!(trailing.event.as_deref(), Some("message"));
+        assert_eq!(trailing.data, "line1\nline2");
+    }
+
+    #[test]
+    fn finish_does_not_invent_frames_from_comments_or_blank_tail() {
+        // 只有心跳注释残留时不该凭空造帧；流已正常收尾时 finish 也应为 None。
+        let mut quiet = SseDecoder::new();
+        quiet.push(": ping");
+        assert!(quiet.finish().is_none(), "注释行不该产出帧");
+
+        let mut done = SseDecoder::new();
+        assert_eq!(done.push("data: [DONE]\n\n").len(), 1);
+        assert!(done.finish().is_none(), "已闭合的帧不该被重复吐出");
     }
 
     #[test]
@@ -367,7 +432,10 @@ mod tests {
         assert_eq!(map_finish_reason("stop"), FinishReason::Stop);
         assert_eq!(map_finish_reason("length"), FinishReason::Length);
         assert_eq!(map_finish_reason("function_call"), FinishReason::ToolCalls);
-        assert_eq!(map_finish_reason("content_filter"), FinishReason::ContentFilter);
+        assert_eq!(
+            map_finish_reason("content_filter"),
+            FinishReason::ContentFilter
+        );
         assert_eq!(map_finish_reason("something_new"), FinishReason::Unknown);
     }
 

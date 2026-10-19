@@ -88,9 +88,13 @@ pub mod event {
     pub const PROVIDER_CHANGED: &str = "provider.changed";
 }
 
-/// 内核已实现的方法全集，用于单测与能力声明。
+/// 内核**真正接线并可路由**的方法全集，用于单测与能力声明。
 ///
 /// 注意：事件（通知）不计入能力清单——能力清单描述的是「可被请求的方法」。
+///
+/// 这里的「已实现」有严格含义：`crates/core` 的 `dispatch.rs` 里有对应分支，
+/// 调用不会返回 `-32601`。协议里**定义了但还没接线**的方法见
+/// [`DECLARED_NOT_IMPLEMENTED`]。
 pub const IMPLEMENTED: &[&str] = &[
     core::HELLO,
     core::PING,
@@ -108,6 +112,18 @@ pub const IMPLEMENTED: &[&str] = &[
     workspace::REVEAL,
     search::FILES,
     search::CONTENT,
+];
+
+/// 协议面**已定义、但内核尚未接线**的方法。
+///
+/// 这些常量与它们背后的 DTO 是 M2 的协议成果（见 `crates/protocol/src/dto.rs`），
+/// 但 `crates/core` 的 `dispatch.rs` 还没有对应分支——`ai-ide-core` 目前甚至
+/// 还没有依赖 `ai-ide-llm`。现在调用它们只会拿到 `-32601 method not found`。
+///
+/// 因此它们**不能**出现在 [`IMPLEMENTED`] 里：`IMPLEMENTED` 会经 `core.hello`
+/// 回报给 Main 作为能力清单，一旦虚报，Main 会照单调用、然后拿到一片 `-32601`。
+/// 接线时（M2 的下一步）把对应常量从本表移入 [`IMPLEMENTED`]，两张表始终互斥。
+pub const DECLARED_NOT_IMPLEMENTED: &[&str] = &[
     provider::UPSERT,
     provider::LIST,
     provider::DELETE,
@@ -127,13 +143,62 @@ mod tests {
 
     #[test]
     fn implemented_list_covers_core_and_m1_domains() {
-        assert_eq!(IMPLEMENTED.len(), 27);
+        assert_eq!(IMPLEMENTED.len(), 16);
         assert!(IMPLEMENTED.contains(&"core.ping"));
         assert!(IMPLEMENTED.contains(&"$/cancelRequest"));
         assert!(IMPLEMENTED.contains(&"workspace.read_file"));
         assert!(IMPLEMENTED.contains(&"search.content"));
-        assert!(IMPLEMENTED.contains(&"provider.upsert"));
-        assert!(IMPLEMENTED.contains(&"llm.chat_stream"));
+    }
+
+    #[test]
+    fn m2_surface_is_declared_but_not_implemented_yet() {
+        // M2 的协议面（provider / model / llm）已经定义，但 core 分发还没接线，
+        // 所以一个都不能进能力清单——否则 core.hello 会向 Main 虚报能力。
+        assert_eq!(DECLARED_NOT_IMPLEMENTED.len(), 11);
+        for name in DECLARED_NOT_IMPLEMENTED {
+            assert!(
+                !IMPLEMENTED.contains(name),
+                "{name} 尚未接线，不能出现在 IMPLEMENTED 里"
+            );
+        }
+        assert!(DECLARED_NOT_IMPLEMENTED.contains(&provider::UPSERT));
+        assert!(DECLARED_NOT_IMPLEMENTED.contains(&model::DELETE));
+        assert!(DECLARED_NOT_IMPLEMENTED.contains(&llm::CHAT_STREAM));
+        assert!(DECLARED_NOT_IMPLEMENTED.contains(&llm::COUNT_TOKENS));
+    }
+
+    #[test]
+    fn capability_tables_are_disjoint_and_cover_every_request_method() {
+        let mut all: Vec<&str> = IMPLEMENTED.to_vec();
+        all.extend_from_slice(DECLARED_NOT_IMPLEMENTED);
+        let total = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), total, "两张表不得有重叠");
+        assert_eq!(total, 27, "应恰好覆盖协议里定义的全部 27 个请求方法");
+    }
+
+    #[test]
+    fn events_are_not_part_of_the_capability_surface() {
+        // 事件是单向通知，不能被请求，因此两张方法表里都不该出现。
+        for event in [
+            event::LOG,
+            event::WORKSPACE_CHANGED,
+            event::LLM_STARTED,
+            event::LLM_DELTA,
+            event::LLM_REASONING,
+            event::LLM_TOOL_CALL,
+            event::LLM_USAGE,
+            event::LLM_FINISHED,
+            event::LLM_ERROR,
+            event::PROVIDER_CHANGED,
+        ] {
+            assert!(!IMPLEMENTED.contains(&event), "事件不该进能力清单: {event}");
+            assert!(
+                !DECLARED_NOT_IMPLEMENTED.contains(&event),
+                "事件不该进待接线方法表: {event}"
+            );
+        }
     }
 
     #[test]

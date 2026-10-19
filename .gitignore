@@ -12,6 +12,9 @@ target/
 **/*.rs.bk
 *.pdb
 
+# ts-rs 的暂存目录：pnpm types:gen 搬运到 packages/shared-types/src/generated 后会删除它，不入库
+crates/protocol/bindings/
+
 # ---- 打包产物 ----
 release/
 *.exe

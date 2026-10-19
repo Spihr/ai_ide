@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 use ai_ide_llm::openai::spec_of;
 use ai_ide_llm::provider::CancelToken;
 use ai_ide_llm::transport::{HttpRequest, HttpResponse, HttpTransport, ResponseBody};
-use ai_ide_llm::{ChatRequest, LlmError, OpenAiProvider, Provider, SecretString, StreamEvent, Usage};
+use ai_ide_llm::{
+    ChatRequest, LlmError, OpenAiProvider, Provider, SecretString, StreamEvent, Usage,
+};
 use ai_ide_protocol::dto::{ChatMessage, ChatParams, ChatRole, ModelRef, ToolSpec};
 
 /// 测试替身：记下请求，回放预设响应。
@@ -154,7 +156,10 @@ fn user_request() -> ChatRequest {
 /// 把完整 SSE 文本切成每块 2 字节——刻意在汉字与行中间切断，
 /// 逼出「增量 UTF-8 解码 + 跨块分帧」两条最容易写错的路径。
 fn split_every_two_bytes(text: &str) -> Vec<Vec<u8>> {
-    text.as_bytes().chunks(2).map(|chunk| chunk.to_vec()).collect()
+    text.as_bytes()
+        .chunks(2)
+        .map(|chunk| chunk.to_vec())
+        .collect()
 }
 
 const SSE_SCRIPT: &str = concat!(
@@ -236,8 +241,7 @@ async fn request_is_wired_with_auth_streaming_and_model() {
 
     let request = transport.last_request();
     assert_eq!(
-        request.url,
-        "https://gw.example.com/v1/chat/completions",
+        request.url, "https://gw.example.com/v1/chat/completions",
         "base_url 尾部斜杠应被归一化"
     );
     assert!(request.stream, "chat_stream 必须走流式读取");
@@ -275,6 +279,8 @@ async fn cancel_before_send_never_touches_the_network() {
     assert_eq!(transport.request_count(), 0, "已取消的请求不该发出去");
 }
 
+/// 取消必须在流还在跑的时候就生效。上游若把整段响应一次性缓冲好（本地网关、代理缓存），
+/// poll 永远 Ready——本用例同时守着「不许把 tokio 线程占满、停止按钮不许形同虚设」。
 #[tokio::test]
 async fn cancel_mid_stream_stops_reading() {
     let transport = FakeTransport::stream(split_every_two_bytes(SSE_SCRIPT));
@@ -296,7 +302,10 @@ async fn cancel_mid_stream_stops_reading() {
         .await
         .unwrap_err();
     let mut receiver = watcher.await.unwrap();
-    assert!(matches!(err, LlmError::Cancelled), "取消必须返回 Cancelled: {err}");
+    assert!(
+        matches!(err, LlmError::Cancelled),
+        "取消必须返回 Cancelled: {err}"
+    );
     // 取消后不应再有事件（尤其是不应出现 Finished）。
     let mut tail = Vec::new();
     while let Some(event) = receiver.recv().await {
@@ -355,9 +364,14 @@ async fn auth_failure_surfaces_upstream_message() {
         .await
         .unwrap_err();
     match err {
-        LlmError::AuthFailed { status, message, .. } => {
+        LlmError::AuthFailed {
+            status, message, ..
+        } => {
             assert_eq!(status, 401);
-            assert!(message.contains("Invalid API key"), "应透传上游文案: {message}");
+            assert!(
+                message.contains("Invalid API key"),
+                "应透传上游文案: {message}"
+            );
         }
         other => panic!("期望 AuthFailed，实际: {other}"),
     }
@@ -399,6 +413,47 @@ async fn truncated_stream_is_reported_as_unavailable() {
         matches!(err, LlmError::Unavailable { .. }),
         "半截流必须显式报错而不是当作正常结束: {err}"
     );
+}
+
+#[tokio::test]
+async fn stream_ending_without_final_blank_line_still_completes() {
+    // 与上一个用例互为对照：这次上游给出的是一段**正常但没以空行收尾**的流——
+    // 最后一帧连换行符都没有。SSE 的分帧规则要求以空行关帧，所以这最后一帧必须由
+    // `SseDecoder::finish` 补出来；少了它，带 `finish_reason` 的尾帧会被静默丢掉，
+    // 一次正常收流会被误报成「上游提前中断」。
+    let script = concat!(
+        "data: {\"id\":\"chatcmpl-tail\",\"choices\":[{\"delta\":{\"content\":\"尾帧也要在\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]",
+    );
+    let transport = FakeTransport::stream(split_every_two_bytes(script));
+    let provider = provider_with(transport, Some("sk-abcdefghijklmnop"));
+    let (sink, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+    let usage = provider
+        .chat_stream(user_request(), sink, CancelToken::new())
+        .await
+        .expect("尾帧没有空行收尾时，也必须按正常结束处理");
+
+    let mut events = Vec::new();
+    while let Some(event) = receiver.recv().await {
+        events.push(event);
+    }
+
+    assert_eq!(
+        events,
+        vec![
+            StreamEvent::Delta {
+                text: "尾帧也要在".to_string()
+            },
+            StreamEvent::Finished {
+                reason: ai_ide_protocol::dto::FinishReason::Stop,
+                message_id: Some("chatcmpl-tail".to_string()),
+            },
+        ],
+        "被补出的尾帧里，结束原因与响应 id 都不能丢"
+    );
+    assert_eq!(usage, Usage::default());
 }
 
 #[tokio::test]

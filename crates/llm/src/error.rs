@@ -84,7 +84,9 @@ impl LlmError {
     /// 上游原始错误体（若拿到了）。
     pub fn upstream(&self) -> Option<Value> {
         match self {
-            Self::AuthFailed { upstream, .. } | Self::RateLimited { upstream, .. } => upstream.clone(),
+            Self::AuthFailed { upstream, .. } | Self::RateLimited { upstream, .. } => {
+                upstream.clone()
+            }
             _ => None,
         }
     }

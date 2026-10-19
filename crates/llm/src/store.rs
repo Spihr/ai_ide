@@ -134,7 +134,8 @@ impl StoreSnapshot {
             Some(existing) => *existing = record,
             None => self.models.push(record),
         }
-        self.models.sort_by(|left, right| left.model_pk.cmp(&right.model_pk));
+        self.models
+            .sort_by(|left, right| left.model_pk.cmp(&right.model_pk));
     }
 
     /// 删除模型记录。
@@ -212,12 +213,8 @@ impl ProviderStore for JsonFileStore {
         std::fs::write(&temp, text)
             .map_err(|err| LlmError::Store(format!("{} 写入失败: {err}", temp.display())))?;
         // 同目录 rename 覆盖：要么是旧文件，要么是新文件，不会出现半截内容。
-        std::fs::rename(&temp, &self.path).map_err(|err| {
-            LlmError::Store(format!(
-                "{} 替换失败: {err}",
-                self.path.display()
-            ))
-        })?;
+        std::fs::rename(&temp, &self.path)
+            .map_err(|err| LlmError::Store(format!("{} 替换失败: {err}", self.path.display())))?;
         Ok(())
     }
 }
@@ -235,10 +232,7 @@ mod tests {
     use super::*;
 
     fn temp_store() -> JsonFileStore {
-        let dir = std::env::temp_dir().join(format!(
-            "ai-ide-llm-store-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("ai-ide-llm-store-{}", uuid::Uuid::new_v4()));
         JsonFileStore::new(dir.join("providers.json"))
     }
 

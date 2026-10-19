@@ -50,10 +50,9 @@ impl HttpRequest {
     pub fn post_json(url: impl Into<String>, body: impl Into<String>, timeout_ms: u64) -> Self {
         let mut request = Self::post(url, timeout_ms);
         request.body = Some(body.into());
-        request.headers.push((
-            "content-type".to_string(),
-            "application/json".to_string(),
-        ));
+        request
+            .headers
+            .push(("content-type".to_string(), "application/json".to_string()));
         request
     }
 
@@ -328,9 +327,10 @@ mod tests {
 
     #[test]
     fn request_builders_set_expected_shape() {
-        let request = HttpRequest::post_json("https://example.com/v1/chat/completions", "{}", 30_000)
-            .header("authorization", "Bearer sk-test")
-            .streaming();
+        let request =
+            HttpRequest::post_json("https://example.com/v1/chat/completions", "{}", 30_000)
+                .header("authorization", "Bearer sk-test")
+                .streaming();
         assert_eq!(request.method, HttpMethod::Post);
         assert!(request.stream);
         assert!(request

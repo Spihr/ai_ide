@@ -222,7 +222,8 @@ mod tests {
 
     #[test]
     fn build_provider_supports_chat_completions_only_in_m2() {
-        let transport: Arc<dyn HttpTransport> = Arc::new(crate::transport::ReqwestTransport::default());
+        let transport: Arc<dyn HttpTransport> =
+            Arc::new(crate::transport::ReqwestTransport::default());
         let built = build_provider(
             &record("p1", ProviderProtocol::OpenaiChatCompletions),
             Some(SecretString::new("sk-abcdefghijkl")),
@@ -271,7 +272,9 @@ mod tests {
             "Ollama",
             "未实现协议也要能报出人话"
         );
-        assert!(describe(&spec_of("p", "网关", "https://x", BTreeMap::new(), None)).contains("网关"));
+        assert!(
+            describe(&spec_of("p", "网关", "https://x", BTreeMap::new(), None)).contains("网关")
+        );
         assert_eq!(model_pk("p1", "m1"), "p1:m1");
     }
 }

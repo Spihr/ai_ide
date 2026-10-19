@@ -58,7 +58,8 @@ pub fn estimate_text(text: &str) -> u64 {
 }
 
 /// 面向 UI 的估算口径说明（写进 `llm.count_tokens` 的 `note`）。
-pub const ESTIMATE_NOTE: &str = "内核未接真实分词器，按「CJK 1 字≈1 token、ASCII 4 字符≈1 token、每消息 +4」估算，误差约 ±20%";
+pub const ESTIMATE_NOTE: &str =
+    "内核未接真实分词器，按「CJK 1 字≈1 token、ASCII 4 字符≈1 token、每消息 +4」估算，误差约 ±20%";
 
 #[cfg(test)]
 mod tests {

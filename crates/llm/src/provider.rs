@@ -101,13 +101,22 @@ mod tests {
 
     #[test]
     fn timeout_falls_back_to_default() {
-        assert_eq!(spec("https://x", None).timeout_ms_or_default(), DEFAULT_TIMEOUT_MS);
+        assert_eq!(
+            spec("https://x", None).timeout_ms_or_default(),
+            DEFAULT_TIMEOUT_MS
+        );
         assert_eq!(spec("https://x", Some(1234)).timeout_ms_or_default(), 1234);
     }
 
     #[test]
     fn base_url_is_normalized() {
-        assert_eq!(spec("https://api.x.com/v1/", None).normalized_base_url(), "https://api.x.com/v1");
-        assert_eq!(spec("https://api.x.com/v1", None).normalized_base_url(), "https://api.x.com/v1");
+        assert_eq!(
+            spec("https://api.x.com/v1/", None).normalized_base_url(),
+            "https://api.x.com/v1"
+        );
+        assert_eq!(
+            spec("https://api.x.com/v1", None).normalized_base_url(),
+            "https://api.x.com/v1"
+        );
     }
 }

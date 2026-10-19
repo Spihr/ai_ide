@@ -70,6 +70,55 @@ export type { SearchContentParams } from "./generated/SearchContentParams";
 export type { ContentMatch } from "./generated/ContentMatch";
 export type { SearchContentResult } from "./generated/SearchContentResult";
 
+// ---- provider.* 方法（M2）----
+export type { ProviderChangedEvent } from "./generated/ProviderChangedEvent";
+export type { ProviderDeleteParams } from "./generated/ProviderDeleteParams";
+export type { ProviderListParams } from "./generated/ProviderListParams";
+export type { ProviderListResult } from "./generated/ProviderListResult";
+export type { ProviderProtocol } from "./generated/ProviderProtocol";
+export type { ProviderTestOverride } from "./generated/ProviderTestOverride";
+export type { ProviderTestParams } from "./generated/ProviderTestParams";
+export type { ProviderTestResult } from "./generated/ProviderTestResult";
+export type { ProviderUpsertParams } from "./generated/ProviderUpsertParams";
+export type { ProviderUpsertResult } from "./generated/ProviderUpsertResult";
+export type { ProviderView } from "./generated/ProviderView";
+
+// ---- model.* 方法（M2）----
+export type { ModelCaps } from "./generated/ModelCaps";
+export type { ModelDefaultParams } from "./generated/ModelDefaultParams";
+export type { ModelDeleteParams } from "./generated/ModelDeleteParams";
+export type { ModelInfo } from "./generated/ModelInfo";
+export type { ModelListParams } from "./generated/ModelListParams";
+export type { ModelListResult } from "./generated/ModelListResult";
+export type { ModelRef } from "./generated/ModelRef";
+export type { ModelUpsertParams } from "./generated/ModelUpsertParams";
+export type { ModelUpsertResult } from "./generated/ModelUpsertResult";
+export type { ModelView } from "./generated/ModelView";
+
+// ---- llm.* 方法（M2）----
+export type { ChatAttachment } from "./generated/ChatAttachment";
+export type { ChatMessage } from "./generated/ChatMessage";
+export type { ChatParams } from "./generated/ChatParams";
+export type { ChatRole } from "./generated/ChatRole";
+export type { ChatToolCall } from "./generated/ChatToolCall";
+export type { FinishReason } from "./generated/FinishReason";
+export type { LlmCancelParams } from "./generated/LlmCancelParams";
+export type { LlmChatStreamParams } from "./generated/LlmChatStreamParams";
+export type { LlmChatStreamResult } from "./generated/LlmChatStreamResult";
+export type { LlmCountTokensParams } from "./generated/LlmCountTokensParams";
+export type { LlmCountTokensResult } from "./generated/LlmCountTokensResult";
+export type { LlmDeltaEvent } from "./generated/LlmDeltaEvent";
+export type { LlmErrorEvent } from "./generated/LlmErrorEvent";
+export type { LlmFinishedEvent } from "./generated/LlmFinishedEvent";
+export type { LlmListModelsParams } from "./generated/LlmListModelsParams";
+export type { LlmListModelsResult } from "./generated/LlmListModelsResult";
+export type { LlmReasoningEvent } from "./generated/LlmReasoningEvent";
+export type { LlmStartedEvent } from "./generated/LlmStartedEvent";
+export type { LlmToolCallEvent } from "./generated/LlmToolCallEvent";
+export type { LlmUsageEvent } from "./generated/LlmUsageEvent";
+export type { ToolChoice } from "./generated/ToolChoice";
+export type { ToolSpec } from "./generated/ToolSpec";
+
 // ---- 协议常量（与 Rust 侧保持一致的运行时镜像）----
 
 /** JSON-RPC 版本字面量。对应 Rust `ai_ide_protocol::JSONRPC_VERSION`。 */

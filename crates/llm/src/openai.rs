@@ -11,7 +11,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use ai_ide_protocol::dto::{ChatMessage, ChatRole, FinishReason, ModelInfo, ModelRef, ToolChoice, ToolSpec};
+use ai_ide_protocol::dto::{
+    ChatMessage, ChatRole, FinishReason, ModelInfo, ModelRef, ToolChoice, ToolSpec,
+};
 use serde_json::{json, Map, Value};
 
 use crate::error::LlmError;
@@ -71,11 +73,12 @@ impl OpenAiProvider {
         match self.custom_authorization() {
             Some(_) => Ok(request),
             None => {
-                let key = self.api_key.as_ref().ok_or_else(|| {
-                    LlmError::ProviderNotConfigured {
+                let key = self
+                    .api_key
+                    .as_ref()
+                    .ok_or_else(|| LlmError::ProviderNotConfigured {
                         provider_id: self.spec.id.clone(),
-                    }
-                })?;
+                    })?;
                 Ok(request.header("authorization", format!("Bearer {}", key.expose())))
             }
         }
@@ -126,7 +129,12 @@ impl OpenAiProvider {
     }
 
     /// 非 200 响应的分类。
-    fn classify_error(&self, status: u16, headers: &[(String, String)], body_text: &str) -> LlmError {
+    fn classify_error(
+        &self,
+        status: u16,
+        headers: &[(String, String)],
+        body_text: &str,
+    ) -> LlmError {
         let upstream = parse_upstream_error(body_text);
         let message = upstream_message(&upstream).unwrap_or_else(|| truncate(body_text, 400));
         match status {
@@ -206,11 +214,21 @@ impl Provider for OpenAiProvider {
         let mut state = StreamState::default();
 
         loop {
+            // 每轮先同步判一次取消。上游若把整段响应一次性缓冲好（本地网关、代理缓存），
+            // 下面的 select 每轮两支同时就绪、命中哪支是随机的，光靠 select 会让「取消」
+            // 退化成概率事件；这里判一次，取消一定命中，且不会再往 sink 推任何事件。
+            if cancel.is_cancelled() {
+                return Err(LlmError::Cancelled);
+            }
             let next = tokio::select! {
+                // 流正等上游数据（Pending）时就地响应取消，不必等下一块分片到齐。
                 _ = cancel.cancelled() => return Err(LlmError::Cancelled),
                 item = futures_util::StreamExt::next(&mut chunks) => item,
             };
             let Some(item) = next else { break };
+            // 主动让出一次执行权。从解码到 emit 全程没有 Pending 点，上游一旦是「本地已缓冲」，
+            // 本任务会把 tokio 线程占满，点「停止」的那个任务根本排不上调度，取消要等整段读完。
+            tokio::task::yield_now().await;
             let bytes = item?;
             let text = decoder.push(&bytes);
             if text.is_empty() {
@@ -256,9 +274,8 @@ impl Provider for OpenAiProvider {
             return Err(self.classify_error(response.status, &response.headers, &text));
         }
         let text = self.require_text_body(&response)?.to_string();
-        let envelope: ModelsEnvelope = serde_json::from_str(&text).map_err(|err| {
-            LlmError::BadResponse(format!("模型列表解析失败: {err}"))
-        })?;
+        let envelope: ModelsEnvelope = serde_json::from_str(&text)
+            .map_err(|err| LlmError::BadResponse(format!("模型列表解析失败: {err}")))?;
         Ok(envelope
             .data
             .into_iter()
@@ -471,7 +488,13 @@ mod tests {
 
     fn provider() -> OpenAiProvider {
         OpenAiProvider::new(
-            spec_of("p1", "本地网关", "https://gw.example.com/v1/", BTreeMap::new(), None),
+            spec_of(
+                "p1",
+                "本地网关",
+                "https://gw.example.com/v1/",
+                BTreeMap::new(),
+                None,
+            ),
             Some(SecretString::new("sk-test-key-123456")),
             Arc::new(crate::transport::ReqwestTransport::default()),
         )
@@ -522,7 +545,13 @@ mod tests {
     #[test]
     fn authorize_without_key_reports_not_configured() {
         let provider = OpenAiProvider::new(
-            spec_of("p1", "网关", "https://gw.example.com/v1", BTreeMap::new(), None),
+            spec_of(
+                "p1",
+                "网关",
+                "https://gw.example.com/v1",
+                BTreeMap::new(),
+                None,
+            ),
             None,
             Arc::new(crate::transport::ReqwestTransport::default()),
         );
@@ -609,7 +638,10 @@ mod tests {
 
         let auth = provider.classify_error(401, &[], body);
         assert!(matches!(auth, LlmError::AuthFailed { status: 401, .. }));
-        assert_eq!(auth.code(), ai_ide_protocol::ErrorCode::PROVIDER_AUTH_FAILED);
+        assert_eq!(
+            auth.code(),
+            ai_ide_protocol::ErrorCode::PROVIDER_AUTH_FAILED
+        );
 
         let rate_limited = provider.classify_error(
             429,
@@ -625,7 +657,10 @@ mod tests {
         let unavailable = provider.classify_error(503, &[], "<html>gateway</html>");
         assert!(matches!(
             unavailable,
-            LlmError::Unavailable { status: Some(503), .. }
+            LlmError::Unavailable {
+                status: Some(503),
+                ..
+            }
         ));
     }
 

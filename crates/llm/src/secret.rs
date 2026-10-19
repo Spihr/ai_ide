@@ -93,7 +93,10 @@ mod tests {
     fn debug_never_leaks_plaintext() {
         let secret = SecretString::new("sk-abcdefghijklmnop1234567890");
         let rendered = format!("{secret:?}");
-        assert!(!rendered.contains("abcdefghijklmnop"), "Debug 泄露明文: {rendered}");
+        assert!(
+            !rendered.contains("abcdefghijklmnop"),
+            "Debug 泄露明文: {rendered}"
+        );
         assert!(rendered.contains('…'));
     }
 
@@ -101,7 +104,10 @@ mod tests {
     fn display_never_leaks_plaintext() {
         let secret = SecretString::new("sk-abcdefghijklmnop1234567890");
         let rendered = format!("{secret}");
-        assert!(!rendered.contains("abcdefghijklmnop"), "Display 泄露明文: {rendered}");
+        assert!(
+            !rendered.contains("abcdefghijklmnop"),
+            "Display 泄露明文: {rendered}"
+        );
     }
 
     #[test]
