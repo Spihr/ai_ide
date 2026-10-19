@@ -36,6 +36,32 @@ pub mod search {
     pub const CONTENT: &str = "search.content";
 }
 
+/// Provider 与模型管理（M2）。
+///
+/// 密钥本身不在这层：`provider.upsert` 的 `api_key` 只进内存保管（见 docs/02 §6.3），
+/// `provider.list` 只回 `has_key` / `key_hint` 这类脱敏信息。
+pub mod provider {
+    pub const UPSERT: &str = "provider.upsert";
+    pub const LIST: &str = "provider.list";
+    pub const DELETE: &str = "provider.delete";
+    pub const TEST: &str = "provider.test";
+}
+
+/// 模型目录（M2）。模型挂在 Provider 下，把「厂商」与「具体模型」解耦。
+pub mod model {
+    pub const UPSERT: &str = "model.upsert";
+    pub const LIST: &str = "model.list";
+    pub const DELETE: &str = "model.delete";
+}
+
+/// 模型接入（M2：流式对话、取消、模型枚举、token 计数）。
+pub mod llm {
+    pub const CHAT_STREAM: &str = "llm.chat_stream";
+    pub const CANCEL: &str = "llm.cancel";
+    pub const LIST_MODELS: &str = "llm.list_models";
+    pub const COUNT_TOKENS: &str = "llm.count_tokens";
+}
+
 /// Core → Main 的通知（事件）。
 pub mod event {
     /// 内核日志转发，便于 Main 侧统一落盘。
@@ -44,6 +70,22 @@ pub mod event {
     pub const WORKSPACE_CHANGED: &str = "workspace.changed";
     /// 后台全量索引完成，附带最终规模统计。
     pub const WORKSPACE_INDEXED: &str = "workspace.indexed";
+    /// 流式对话开始（M2）。每次 `llm.chat_stream` 恰好一条。
+    pub const LLM_STARTED: &str = "llm.started";
+    /// 正文增量（M2）。
+    pub const LLM_DELTA: &str = "llm.delta";
+    /// 思维链增量（M2，仅推理模型有）。
+    pub const LLM_REASONING: &str = "llm.reasoning";
+    /// 工具调用增量（M2，参数按片段拼接）。
+    pub const LLM_TOOL_CALL: &str = "llm.tool_call";
+    /// 用量统计（M2）。
+    pub const LLM_USAGE: &str = "llm.usage";
+    /// 流正常结束（M2）。与 [`LLM_ERROR`] 互斥。
+    pub const LLM_FINISHED: &str = "llm.finished";
+    /// 流异常终止（M2）。与 [`LLM_FINISHED`] 互斥。
+    pub const LLM_ERROR: &str = "llm.error";
+    /// Provider 目录发生变化（M2），供设置界面刷新。
+    pub const PROVIDER_CHANGED: &str = "provider.changed";
 }
 
 /// 内核已实现的方法全集，用于单测与能力声明。
@@ -66,6 +108,17 @@ pub const IMPLEMENTED: &[&str] = &[
     workspace::REVEAL,
     search::FILES,
     search::CONTENT,
+    provider::UPSERT,
+    provider::LIST,
+    provider::DELETE,
+    provider::TEST,
+    model::UPSERT,
+    model::LIST,
+    model::DELETE,
+    llm::CHAT_STREAM,
+    llm::CANCEL,
+    llm::LIST_MODELS,
+    llm::COUNT_TOKENS,
 ];
 
 #[cfg(test)]
@@ -74,11 +127,23 @@ mod tests {
 
     #[test]
     fn implemented_list_covers_core_and_m1_domains() {
-        assert_eq!(IMPLEMENTED.len(), 16);
+        assert_eq!(IMPLEMENTED.len(), 27);
         assert!(IMPLEMENTED.contains(&"core.ping"));
         assert!(IMPLEMENTED.contains(&"$/cancelRequest"));
         assert!(IMPLEMENTED.contains(&"workspace.read_file"));
         assert!(IMPLEMENTED.contains(&"search.content"));
+        assert!(IMPLEMENTED.contains(&"provider.upsert"));
+        assert!(IMPLEMENTED.contains(&"llm.chat_stream"));
+    }
+
+    #[test]
+    fn llm_domain_matches_protocol_doc() {
+        assert_eq!(provider::UPSERT, "provider.upsert");
+        assert_eq!(model::LIST, "model.list");
+        assert_eq!(llm::CHAT_STREAM, "llm.chat_stream");
+        assert_eq!(llm::COUNT_TOKENS, "llm.count_tokens");
+        assert_eq!(event::LLM_DELTA, "llm.delta");
+        assert_eq!(event::PROVIDER_CHANGED, "provider.changed");
     }
 
     #[test]

@@ -1,0 +1,25 @@
+[package]
+name = "ai-ide-llm"
+description = "模型接入：Provider 抽象、OpenAI Chat Completions/SSE 适配与凭据内存保管（M2）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ai-ide-protocol = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

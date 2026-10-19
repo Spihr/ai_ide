@@ -4,6 +4,7 @@ members = [
     "crates/protocol",
     "crates/workspace",
     "crates/indexer",
+    "crates/llm",
     "crates/core",
 ]
 
@@ -33,6 +34,16 @@ tokio = { version = "1.40", features = [
     "time",
     "signal",
 ] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# 模型接入（M2）：HTTP 客户端走 reqwest + rustls（见 docs/02 §9、docs/04 §1）
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls-tls-webpki-roots",
+] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+async-trait = "0.1"
 
 # 可观测性
 tracing = "0.1"
@@ -54,6 +65,7 @@ trash = "3.3"
 ai-ide-protocol = { path = "crates/protocol" }
 ai-ide-workspace = { path = "crates/workspace" }
 ai-ide-indexer = { path = "crates/indexer" }
+ai-ide-llm = { path = "crates/llm" }
 
 [profile.release]
 lto = "thin"

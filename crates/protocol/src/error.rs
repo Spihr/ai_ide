@@ -41,6 +41,8 @@ impl ErrorCode {
     pub const PROVIDER_AUTH_FAILED: Self = Self(2002);
     pub const PROVIDER_RATE_LIMITED: Self = Self(2003);
     pub const CONTEXT_OVERFLOW: Self = Self(2004);
+    /// 上游不可达、超时或返回了无法解释的响应体（含本地未启用 HTTP 传输的骨架态）。
+    pub const PROVIDER_UNAVAILABLE: Self = Self(2005);
 
     // ---------- 3xxx 工具 ----------
     pub const TOOL_NOT_ALLOWED: Self = Self(3001);

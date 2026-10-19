@@ -519,6 +519,543 @@ pub struct SearchContentResult {
     pub truncated: bool,
 }
 
+// ---------------------------------------------------------------------------
+// provider.* / model.* —— Provider 与模型目录（M2）
+// ---------------------------------------------------------------------------
+
+/// 上游协议种类。M2 只落地 `openai_chat_completions`（其余为已定义、待实现的适配器）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderProtocol {
+    /// OpenAI Chat Completions，覆盖所有兼容网关（DeepSeek / Kimi / 智谱 / OpenRouter …）。
+    OpenaiChatCompletions,
+    /// OpenAI Responses API。
+    OpenaiResponses,
+    /// Anthropic Messages API。
+    AnthropicMessages,
+    /// Google Gemini `generateContent`。
+    Gemini,
+    /// Ollama 本地服务。
+    Ollama,
+}
+
+/// `provider.upsert` 请求参数。
+///
+/// 不带 `id` 即新建；带 `id` 即原地更新（`api_key` 缺省表示沿用已存密钥）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ProviderUpsertParams {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub name: String,
+    pub protocol: ProviderProtocol,
+    /// 接口根地址，例如 `https://api.deepseek.com/v1`。
+    pub base_url: String,
+    /// API Key。**只进内存保管**（docs/02 §6.3），内核与磁盘上的自定义配置里都不落明文。
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// 附加请求头（例如网关要求的 `X-Api-Version`）。
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+    /// 是否启用。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 单次请求超时（毫秒）；缺省 60000。
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub timeout_ms: Option<u64>,
+}
+
+/// `provider.upsert` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ProviderUpsertResult {
+    pub provider_id: String,
+}
+
+/// `provider.list` 请求参数（空对象）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ProviderListParams {}
+
+/// Provider 的脱敏视图：**任何字段都不含明文密钥**。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ProviderView {
+    pub id: String,
+    pub name: String,
+    pub protocol: ProviderProtocol,
+    pub base_url: String,
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+    pub enabled: bool,
+    /// 是否已配置密钥。
+    pub has_key: bool,
+    /// 密钥指纹，形如 `sk-a…4f2c`；未配置时为 null。
+    #[serde(default)]
+    #[ts(optional)]
+    pub key_hint: Option<String>,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub timeout_ms: Option<u64>,
+    /// 最近一次 `provider.test` 是否通过；从未测试过为 null。
+    #[serde(default)]
+    #[ts(type = "boolean | null")]
+    pub last_test_ok: Option<bool>,
+    #[ts(type = "number")]
+    pub created_at_ms: i64,
+    #[ts(type = "number")]
+    pub updated_at_ms: i64,
+}
+
+/// `provider.list` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ProviderListResult {
+    pub providers: Vec<ProviderView>,
+}
+
+/// `provider.delete` 请求参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ProviderDeleteParams {
+    pub provider_id: String,
+}
+
+/// `provider.test` 的内联覆盖项：允许「先试连通、再决定是否保存」。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ProviderTestOverride {
+    pub protocol: ProviderProtocol,
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+/// `provider.test` 请求参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ProviderTestParams {
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    /// 内联覆盖（JS 侧字段名就是 `override`）。
+    #[serde(default, rename = "override")]
+    pub override_spec: Option<ProviderTestOverride>,
+}
+
+/// `provider.test` 响应结果。连通性判定只看「能否拿到模型列表」。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ProviderTestResult {
+    pub ok: bool,
+    #[ts(type = "number")]
+    pub latency_ms: u64,
+    #[ts(type = "number")]
+    pub models_found: u64,
+    /// 失败原因摘要或附加说明。
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// 模型能力标注。决定 UI 是否显示推理折叠块、是否允许挂工具。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ModelCaps {
+    /// 是否支持流式输出。
+    pub streaming: bool,
+    /// 是否支持工具调用。
+    pub tools: bool,
+    /// 是否输出思维链（OpenAI 兼容的 `reasoning_content`）。
+    pub reasoning: bool,
+    /// 是否支持图片输入。
+    pub vision: bool,
+    /// 上下文窗口（token）；未知为 null。
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub context_window: Option<u64>,
+}
+
+impl Default for ModelCaps {
+    fn default() -> Self {
+        Self {
+            streaming: true,
+            tools: false,
+            reasoning: false,
+            vision: false,
+            context_window: None,
+        }
+    }
+}
+
+/// 模型级默认采样参数，请求未显式给值时使用。
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ModelDefaultParams {
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub max_output_tokens: Option<u64>,
+    #[serde(default)]
+    pub top_p: Option<f64>,
+}
+
+/// `model.upsert` 请求参数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ModelUpsertParams {
+    pub provider_id: String,
+    /// 上游模型名，例如 `deepseek-chat`。
+    pub model_id: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub caps: Option<ModelCaps>,
+    #[serde(default)]
+    pub params: Option<ModelDefaultParams>,
+}
+
+/// `model.upsert` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ModelUpsertResult {
+    /// 模型条目的稳定主键（`provider_id` + `model_id`）。
+    pub model_pk: String,
+}
+
+/// 模型条目视图。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ModelView {
+    pub model_pk: String,
+    pub provider_id: String,
+    pub model_id: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    pub caps: ModelCaps,
+    pub params: ModelDefaultParams,
+    #[ts(type = "number")]
+    pub created_at_ms: i64,
+}
+
+/// `model.list` 请求参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ModelListParams {
+    /// 只列某个 Provider 下的模型；缺省列出全部。
+    #[serde(default)]
+    pub provider_id: Option<String>,
+}
+
+/// `model.list` 响应结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ModelListResult {
+    pub models: Vec<ModelView>,
+}
+
+/// `model.delete` 请求参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ModelDeleteParams {
+    pub model_pk: String,
+}
+
+// ---------------------------------------------------------------------------
+// llm.* —— 流式对话（M2）
+// ---------------------------------------------------------------------------
+
+/// 模型引用：Provider + 上游模型名。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ModelRef {
+    pub provider_id: String,
+    pub model_id: String,
+}
+
+/// 对话角色。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatRole {
+    System,
+    User,
+    Assistant,
+    Tool,
+}
+
+/// 消息附件（M2 只透传路径，读取与去重由 M3 的 @上下文接手）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ChatAttachment {
+    /// 附件类型，当前只有 `file`。
+    pub kind: String,
+    /// 相对工作区根的路径。
+    pub path: String,
+}
+
+/// 一次工具调用（助手发起）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ChatToolCall {
+    pub id: String,
+    pub name: String,
+    /// 参数 JSON 原文（不做解析，避免上游半截 JSON 导致丢内容）。
+    pub arguments: String,
+}
+
+/// 一条对话消息。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ChatMessage {
+    pub role: ChatRole,
+    /// 文本内容；纯工具调用消息可能为空串。
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub attachments: Vec<ChatAttachment>,
+    /// 助手消息携带的工具调用。
+    #[serde(default)]
+    pub tool_calls: Vec<ChatToolCall>,
+    /// `role = tool` 时指向被回应的调用 id。
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+}
+
+/// 可挂载的工具声明。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ToolSpec {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// JSON Schema。
+    pub parameters: serde_json::Value,
+}
+
+/// 工具选择策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolChoice {
+    Auto,
+    None,
+    Required,
+}
+
+/// 单次请求的采样参数。
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ChatParams {
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub max_output_tokens: Option<u64>,
+    #[serde(default)]
+    pub top_p: Option<f64>,
+    /// 停止序列。
+    #[serde(default)]
+    pub stop: Vec<String>,
+    /// 厂商私有参数透传（例如 `{"top_k": 40}`）。
+    #[serde(default)]
+    pub extra: Option<serde_json::Value>,
+}
+
+/// `llm.chat_stream` 请求参数。
+///
+/// 方法立即返回 `{stream_id}`，内容通过 `llm.*` 事件族推送——这样 UI 的
+/// 「发送」按钮不会被网络往返阻塞，取消也能作用在真正在途的那条流上。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LlmChatStreamParams {
+    /// 调用方生成的流 id（同时作为 `$/cancelRequest` 之外的取消句柄）。
+    pub stream_id: String,
+    /// 会话 id（M3 会话持久化用，M2 仅原样回落到事件里）。
+    #[serde(default)]
+    pub session_id: Option<String>,
+    pub model_ref: ModelRef,
+    pub messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub tools: Vec<ToolSpec>,
+    #[serde(default)]
+    pub tool_choice: Option<ToolChoice>,
+    #[serde(default)]
+    pub params: Option<ChatParams>,
+}
+
+/// `llm.chat_stream` 响应结果（立即返回）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LlmChatStreamResult {
+    pub stream_id: String,
+}
+
+/// `llm.cancel` 请求参数。幂等：不存在的 `stream_id` 也回成功。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LlmCancelParams {
+    pub stream_id: String,
+}
+
+/// `llm.list_models` 请求参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LlmListModelsParams {
+    pub provider_id: String,
+}
+
+/// 上游模型条目。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ModelInfo {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub owned_by: Option<String>,
+}
+
+/// `llm.list_models` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LlmListModelsResult {
+    pub models: Vec<ModelInfo>,
+}
+
+/// `llm.count_tokens` 请求参数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LlmCountTokensParams {
+    pub model_ref: ModelRef,
+    pub messages: Vec<ChatMessage>,
+}
+
+/// `llm.count_tokens` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LlmCountTokensResult {
+    #[ts(type = "number")]
+    pub tokens: u64,
+    /// 是否为精确值。M2 未接真实分词器，一律为 false（估算口径见 crate 文档）。
+    pub exact: bool,
+    /// 估算口径说明。
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// 流结束原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum FinishReason {
+    Stop,
+    Length,
+    ToolCalls,
+    ContentFilter,
+    /// 上游给了未知值时的兜底（原始值见 `llm.error` 之外的日志）。
+    Unknown,
+}
+
+/// `llm.started` 事件载荷。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LlmStartedEvent {
+    pub stream_id: String,
+    pub model_ref: ModelRef,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[ts(type = "number")]
+    pub started_at_ms: i64,
+}
+
+/// `llm.delta` 事件载荷：正文增量。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LlmDeltaEvent {
+    pub stream_id: String,
+    pub text: String,
+}
+
+/// `llm.reasoning` 事件载荷：思维链增量。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LlmReasoningEvent {
+    pub stream_id: String,
+    pub text: String,
+}
+
+/// `llm.tool_call` 事件载荷：按片段拼接的工具调用。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LlmToolCallEvent {
+    pub stream_id: String,
+    /// 调用序号（同一条流内从 0 开始）。
+    #[ts(type = "number")]
+    pub index: u32,
+    /// 首帧带 id，后续帧为 null。
+    #[serde(default)]
+    pub id: Option<String>,
+    /// 首帧带函数名，后续帧为 null。
+    #[serde(default)]
+    pub name: Option<String>,
+    /// 参数 JSON 的增量片段。
+    pub arguments_delta: String,
+}
+
+/// `llm.usage` 事件载荷。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LlmUsageEvent {
+    pub stream_id: String,
+    #[ts(type = "number")]
+    pub prompt_tokens: u64,
+    #[ts(type = "number")]
+    pub completion_tokens: u64,
+    /// 命中提示缓存的 token 数；上游未报为 null。
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub cached_tokens: Option<u64>,
+}
+
+/// `llm.finished` 事件载荷。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LlmFinishedEvent {
+    pub stream_id: String,
+    pub finish_reason: FinishReason,
+    /// 上游响应 id（若有）。
+    #[serde(default)]
+    pub message_id: Option<String>,
+}
+
+/// `llm.error` 事件载荷：流异常终止。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LlmErrorEvent {
+    pub stream_id: String,
+    pub code: crate::error::ErrorCode,
+    pub message: String,
+    /// 上游原始错误体（脱敏后），便于用户自查配额与模型名。
+    #[serde(default)]
+    pub upstream: Option<serde_json::Value>,
+}
+
+/// `provider.changed` 事件载荷。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ProviderChangedEvent {
+    /// 变更类型：`upserted` / `deleted`。
+    pub kind: String,
+    pub provider_id: String,
+}
+
+/// 布尔字段的 serde 默认值：`true`。
+fn default_true() -> bool {
+    true
+}
+
 /// 供 TS 侧引用的导出目录常量说明（不参与序列化，仅为文档服务）。
 pub const _TS_EXPORT_DIR: &str = TS_DIR;
 
