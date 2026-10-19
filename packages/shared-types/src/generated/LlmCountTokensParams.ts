@@ -4,5 +4,11 @@ import type { ModelRef } from "./ModelRef";
 
 /**
  * `llm.count_tokens` 请求参数。
+ *
+ * 两个口径可以同时给出，结果相加：
+ * - `messages`：消息口径，含每条消息的固定结构开销；
+ * - `texts`：纯文本口径，用于输入框里还没组装成消息的引用片段。
+ *
+ * 两者都缺省时结果为 0（不报错）：UI 每敲一个字都会调它，为空格子报错只会刷屏。
  */
-export type LlmCountTokensParams = { model_ref: ModelRef, messages: Array<ChatMessage>, };
+export type LlmCountTokensParams = { model_ref: ModelRef, messages: Array<ChatMessage>, texts: Array<string>, };

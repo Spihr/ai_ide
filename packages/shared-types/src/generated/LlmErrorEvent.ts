@@ -9,4 +9,10 @@ export type LlmErrorEvent = { stream_id: string, code: ErrorCode, message: strin
 /**
  * 上游原始错误体（脱敏后），便于用户自查配额与模型名。
  */
-upstream: JsonValue | null, };
+upstream: JsonValue | null, 
+/**
+ * 上游建议的重试等待（毫秒，来自 `Retry-After`）。
+ *
+ * 有它 UI 才能显示「N 秒后重试」；只报一句「限流了」等于把最有用的一半信息丢掉。
+ */
+retry_after_ms: bigint | null, };

@@ -365,7 +365,10 @@ export async function sendMessage(text: string): Promise<boolean> {
       messages,
       tools: [],
       tool_choice: null,
-      params: null
+      params: null,
+      // M3 的上下文引用目前只在内核侧落地（@文件/@文件夹 的 UI 接入属后续切片），
+      // 这里显式传 null，保持 M2 的「不注入」行为。
+      context: null
     })
     // 协议约定内核原样回执调用方给的 `stream_id`（`llm.chat_stream` 的时序是
     // 「先回 id 再开流」），这里仍然以回执为准对齐一次：万一哪天内核改成自己生成

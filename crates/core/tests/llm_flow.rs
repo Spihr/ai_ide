@@ -12,11 +12,14 @@
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use ai_ide_llm::tokens::estimate_text;
+use ai_ide_protocol::ErrorCode;
 use serde_json::{json, Value};
 
 mod common;
@@ -793,5 +796,332 @@ fn 上游连不上_报网络错误而不是超时() {
     assert_eq!(
         core.error_code("llm.list_models", json!({ "provider_id": provider_id })),
         2005
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M3 上下文引用
+//
+// 这一段的断言对象是**上游收到的请求体**：引用渲染、行号标注、裁剪都发生在
+// 「出网之前」，只盯 `llm.*` 事件看不到模型究竟收到了什么。
+// ---------------------------------------------------------------------------
+
+/// 一个用完即删的临时工作区。引用渲染要真的读盘、真的列目录，因此不能打桩。
+struct TempWorkspace {
+    root: PathBuf,
+}
+
+impl TempWorkspace {
+    fn new(tag: &str) -> Self {
+        let root = std::env::temp_dir().join(format!("ai-ide-m3-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src").join("lib")).expect("建目录");
+        std::fs::write(root.join("README.md"), "# 演示\n\n第一行\n第二行\n").expect("写 README");
+        std::fs::write(
+            root.join("src").join("main.ts"),
+            "export const main = 1;\nexport const other = 2;\n",
+        )
+        .expect("写 main.ts");
+        std::fs::write(
+            root.join("src").join("lib").join("util.ts"),
+            "export const util = 3;\n",
+        )
+        .expect("写 util.ts");
+        Self { root }
+    }
+
+    fn display(&self) -> String {
+        self.root.display().to_string()
+    }
+}
+
+impl Drop for TempWorkspace {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// 打开工作区并取回 id（引用默认落在活动工作区上，显式传 id 更稳）。
+fn open_workspace(core: &mut Core, workspace: &TempWorkspace) -> String {
+    let opened = core.ok("workspace.open", json!({ "path": workspace.display() }));
+    opened["workspace_id"]
+        .as_str()
+        .expect("workspace_id 是字符串")
+        .to_string()
+}
+
+/// 带上下文引用的 `llm.chat_stream` 参数。
+fn chat_params_with_context(
+    stream_id: &str,
+    provider_id: &str,
+    workspace_id: &str,
+    refs: Value,
+    compress: Value,
+) -> Value {
+    let mut params = chat_params(stream_id, provider_id);
+    params["session_id"] = json!("sess-ctx");
+    params["context"] = json!({
+        "workspace_id": workspace_id,
+        "refs": refs,
+        "compress": compress,
+    });
+    params
+}
+
+/// 把一条流读到 `llm.finished` 为止，返回累计的增量文本。
+fn drain_stream(core: &mut Core) -> String {
+    let mut text = String::new();
+    loop {
+        let event = next_event(core);
+        match event["method"].as_str().unwrap_or_default() {
+            "llm.delta" => text.push_str(event["params"]["text"].as_str().unwrap_or_default()),
+            "llm.error" => panic!("流意外报错：{}", event["params"]),
+            "llm.finished" => return text,
+            _ => {}
+        }
+    }
+}
+
+/// 取上游最近一次请求体里的 `messages`。
+fn injected_messages(upstream: &MockUpstream) -> Vec<Value> {
+    let seen = upstream.last_chat();
+    let body: Value = serde_json::from_str(&seen.body).expect("请求体是 JSON");
+    body["messages"]
+        .as_array()
+        .expect("messages 是数组")
+        .clone()
+}
+
+#[test]
+fn 上下文引用_渲染成前置系统消息且顺序与来源标注齐全() {
+    let upstream = MockUpstream::start(
+        vec![Script::Stream {
+            frames: vec![
+                delta("收到"),
+                sse(json!({
+                    "id": "chatcmpl-ctx",
+                    "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+                })),
+            ],
+        }],
+        json!({ "data": [] }),
+    );
+    let data = TempDataDir::new("llm-context");
+    let workspace = TempWorkspace::new("inject");
+    let mut core = Core::spawn(&data.root);
+    let provider_id = setup_provider(&mut core, &upstream);
+    let workspace_id = open_workspace(&mut core, &workspace);
+
+    let refs = json!([
+        { "kind": "file", "path": "src/main.ts" },
+        { "kind": "folder", "path": "src" },
+        { "kind": "selection", "path": "README.md", "start_line": 3, "end_line": 4 },
+    ]);
+    let (_, accepted) = core.ok_async(
+        "llm.chat_stream",
+        chat_params_with_context("s-引用", &provider_id, &workspace_id, refs, Value::Null),
+    );
+    assert_eq!(accepted["stream_id"], json!("s-引用"));
+
+    // 引用要在「发请求之前」就位，否则上游收到的就是一份没有引用的提问。
+    assert_eq!(drain_stream(&mut core), "收到");
+
+    let messages = injected_messages(&upstream);
+    assert_eq!(
+        messages.len(),
+        2,
+        "引用应合并成一条 system 消息，而不是给每条引用各加一条：{messages:?}"
+    );
+    assert_eq!(messages[0]["role"], json!("system"), "引用必须是系统消息");
+    assert_eq!(
+        messages[1]["content"],
+        json!("你好"),
+        "用户消息要原样保留，并排在引用之后"
+    );
+
+    let injected = messages[0]["content"]
+        .as_str()
+        .expect("system 内容是字符串");
+    let file_at = injected
+        .find("<file path=\"src/main.ts\"")
+        .expect("文件引用要带来源标注");
+    let folder_at = injected
+        .find("<folder path=\"src\"")
+        .expect("目录引用要带来源标注");
+    let selection_at = injected
+        .find("<selection path=\"README.md\" lines=\"3-4\">")
+        .expect("选区要带行区间标注");
+    assert!(
+        file_at < folder_at && folder_at < selection_at,
+        "注入顺序必须等于 refs 顺序：{injected}"
+    );
+
+    assert!(
+        injected.contains("1| export const main = 1;"),
+        "注入内容要带行号，模型才能引用具体位置：{injected}"
+    );
+    assert!(
+        injected.contains("  util.ts"),
+        "目录树要含子目录条目并缩进：{injected}"
+    );
+    assert!(
+        injected.contains("3| 第一行") && injected.contains("4| 第二行"),
+        "选区要注入请求的行区间：{injected}"
+    );
+    assert!(
+        !injected.contains("# 演示"),
+        "选区外的行不该被注入：{injected}"
+    );
+}
+
+#[test]
+fn 上下文引用_越界路径在派发前就被拒() {
+    let upstream = MockUpstream::start(vec![], json!({ "data": [] }));
+    let data = TempDataDir::new("llm-context-escape");
+    let workspace = TempWorkspace::new("escape");
+    let mut core = Core::spawn(&data.root);
+    let provider_id = setup_provider(&mut core, &upstream);
+    let workspace_id = open_workspace(&mut core, &workspace);
+
+    // 越界不走「读不到就标注」那条容错路径：路径闸门是安全边界。
+    let code = core.error_code(
+        "llm.chat_stream",
+        chat_params_with_context(
+            "s-越界",
+            &provider_id,
+            &workspace_id,
+            json!([{ "kind": "file", "path": "../outside.txt" }]),
+            Value::Null,
+        ),
+    );
+    assert_eq!(
+        code,
+        i64::from(ErrorCode::PATH_OUT_OF_WORKSPACE.as_i32()),
+        "越界必须是路径错误码，而不是笼统的「请求不合法」"
+    );
+
+    // 被拒的请求既不该先回 `{stream_id}`，也不该把内容发到上游。
+    assert!(
+        core.events_named("llm.started").is_empty(),
+        "渲染失败的请求不该先发 started：{:?}",
+        core.events()
+    );
+    assert!(
+        upstream
+            .requests()
+            .iter()
+            .all(|seen| !seen.path.ends_with("/chat/completions")),
+        "越界引用不该出网"
+    );
+}
+
+#[test]
+fn 上下文引用_预算不足时裁剪并留下裁剪说明() {
+    let upstream = MockUpstream::start(
+        vec![Script::Stream {
+            frames: vec![
+                delta("好"),
+                sse(json!({
+                    "id": "chatcmpl-budget",
+                    "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+                })),
+            ],
+        }],
+        json!({ "data": [] }),
+    );
+    let data = TempDataDir::new("llm-context-budget");
+    let workspace = TempWorkspace::new("budget");
+    let mut core = Core::spawn(&data.root);
+    let provider_id = setup_provider(&mut core, &upstream);
+    let workspace_id = open_workspace(&mut core, &workspace);
+
+    let mut big = String::new();
+    for line in 0..800 {
+        big.push_str(&format!("export const value_{line} = {line};\n"));
+    }
+    std::fs::write(workspace.root.join("big.ts"), big).expect("写大文件");
+
+    let budget = 200u64;
+    let (_, accepted) = core.ok_async(
+        "llm.chat_stream",
+        chat_params_with_context(
+            "s-预算",
+            &provider_id,
+            &workspace_id,
+            json!([{ "kind": "file", "path": "big.ts" }]),
+            json!({ "enabled": true, "strategy": "truncate", "budget_tokens": budget }),
+        ),
+    );
+    assert_eq!(accepted["stream_id"], json!("s-预算"));
+    // 裁剪只影响引用内容，链路本身照常走完。
+    assert_eq!(drain_stream(&mut core), "好");
+
+    let messages = injected_messages(&upstream);
+    let injected = messages[0]["content"]
+        .as_str()
+        .expect("system 内容是字符串");
+    assert!(
+        estimate_text(injected) <= budget,
+        "注入内容必须落在预算内：{} > {budget}",
+        estimate_text(injected)
+    );
+    assert!(
+        injected.contains("因 token 预算不足"),
+        "被裁掉的内容要有说明，否则模型会以为它看到了全文：{injected}"
+    );
+    assert!(
+        injected.contains("value_0 = 0;"),
+        "预算内的开头部分要留下：{injected}"
+    );
+    assert!(
+        !injected.contains("value_700"),
+        "预算之外的内容不该混进来：{injected}"
+    );
+}
+
+#[test]
+fn token_估算_合并_messages_与_texts_两个口径() {
+    // 估算不查注册表：网关挂了，输入框的计数也该照常工作。
+    let data = TempDataDir::new("llm-count");
+    let mut core = Core::spawn(&data.root);
+    let model_ref = json!({ "provider_id": "p-未注册", "model_id": MODEL });
+
+    let plain = core.ok(
+        "llm.count_tokens",
+        json!({
+            "model_ref": model_ref,
+            "messages": [{ "role": "user", "content": "你好世界" }],
+        }),
+    );
+    assert_eq!(plain["exact"], json!(false), "M3 仍是估算，不能谎报精确");
+    assert!(
+        plain["note"].is_string(),
+        "口径说明要带出去，UI 才能提示这是估算值：{plain}"
+    );
+    let plain_tokens = plain["tokens"].as_u64().expect("tokens 是数字");
+    assert!(plain_tokens > 0, "非空消息不该估出 0");
+
+    // `texts` 是输入框里还没拼成消息的草稿/引用片段：与 messages 相加，不互相覆盖。
+    let draft = "export const draft = 1;\n".repeat(10);
+    let mixed = core.ok(
+        "llm.count_tokens",
+        json!({
+            "model_ref": model_ref,
+            "messages": [{ "role": "user", "content": "你好世界" }],
+            "texts": [draft],
+        }),
+    );
+    let mixed_tokens = mixed["tokens"].as_u64().expect("tokens 是数字");
+    assert_eq!(
+        mixed_tokens,
+        plain_tokens + estimate_text(&draft),
+        "两种口径要相加，且与内核估算器同口径"
+    );
+
+    let empty = core.ok("llm.count_tokens", json!({ "model_ref": model_ref }));
+    assert_eq!(
+        empty["tokens"],
+        json!(0),
+        "两个口径都缺省时回 0 而不是报错：输入框每敲一个字都会调它"
     );
 }

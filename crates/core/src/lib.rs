@@ -20,6 +20,11 @@
 //! `workspace.*` / `search.*` 在 [`ws`] 模块，`provider.*` / `model.*` 在
 //! [`provider_api`] 模块，两者共用的运行期状态在 [`state`] / [`llm_runtime`]。
 //!
+//! **M3 起 `llm.chat_stream` 消费上下文引用**：`context.refs` 里的
+//! `@文件 / @文件夹 / @选区 / 当前文件` 由 [`context`] 渲染成带行号与来源标注的文本，
+//! 按 token 预算裁剪后插成第一条 `system` 消息；越界路径直接拒绝请求。
+//! `llm.count_tokens` 同时接受 `messages` 与 `texts`，口径不变（`exact:false`）。
+//!
 //! 后续里程碑在此骨架上继续挂载：agent / terminal / mcp / store 等模块。
 //!
 //! ## 绝对约定：stdout 只跑协议
@@ -27,6 +32,7 @@
 //! 任何日志、诊断、进度输出**必须**走 stderr。一旦有别的字节混进 stdout，
 //! 主进程侧的行解析就会崩，而且这种 bug 极难定位。
 
+pub mod context;
 pub mod dispatch;
 pub mod llm_api;
 pub mod llm_runtime;

@@ -863,6 +863,109 @@ pub struct ChatParams {
     pub extra: Option<serde_json::Value>,
 }
 
+// ---------------------------------------------------------------------------
+// 上下文引用（M3）
+// ---------------------------------------------------------------------------
+
+/// `@` 引用的种类。
+///
+/// 四类对应编辑器里四种被选中的对象：文件、目录、选区、当前文件。
+/// `current_file` 与 `file` 的注入格式完全一致，区别只在语义——前者由调用方在
+/// 「用户没显式选文件、但编辑器里有活动文件」的场合给出。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextRefKind {
+    /// `@文件`：注入文件内容（超长时按单文件上限裁剪）。
+    File,
+    /// `@文件夹`：注入目录树（浅层，不递归到底）。
+    Folder,
+    /// `@选区`：注入一段行区间，或选区原文。
+    Selection,
+    /// `@当前文件`：注入编辑器里的活动文件。
+    CurrentFile,
+}
+
+/// 注入内容的压缩策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum CompressStrategy {
+    /// 按 token 预算裁剪（M3 落地的策略）。
+    #[default]
+    Truncate,
+    /// 摘要压缩。需要模型参与，M3 **未实现**：内核收到它按 `truncate` 处理并记日志，
+    /// 而不是假装做过摘要。
+    Summarize,
+}
+
+/// 一条上下文引用。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ContextRef {
+    pub kind: ContextRefKind,
+    /// 工作区内的路径。相对路径按工作区根展开；绝对路径只要落在工作区内也接受。
+    /// 越界路径会让整个 `llm.chat_stream` 报错，不会被静默丢弃。
+    pub path: String,
+    /// 行区间起点（1-based，含）。`file` / `current_file` / `selection` 有效。
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub start_line: Option<u32>,
+    /// 行区间终点（1-based，含）。
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub end_line: Option<u32>,
+    /// 选区原文。仅 `selection` 未给行号时使用；给了行号时以行号为准，
+    /// 免得两处口径不一致。
+    #[serde(default)]
+    pub text: Option<String>,
+    /// 展示名（UI chip 文案）。只用于界面，不注入对话内容。
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// 注入预算与压缩策略。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CompressOptions {
+    /// 是否启用预算裁剪；缺省为 `true`。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub strategy: CompressStrategy,
+    /// 注入内容的 token 预算；留空用内核默认值。
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub budget_tokens: Option<u64>,
+}
+
+impl Default for CompressOptions {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            strategy: CompressStrategy::Truncate,
+            budget_tokens: None,
+        }
+    }
+}
+
+/// `llm.chat_stream` 的上下文引用参数。
+///
+/// 缺省（`null`）时内核不注入任何内容——M2 的行为原样保留，老调用方无需改动。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ChatContext {
+    /// 引用所属工作区；留空回落到活动工作区。
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    /// 引用列表。**注入顺序即数组顺序**。
+    #[serde(default)]
+    pub refs: Vec<ContextRef>,
+    /// 注入预算；留空用默认值。
+    #[serde(default)]
+    pub compress: Option<CompressOptions>,
+}
+
 /// `llm.chat_stream` 请求参数。
 ///
 /// 方法立即返回 `{stream_id}`，内容通过 `llm.*` 事件族推送——这样 UI 的
@@ -883,6 +986,9 @@ pub struct LlmChatStreamParams {
     pub tool_choice: Option<ToolChoice>,
     #[serde(default)]
     pub params: Option<ChatParams>,
+    /// 上下文引用（M3）。内核把引用内容渲染成一条 `system` 消息，插在 `messages` 之前。
+    #[serde(default)]
+    pub context: Option<ChatContext>,
 }
 
 /// `llm.chat_stream` 响应结果（立即返回）。
@@ -925,11 +1031,20 @@ pub struct LlmListModelsResult {
 }
 
 /// `llm.count_tokens` 请求参数。
+///
+/// 两个口径可以同时给出，结果相加：
+/// - `messages`：消息口径，含每条消息的固定结构开销；
+/// - `texts`：纯文本口径，用于输入框里还没组装成消息的引用片段。
+///
+/// 两者都缺省时结果为 0（不报错）：UI 每敲一个字都会调它，为空格子报错只会刷屏。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct LlmCountTokensParams {
     pub model_ref: ModelRef,
+    #[serde(default)]
     pub messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub texts: Vec<String>,
 }
 
 /// `llm.count_tokens` 响应结果。

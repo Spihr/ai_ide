@@ -20,18 +20,20 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use ai_ide_llm::tokens::{estimate_tokens, ESTIMATE_NOTE};
+use ai_ide_llm::tokens::{estimate_text, estimate_tokens, ESTIMATE_NOTE};
 use ai_ide_llm::{CancelToken, ChatRequest, LlmError, Provider, StreamEvent};
 use ai_ide_protocol::dto::{
-    FinishReason, LlmCancelParams, LlmChatStreamParams, LlmChatStreamResult, LlmCountTokensParams,
-    LlmCountTokensResult, LlmDeltaEvent, LlmErrorEvent, LlmFinishedEvent, LlmListModelsParams,
-    LlmListModelsResult, LlmReasoningEvent, LlmStartedEvent, LlmToolCallEvent, LlmUsageEvent,
-    ModelRef, OkResult,
+    ChatMessage, ChatRole, FinishReason, LlmCancelParams, LlmChatStreamParams, LlmChatStreamResult,
+    LlmCountTokensParams, LlmCountTokensResult, LlmDeltaEvent, LlmErrorEvent, LlmFinishedEvent,
+    LlmListModelsParams, LlmListModelsResult, LlmReasoningEvent, LlmStartedEvent, LlmToolCallEvent,
+    LlmUsageEvent, ModelRef, OkResult,
 };
 use ai_ide_protocol::{methods, ErrorCode, ErrorObject, Request};
+use ai_ide_workspace::WorkspaceError;
 use tokio::sync::mpsc::unbounded_channel;
 use tracing::{debug, error, info, warn};
 
+use crate::context;
 use crate::dispatch::parse_params;
 use crate::peer::Peer;
 use crate::state::{now_ms, AppState};
@@ -137,7 +139,32 @@ pub async fn chat_stream(peer: &Peer, state: &AppState, req: &Request) {
         return peer.respond_error(&req.id, &error).await;
     };
 
-    // 4) 登记取消句柄。同 id 并发会互相干扰，直接拒绝。
+    // 4) 上下文引用（M3）：把 `@文件 / @文件夹 / @选区` 的内容渲染出来。
+    //    必须在登记取消句柄之前做完——越界路径要让请求当场失败，而不是先受理、
+    //    发完 `{stream_id}` 再报错（那时 UI 已经在等事件，收尾语义会变得含糊）。
+    let injection = match &params.context {
+        Some(reference) if !reference.refs.is_empty() => {
+            let workspace = match state.workspace(reference.workspace_id.as_deref()) {
+                Ok(workspace) => workspace,
+                Err(err) => return peer.respond_error(&req.id, &workspace_error(&err)).await,
+            };
+            let reference = reference.clone();
+            // 读盘与列目录都是阻塞活，扔进阻塞池，别占住运行时的线程。
+            match tokio::task::spawn_blocking(move || context::render(&workspace, &reference)).await
+            {
+                Ok(Ok(injected)) => Some(injected),
+                Ok(Err(err)) => return peer.respond_error(&req.id, &workspace_error(&err)).await,
+                Err(join_err) => {
+                    let error =
+                        ErrorObject::internal(format!("上下文引用任务异常退出：{join_err}"));
+                    return peer.respond_error(&req.id, &error).await;
+                }
+            }
+        }
+        _ => None,
+    };
+
+    // 5) 登记取消句柄。同 id 并发会互相干扰，直接拒绝。
     let streams = state.streams();
     let cancel = CancelToken::new();
     if !streams.register(&params.stream_id, cancel.clone()) {
@@ -148,7 +175,35 @@ pub async fn chat_stream(peer: &Peer, state: &AppState, req: &Request) {
         return peer.respond_error(&req.id, &error).await;
     }
 
-    // 5) 先回结果，再开流：`{stream_id}` 是「已受理」的回执，内容是后续事件的事。
+    // 6) 引用内容就位：插成**第一条** `system` 消息，排在全部用户消息之前。
+    //    顺序是有意的——把外部材料放在对话历史前面，模型读到时已有全局视角；
+    //    插在中间会让「引用」看起来像上一轮的回复。
+    let mut messages = params.messages.clone();
+    if let Some(injected) = injection {
+        if injected.is_empty() {
+            debug!(stream_id = %params.stream_id, "上下文引用渲染为空，未插入消息");
+        } else {
+            info!(
+                stream_id = %params.stream_id,
+                refs = params.context.as_ref().map_or(0, |r| r.refs.len()),
+                injected_tokens = injected.tokens,
+                omitted = injected.omitted.len(),
+                "已注入上下文引用"
+            );
+            messages.insert(
+                0,
+                ChatMessage {
+                    role: ChatRole::System,
+                    content: injected.content,
+                    attachments: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                },
+            );
+        }
+    }
+
+    // 7) 先回结果，再开流：`{stream_id}` 是「已受理」的回执，内容是后续事件的事。
     peer.respond(
         &req.id,
         &LlmChatStreamResult {
@@ -166,7 +221,7 @@ pub async fn chat_stream(peer: &Peer, state: &AppState, req: &Request) {
     };
     let request = ChatRequest {
         model: params.model_ref.clone(),
-        messages: params.messages.clone(),
+        messages,
         tools: params.tools.clone(),
         tool_choice: params.tool_choice,
         params: params.params.clone().unwrap_or_default(),
@@ -436,6 +491,10 @@ pub async fn list_models(peer: &Peer, state: &AppState, req: &Request) {
 /// M2 不做真实分词：口径见 [`ai_ide_llm::tokens`]（CJK 一字≈1 token、ASCII 4 字符≈1 token、
 /// 每条消息固定开销），因此 `exact` 一律为 `false`，并附口径说明供 UI 提示「预算值」。
 ///
+/// M3 起入参有两种口径，都算进同一个结果：`messages`（对话历史）与 `texts`（额外的
+/// 裸文本，典型用途是输入框里还没拼成消息的草稿、以及 @引用到的片段）。两者可以同时给，
+/// 服务的是「发送前估算总量」这一个目的。
+///
 /// **不查注册表**：估算纯本地计算，调不通上游也要能算——输入框的 token 计数
 /// 不该因为网关挂了而消失。
 pub async fn count_tokens(peer: &Peer, _state: &AppState, req: &Request) {
@@ -446,7 +505,10 @@ pub async fn count_tokens(peer: &Peer, _state: &AppState, req: &Request) {
 
     // 工具定义也占 token，但 DTO 里这一项还没定（`docs/03` §2.4 只列了 messages），
     // 因此先按空表估算；口径在 note 里说明，不假装精确。
-    let tokens = estimate_tokens(&params.messages, &[]);
+    let mut tokens = estimate_tokens(&params.messages, &[]);
+    for text in &params.texts {
+        tokens += estimate_text(text);
+    }
     peer.respond(
         &req.id,
         &LlmCountTokensResult {
@@ -461,6 +523,14 @@ pub async fn count_tokens(peer: &Peer, _state: &AppState, req: &Request) {
 // ---------------------------------------------------------------------------
 // 内部工具
 // ---------------------------------------------------------------------------
+
+/// 工作区 / 路径错误 → 协议错误对象。
+///
+/// 越界（`PATH_OUT_OF_WORKSPACE`）走这里原样透出：UI 需要能区分「路径不合法」
+/// 与「工作区没打开」，两者对用户的下一步动作完全不同。
+fn workspace_error(err: &WorkspaceError) -> ErrorObject {
+    ErrorObject::new(err.code(), err.to_string())
+}
 
 /// 把模型接入层错误翻成协议错误对象再回（与 `provider_api` 同一套折返口径）。
 async fn respond_llm_error(peer: &Peer, req: &Request, err: &LlmError) {
@@ -540,6 +610,7 @@ mod tests {
             tools: Vec::new(),
             tool_choice: None,
             params: None,
+            context: None,
         };
         let err = validate_stream_params(&params).expect("空 stream_id 必须被拒");
         assert_eq!(err.code, ErrorCode::INVALID_PARAMS);

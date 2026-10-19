@@ -119,6 +119,13 @@ export type { LlmUsageEvent } from "./generated/LlmUsageEvent";
 export type { ToolChoice } from "./generated/ToolChoice";
 export type { ToolSpec } from "./generated/ToolSpec";
 
+// ---- 上下文引用（M3）----
+export type { ChatContext } from "./generated/ChatContext";
+export type { CompressOptions } from "./generated/CompressOptions";
+export type { CompressStrategy } from "./generated/CompressStrategy";
+export type { ContextRef } from "./generated/ContextRef";
+export type { ContextRefKind } from "./generated/ContextRefKind";
+
 // ---- 协议常量（与 Rust 侧保持一致的运行时镜像）----
 
 /** JSON-RPC 版本字面量。对应 Rust `ai_ide_protocol::JSONRPC_VERSION`。 */
