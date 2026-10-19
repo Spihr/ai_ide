@@ -3,7 +3,9 @@
 import { useEffect, useState } from 'react'
 
 import type { CoreStatus } from '../../shared/ipc'
+import { disposeAi, initAi } from './ai-store'
 import { ActivityBar } from './components/ActivityBar'
+import { AiPanel } from './components/AiPanel'
 import { CodeEditor } from './components/CodeEditor'
 import { EditorTabs } from './components/EditorTabs'
 import { FileTree } from './components/FileTree'
@@ -32,10 +34,13 @@ export function App() {
     })
     const offStatus = window.aiide.onCoreStatus((status) => setCore(status))
     const offWorkspace = initWorkspaceEvents()
+    // AI 事件订阅常驻进程级：只在「AI」视图打开时才订阅会漏掉流式事件。
+    initAi()
     return () => {
       alive = false
       offStatus()
       offWorkspace()
+      disposeAi()
     }
   }, [])
 
@@ -109,13 +114,17 @@ export function App() {
 
         <aside className="sidebar">
           <div className="sidebar__header">
-            {state.activity === 'explorer' ? '资源管理器' : '搜索'}
+            {state.activity === 'explorer' ? '资源管理器' : state.activity === 'search' ? '搜索' : 'AI'}
           </div>
-          {state.workspaceError && <p className="panel__error">{state.workspaceError}</p>}
+          {state.workspaceError && state.activity !== 'ai' && (
+            <p className="panel__error">{state.workspaceError}</p>
+          )}
           {state.activity === 'explorer' ? (
             hasWorkspace ? <FileTree /> : <p className="panel__hint">尚未打开工作区</p>
-          ) : (
+          ) : state.activity === 'search' ? (
             <SearchPanel />
+          ) : (
+            <AiPanel />
           )}
         </aside>
 

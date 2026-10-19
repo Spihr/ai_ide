@@ -32,7 +32,15 @@ export const IpcChannels = {
   /** 主进程 → 渲染进程：后台全量索引完成 */
   workspaceIndexed: 'workspace:indexed',
   /** 弹出系统目录选择框（invoke，返回绝对路径或 null） */
-  pickWorkspace: 'dialog:pick-workspace'
+  pickWorkspace: 'dialog:pick-workspace',
+  /** 查询密钥托管状态 */
+  credentialsStatus: 'credentials:status',
+  /** 撤销某个 Provider 的密钥托管 */
+  credentialsForget: 'credentials:forget',
+  /** 主进程 → 渲染进程：密钥托管状态变更 */
+  credentialsStatusChanged: 'credentials:status-changed',
+  /** 主进程 → 渲染进程：M2 事件（`provider.changed` / `llm.*`） */
+  aiEvent: 'ai:event'
 } as const
 
 export type CoreState = 'idle' | 'starting' | 'ready' | 'failed' | 'stopped'
@@ -71,6 +79,31 @@ export interface CoreLogChunk {
   text: string
 }
 
+/**
+ * 密钥托管状态（docs/02 §6.3）。
+ *
+ * 这里刻意**不含任何密钥内容**——渲染进程只需要知道「有没有托管」与
+ * 「加密是否可用」，明文只在主进程与内核内存之间流转。
+ */
+export interface CredentialStatus {
+  /** `safeStorage` 是否可用。不可用时密钥只留内存，绝不落明文。 */
+  encryptionAvailable: boolean
+  /** 托管文件绝对路径（可能尚未创建）。 */
+  vaultPath: string
+  /** 已托管密钥的 provider id 列表。 */
+  managedProviderIds: string[]
+  /** 最近一次失败原因（解密失败 / 无系统密钥链等）。 */
+  lastError: string | null
+}
+
+/** M2 事件向渲染进程的转发载荷：`provider.changed` 与 `llm.*`。 */
+export interface AiEvent {
+  /** 内核通知的方法名，如 `llm.delta`。 */
+  method: string
+  /** 通知载荷（形状与 Rust 协议一致，字段为 snake_case）。 */
+  params: unknown
+}
+
 /** 渲染进程可见的 API 形状（由 preload 注入到 `window.aiide`）。 */
 export interface AiIdeApi {
   getCoreStatus: () => Promise<CoreStatus>
@@ -85,4 +118,12 @@ export interface AiIdeApi {
   onWorkspaceChanged: (listener: (event: WorkspaceChangedEvent) => void) => () => void
   /** 订阅后台索引完成事件，返回取消订阅函数。 */
   onWorkspaceIndexed: (listener: (event: WorkspaceIndexedEvent) => void) => () => void
+  /** 查询密钥托管状态（不含任何密钥内容）。 */
+  getCredentialStatus: () => Promise<CredentialStatus>
+  /** 撤销某个 Provider 的密钥托管，返回更新后的状态。 */
+  forgetCredential: (providerId: string) => Promise<CredentialStatus>
+  /** 订阅 M2 事件（`provider.changed` / `llm.*`），返回取消订阅函数。 */
+  onAiEvent: (listener: (event: AiEvent) => void) => () => void
+  /** 订阅密钥托管状态变更，返回取消订阅函数。 */
+  onCredentialStatus: (listener: (status: CredentialStatus) => void) => () => void
 }

@@ -50,6 +50,13 @@ export interface CoreSupervisorOptions {
   clientVersion?: string
   /** 单条请求超时（毫秒），默认 30s。 */
   requestTimeoutMs?: number
+  /**
+   * 追加到内核进程的环境变量。
+   *
+   * 外壳的 `userData` 被覆盖（测试 / 多实例）时用它同进同退地把数据目录一起
+   * 告诉内核（`AI_IDE_DATA_DIR`），否则内核会写到真实用户目录去。
+   */
+  env?: NodeJS.ProcessEnv
 }
 
 interface PendingRequest {
@@ -80,6 +87,7 @@ export class CoreSupervisor extends EventEmitter<CoreSupervisorEvents> {
   private readonly cwd: string | undefined
   private readonly clientVersion: string
   private readonly requestTimeoutMs: number
+  private readonly env: NodeJS.ProcessEnv | undefined
 
   /** 握手结果，进程就绪后可用。 */
   private hello: HelloResult | null = null
@@ -92,6 +100,7 @@ export class CoreSupervisor extends EventEmitter<CoreSupervisorEvents> {
     this.cwd = options.cwd
     this.clientVersion = options.clientVersion ?? '0.1.0'
     this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000
+    this.env = options.env
   }
 
   /** 内核是否处于可用状态。 */
@@ -133,7 +142,8 @@ export class CoreSupervisor extends EventEmitter<CoreSupervisorEvents> {
     const child = spawn(this.binaryPath, [], {
       cwd: this.cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
-      windowsHide: true
+      windowsHide: true,
+      env: this.env ? { ...process.env, ...this.env } : process.env
     })
     this.child = child
     this.lastExit = null

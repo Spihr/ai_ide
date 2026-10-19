@@ -118,7 +118,21 @@ function installHarness(): Harness {
     onCoreStatus: () => () => undefined,
     onCoreLog: () => () => undefined,
     onWorkspaceChanged: () => () => undefined,
-    onWorkspaceIndexed: () => () => undefined
+    onWorkspaceIndexed: () => () => undefined,
+    getCredentialStatus: async () => ({
+      encryptionAvailable: false,
+      vaultPath: 'C:\\ud\\credentials.enc',
+      managedProviderIds: [],
+      lastError: null
+    }),
+    forgetCredential: async () => ({
+      encryptionAvailable: false,
+      vaultPath: 'C:\\ud\\credentials.enc',
+      managedProviderIds: [],
+      lastError: null
+    }),
+    onAiEvent: () => () => undefined,
+    onCredentialStatus: () => () => undefined
   }
 
   const confirm = vi.fn(() => true)

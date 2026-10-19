@@ -7,6 +7,8 @@
 
 import { describe, expect, it } from 'vitest'
 
+import { IMPLEMENTED_METHODS, Methods } from '@ai-ide/shared-types'
+
 import { allowedRendererMethods, checkRendererCall } from './policy'
 
 describe('checkRendererCall', () => {
@@ -31,9 +33,37 @@ describe('checkRendererCall', () => {
     }
   })
 
+  it('放行 M2 的 Provider / 模型 / 对话方法', () => {
+    const methods = [
+      Methods.provider.upsert,
+      Methods.provider.list,
+      Methods.provider.delete,
+      Methods.provider.test,
+      Methods.model.upsert,
+      Methods.model.list,
+      Methods.model.delete,
+      Methods.llm.chatStream,
+      Methods.llm.cancel,
+      Methods.llm.listModels,
+      Methods.llm.countTokens
+    ]
+
+    for (const method of methods) {
+      expect(checkRendererCall(method).allowed, `${method} 应被放行`).toBe(true)
+    }
+  })
+
   it('拦截白名单之外的方法，并给出原因', () => {
-    // workspace.chmod / fs.delete 之类内核根本没实现，也不该被 UI 调用
-    const methods = ['core.hello', 'core.shutdown', 'llm.chat', 'agent.run', 'workspace.chmod']
+    // core.hello / core.shutdown 是主进程自用的握手与退出；workspace.chmod、agent.run
+    // 之类内核根本没实现，也不该被 UI 调用
+    const methods = [
+      Methods.core.hello,
+      Methods.core.shutdown,
+      Methods.cancel.request,
+      'agent.run',
+      'workspace.chmod',
+      'mcp.invoke'
+    ]
 
     for (const method of methods) {
       const decision = checkRendererCall(method)
@@ -56,6 +86,17 @@ describe('checkRendererCall', () => {
     expect([...allowedRendererMethods()].sort()).toEqual([
       'core.ping',
       'core.stats',
+      'llm.cancel',
+      'llm.chat_stream',
+      'llm.count_tokens',
+      'llm.list_models',
+      'model.delete',
+      'model.list',
+      'model.upsert',
+      'provider.delete',
+      'provider.list',
+      'provider.test',
+      'provider.upsert',
       'search.content',
       'search.files',
       'workspace.close',
@@ -68,5 +109,13 @@ describe('checkRendererCall', () => {
       'workspace.tree',
       'workspace.write_file'
     ])
+  })
+
+  it('白名单只能是已实现方法的子集（放行内核没实现的方法 = 一片 -32601）', () => {
+    const implemented = new Set<string>(IMPLEMENTED_METHODS)
+
+    for (const method of allowedRendererMethods()) {
+      expect(implemented.has(method), `${method} 未列在 IMPLEMENTED_METHODS 中`).toBe(true)
+    }
   })
 })

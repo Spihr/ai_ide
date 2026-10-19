@@ -31,7 +31,24 @@ const RENDERER_ALLOWED = new Set<string>([
 
   // M1：检索。
   Methods.search.files,
-  Methods.search.content
+  Methods.search.content,
+
+  // M2：模型接入。放行的理由与 M1 一致——这些都要用户显式动作才会发起：
+  // 配置/删除 Provider 与模型、点「测试连接」、发一条对话、按「停止」。
+  // 其中 `provider.test` 会向 Provider 的 base_url 发起真实请求、`llm.chat_stream`
+  // 会产生真实调用与计费，所以它们**只能**由用户在设置界面或对话面板亲手触发，
+  // 不存在任何「渲染进程自动重试」的路径。
+  Methods.provider.upsert,
+  Methods.provider.list,
+  Methods.provider.delete,
+  Methods.provider.test,
+  Methods.model.upsert,
+  Methods.model.list,
+  Methods.model.delete,
+  Methods.llm.chatStream,
+  Methods.llm.cancel,
+  Methods.llm.listModels,
+  Methods.llm.countTokens
 ])
 
 export interface PolicyDecision {

@@ -9,9 +9,11 @@ import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 
 import {
   IpcChannels,
+  type AiEvent,
   type AiIdeApi,
   type CoreLogChunk,
   type CoreStatus,
+  type CredentialStatus,
   type PingBenchmarkResult,
   type WorkspaceChangedEvent,
   type WorkspaceIndexedEvent
@@ -62,6 +64,29 @@ const api: AiIdeApi = {
     ipcRenderer.on(IpcChannels.workspaceIndexed, handler)
     return () => {
       ipcRenderer.removeListener(IpcChannels.workspaceIndexed, handler)
+    }
+  },
+
+  // M2：密钥托管只暴露「状态」与「撤销」，没有任何取回明文的通道。
+  getCredentialStatus: (): Promise<CredentialStatus> =>
+    ipcRenderer.invoke(IpcChannels.credentialsStatus),
+
+  forgetCredential: (providerId: string): Promise<CredentialStatus> =>
+    ipcRenderer.invoke(IpcChannels.credentialsForget, providerId),
+
+  onAiEvent: (listener: (event: AiEvent) => void): (() => void) => {
+    const handler = (_event: IpcRendererEvent, payload: AiEvent): void => listener(payload)
+    ipcRenderer.on(IpcChannels.aiEvent, handler)
+    return () => {
+      ipcRenderer.removeListener(IpcChannels.aiEvent, handler)
+    }
+  },
+
+  onCredentialStatus: (listener: (status: CredentialStatus) => void): (() => void) => {
+    const handler = (_event: IpcRendererEvent, status: CredentialStatus): void => listener(status)
+    ipcRenderer.on(IpcChannels.credentialsStatusChanged, handler)
+    return () => {
+      ipcRenderer.removeListener(IpcChannels.credentialsStatusChanged, handler)
     }
   }
 }

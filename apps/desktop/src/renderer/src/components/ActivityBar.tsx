@@ -1,4 +1,4 @@
-/** 左侧活动栏：资源管理器 / 搜索两个视图入口。 */
+/** 左侧活动栏：资源管理器 / 搜索 / AI 三个视图入口。 */
 
 import { setActivity, useEditor, type ActivityView } from '../store'
 
@@ -10,7 +10,8 @@ interface ActivityItem {
 
 const ITEMS: ActivityItem[] = [
   { id: 'explorer', label: '资源管理器', glyph: '▤' },
-  { id: 'search', label: '搜索', glyph: '⌕' }
+  { id: 'search', label: '搜索', glyph: '⌕' },
+  { id: 'ai', label: 'AI', glyph: '✦' }
 ]
 
 export function ActivityBar() {

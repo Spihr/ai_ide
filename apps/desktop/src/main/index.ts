@@ -9,23 +9,44 @@
  * 内核启动失败**不阻断**窗口显示——UI 需要活着把错误呈现给用户。
  */
 
-import { app, BrowserWindow, dialog, ipcMain } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, safeStorage } from 'electron'
 import { dirname, join } from 'node:path'
 
 import { Methods, type HelloResult } from '@ai-ide/shared-types'
 import { CoreSupervisor } from './core-supervisor'
+import { CredentialVault } from './credentials'
 import { checkRendererCall } from './policy'
 import {
+  extractDeletedProviderId,
+  extractUpsertedKey,
+  rememberKeyAfterUpsert,
+  replayCredentials
+} from './provider-keys'
+import {
   IpcChannels,
+  type AiEvent,
   type CoreLogChunk,
   type CoreStatus,
+  type CredentialStatus,
   type PingBenchmarkResult
 } from '../shared/ipc'
 
 const isDev = !app.isPackaged
 
+/**
+ * 用户数据目录覆盖（测试与多实例隔离用）。
+ *
+ * 必须在 `app.whenReady()` 之前设置：Electron 一旦就绪就会按默认目录
+ * 建好各种路径，事后再 `setPath` 只会得到半新半旧的混合状态。
+ */
+const userDataOverride = process.env.AI_IDE_USER_DATA_DIR
+if (userDataOverride && userDataOverride.trim().length > 0) {
+  app.setPath('userData', userDataOverride.trim())
+}
+
 let supervisor: CoreSupervisor | null = null
 let mainWindow: BrowserWindow | null = null
+let vault: CredentialVault | null = null
 
 let currentStatus: CoreStatus = {
   state: 'idle',
@@ -70,6 +91,64 @@ function pushLog(text: string): void {
   mainWindow.webContents.send(IpcChannels.coreLog, chunk)
 }
 
+// ---------------------------------------------------------------------------
+// 密钥托管（docs/02 §6.3）
+// ---------------------------------------------------------------------------
+
+/** M2 事件：`provider.changed` 与 `llm.*` 全家。 */
+function isAiEvent(method: string): boolean {
+  return method === Methods.event.providerChanged || method.startsWith('llm.')
+}
+
+function requireVault(): CredentialVault {
+  if (!vault) throw new Error('密钥托管尚未初始化')
+  return vault
+}
+
+function credentialStatus(): CredentialStatus {
+  if (!vault) {
+    return {
+      encryptionAvailable: safeStorage.isEncryptionAvailable(),
+      vaultPath: '',
+      managedProviderIds: [],
+      lastError: '密钥托管尚未初始化'
+    }
+  }
+  return vault.status()
+}
+
+function broadcastCredentialStatus(): void {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send(IpcChannels.credentialsStatusChanged, credentialStatus())
+  }
+}
+
+/**
+ * 内核就绪（含重启）后把托管密钥注回内核。
+ *
+ * 内核只在内存里保管密钥，所以每次拉起内核都要重放一次；否则用户在设置界面
+ * 填过的 Key 会表现为「填了但连不上」。
+ */
+async function injectCredentialKeys(instance: CoreSupervisor): Promise<void> {
+  if (!vault) return
+  const report = await replayCredentials({
+    request: (method, params) => instance.request(method, params),
+    vault,
+    log: pushLog
+  })
+
+  const touched = report.injected.length + report.missing.length + report.failed.length
+  if (touched > 0) {
+    pushLog(
+      `[credentials] 密钥重放：注入 ${report.injected.length}，缺失 ${report.missing.length}，失败 ${report.failed.length}\n`
+    )
+  }
+  for (const failure of report.failed) {
+    pushLog(`[credentials] 注入失败 ${failure.providerId}：${failure.message}\n`)
+  }
+  broadcastCredentialStatus()
+}
+
 /** 拉起内核并完成握手；返回最终状态。 */
 async function startCore(): Promise<CoreStatus> {
   const binaryPath = resolveCoreBinary()
@@ -92,21 +171,31 @@ async function startCore(): Promise<CoreStatus> {
   const instance = new CoreSupervisor({
     binaryPath,
     cwd: dirname(binaryPath),
-    clientVersion: app.getVersion()
+    clientVersion: app.getVersion(),
+    // 内核的 `providers.json` 与外壳的 `credentials.enc` 都属于「这个应用的数据」，
+    // 必须同进同退：外壳的 userData 被覆盖（测试 / 多实例）时，内核也不能写到
+    // 真实用户目录去。用户显式设过 `AI_IDE_DATA_DIR` 则尊重用户的选择。
+    env: {
+      AI_IDE_DATA_DIR: process.env.AI_IDE_DATA_DIR ?? app.getPath('userData')
+    }
   })
 
   instance.on('stderr', (chunk) => pushLog(chunk))
   instance.on('notification', (method, params) => {
-    // 工作区事件直接转发给 UI；其余通知只留在内核日志里。
+    // 工作区事件走各自专用通道，M2 的 `provider.changed` / `llm.*` 走统一 AI 事件通道；
+    // 其余通知只留在内核日志里。
     const channel =
       method === Methods.event.workspaceChanged
         ? IpcChannels.workspaceChanged
         : method === Methods.event.workspaceIndexed
           ? IpcChannels.workspaceIndexed
-          : null
+          : isAiEvent(method)
+            ? IpcChannels.aiEvent
+            : null
 
     if (channel && mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send(channel, params)
+      const payload = channel === IpcChannels.aiEvent ? ({ method, params } satisfies AiEvent) : params
+      mainWindow.webContents.send(channel, payload)
       return
     }
     pushLog(`[notify] ${method} ${JSON.stringify(params ?? {})}\n`)
@@ -137,6 +226,8 @@ async function startCore(): Promise<CoreStatus> {
       exitCode: null,
       exitSignal: null
     })
+    // 就绪即重放密钥：内核重启后内存里是空的，不重放会导致「配置在、密钥不在」。
+    await injectCredentialKeys(instance)
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     await instance.stop(false).catch(() => undefined)
@@ -213,7 +304,35 @@ function registerIpc(): void {
       if (!decision.allowed) {
         throw new Error(decision.reason ?? `调用被拒绝：${method}`)
       }
-      return requireSupervisor().request(method, params)
+
+      // 明文密钥只在「渲染进程 → 主进程 → 内核」这条链上短暂存在：
+      // 进内核之前先截住一份给托管，内核那边拿到的是同一把、但只留在内存。
+      const pendingKey = extractUpsertedKey(method, params)
+      const result = await requireSupervisor().request(method, params)
+
+      if (pendingKey) {
+        try {
+          const saved = await rememberKeyAfterUpsert(requireVault(), result, pendingKey)
+          broadcastCredentialStatus()
+          if (!saved.persisted) {
+            pushLog('[credentials] 系统密钥链不可用，密钥仅保留在内存中（未写盘）\n')
+          }
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err)
+          pushLog(`[credentials] 托管密钥失败：${message}\n`)
+        }
+      }
+
+      const deletedId = extractDeletedProviderId(method, params)
+      if (deletedId) {
+        // 级联清理：Provider 删了还留着密钥托管，等于留了一把无主的钥匙。
+        await requireVault()
+          .forget(deletedId)
+          .catch(() => false)
+        broadcastCredentialStatus()
+      }
+
+      return result
     }
   )
 
@@ -225,6 +344,21 @@ function registerIpc(): void {
           ? Math.min(Math.max(Math.trunc(count), 1), 2_000)
           : 20
       return runPingBenchmark(requireSupervisor(), normalized)
+    }
+  )
+
+  ipcMain.handle(IpcChannels.credentialsStatus, async (): Promise<CredentialStatus> => credentialStatus())
+
+  ipcMain.handle(
+    IpcChannels.credentialsForget,
+    async (_event, providerId: unknown): Promise<CredentialStatus> => {
+      if (typeof providerId !== 'string' || providerId.trim().length === 0) {
+        throw new Error('providerId 必须是非空字符串')
+      }
+      const forgot = await requireVault().forget(providerId.trim())
+      if (forgot) pushLog(`[credentials] 已撤销 ${providerId} 的密钥托管\n`)
+      broadcastCredentialStatus()
+      return credentialStatus()
     }
   )
 
@@ -286,7 +420,14 @@ function createWindow(): void {
 // 应用生命周期
 // ---------------------------------------------------------------------------
 
-void app.whenReady().then(() => {
+void app.whenReady().then(async () => {
+  // 托管文件位置依赖 userData，必须在窗口与内核之前就绪。
+  vault = new CredentialVault({
+    vaultPath: join(app.getPath('userData'), 'credentials.enc'),
+    safeStorage
+  })
+  await vault.load()
+
   registerIpc()
   createWindow()
   void startCore()
