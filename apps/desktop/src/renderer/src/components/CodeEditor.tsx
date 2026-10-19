@@ -51,12 +51,16 @@ export function CodeEditor() {
       if (path) updateContent(path, editor.getValue())
     })
 
+    // 卸载时 ref 可能已被改写，先取快照再清理
+    const models = modelsRef.current
+    const views = viewsRef.current
+
     return () => {
       subscription.dispose()
       editor.dispose()
-      for (const model of modelsRef.current.values()) model.dispose()
-      modelsRef.current.clear()
-      viewsRef.current.clear()
+      for (const model of models.values()) model.dispose()
+      models.clear()
+      views.clear()
       editorRef.current = null
       currentRef.current = null
     }

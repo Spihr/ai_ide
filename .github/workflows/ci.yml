@@ -67,6 +67,9 @@ jobs:
       - name: 校验协议类型无漂移
         run: git diff --exit-code -- packages/shared-types/src/generated
 
+      - name: 代码检查
+        run: pnpm lint
+
       - name: 类型检查
         run: pnpm typecheck
 

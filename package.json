@@ -21,10 +21,19 @@
     "e2e:m1": "node scripts/e2e-m1.mjs",
     "bench:m1": "node scripts/bench-m1.mjs",
     "types:gen": "node scripts/gen-types.mjs",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "verify:ci": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo build -p ai-ide-core && node scripts/smoke-core.mjs && pnpm lint && pnpm typecheck && pnpm test && pnpm --filter @ai-ide/desktop build",
     "verify:m0": "cargo test --workspace && cargo build -p ai-ide-core && node scripts/smoke-core.mjs && pnpm typecheck && pnpm test",
     "verify:m1": "cargo test --workspace && cargo build -p ai-ide-core && node scripts/smoke-core.mjs && node scripts/smoke-m1.mjs && pnpm build && node scripts/e2e-m1.mjs && pnpm typecheck && pnpm test"
   },
   "devDependencies": {
-    "playwright-core": "^1.64.1"
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.13.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.5.7",
+    "globals": "^17.13.0",
+    "playwright-core": "^1.64.1",
+    "typescript-eslint": "^8.71.2"
   }
 }

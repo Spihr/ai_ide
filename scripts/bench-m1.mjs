@@ -127,7 +127,7 @@ console.log(`  stats=${JSON.stringify(ws.stats)} indexing=${ws.indexing}`)
 const firstTree = await timed('workspace.tree（根目录首屏）', () =>
   request('workspace.tree', { workspace_id: ws.workspace_id, path: null, depth: 1, include_ignored: false })
 )
-const subTree = await timed('workspace.tree（单个子目录）', () =>
+await timed('workspace.tree（单个子目录）', () =>
   request('workspace.tree', { workspace_id: ws.workspace_id, path: 'd0', depth: 1, include_ignored: false })
 )
 
