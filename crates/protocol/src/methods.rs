@@ -36,7 +36,7 @@ pub mod search {
     pub const CONTENT: &str = "search.content";
 }
 
-/// Provider 与模型管理（M2）。
+/// Provider 与模型管理（M2，已在 `crates/core` 接线）。
 ///
 /// 密钥本身不在这层：`provider.upsert` 的 `api_key` 只进内存保管（见 docs/02 §6.3），
 /// `provider.list` 只回 `has_key` / `key_hint` 这类脱敏信息。
@@ -47,7 +47,7 @@ pub mod provider {
     pub const TEST: &str = "provider.test";
 }
 
-/// 模型目录（M2）。模型挂在 Provider 下，把「厂商」与「具体模型」解耦。
+/// 模型目录（M2，已在 `crates/core` 接线）。模型挂在 Provider 下，把「厂商」与「具体模型」解耦。
 pub mod model {
     pub const UPSERT: &str = "model.upsert";
     pub const LIST: &str = "model.list";
@@ -112,18 +112,6 @@ pub const IMPLEMENTED: &[&str] = &[
     workspace::REVEAL,
     search::FILES,
     search::CONTENT,
-];
-
-/// 协议面**已定义、但内核尚未接线**的方法。
-///
-/// 这些常量与它们背后的 DTO 是 M2 的协议成果（见 `crates/protocol/src/dto.rs`），
-/// 但 `crates/core` 的 `dispatch.rs` 还没有对应分支——`ai-ide-core` 目前甚至
-/// 还没有依赖 `ai-ide-llm`。现在调用它们只会拿到 `-32601 method not found`。
-///
-/// 因此它们**不能**出现在 [`IMPLEMENTED`] 里：`IMPLEMENTED` 会经 `core.hello`
-/// 回报给 Main 作为能力清单，一旦虚报，Main 会照单调用、然后拿到一片 `-32601`。
-/// 接线时（M2 的下一步）把对应常量从本表移入 [`IMPLEMENTED`]，两张表始终互斥。
-pub const DECLARED_NOT_IMPLEMENTED: &[&str] = &[
     provider::UPSERT,
     provider::LIST,
     provider::DELETE,
@@ -137,34 +125,55 @@ pub const DECLARED_NOT_IMPLEMENTED: &[&str] = &[
     llm::COUNT_TOKENS,
 ];
 
+/// 协议面**已定义、但内核尚未接线**的方法。
+///
+/// **M2 收尾后本表为空**：`provider.*` / `model.*` / `llm.*` 都已接进
+/// `crates/core` 的 `dispatch.rs`。空表不是「这个机制没用」——它是给后续里程碑
+/// （M3 会话、M4 Agent、M5 终端…）留的位置：协议先行定义、实现后补，谁没接线
+/// 谁就待在这里。
+///
+/// 它们**不能**出现在 [`IMPLEMENTED`] 里：`IMPLEMENTED` 会经 `core.hello`
+/// 回报给 Main 作为能力清单，一旦虚报，Main 会照单调用、然后拿到一片 `-32601`。
+/// 接线时把对应常量从本表移入 [`IMPLEMENTED`]，两张表始终互斥。
+pub const DECLARED_NOT_IMPLEMENTED: &[&str] = &[];
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn implemented_list_covers_core_and_m1_domains() {
-        assert_eq!(IMPLEMENTED.len(), 16);
+    fn implemented_list_covers_core_m1_m2_domains() {
+        assert_eq!(IMPLEMENTED.len(), 27);
         assert!(IMPLEMENTED.contains(&"core.ping"));
         assert!(IMPLEMENTED.contains(&"$/cancelRequest"));
         assert!(IMPLEMENTED.contains(&"workspace.read_file"));
         assert!(IMPLEMENTED.contains(&"search.content"));
+        assert!(IMPLEMENTED.contains(&provider::UPSERT));
+        assert!(IMPLEMENTED.contains(&model::DELETE));
+        // M2 收尾：`llm.*` 四个方法进清单，能力声明与 dispatch 分支一致。
+        assert!(IMPLEMENTED.contains(&llm::CHAT_STREAM));
+        assert!(IMPLEMENTED.contains(&llm::CANCEL));
+        assert!(IMPLEMENTED.contains(&llm::LIST_MODELS));
+        assert!(IMPLEMENTED.contains(&llm::COUNT_TOKENS));
     }
 
     #[test]
-    fn m2_surface_is_declared_but_not_implemented_yet() {
-        // M2 的协议面（provider / model / llm）已经定义，但 core 分发还没接线，
-        // 所以一个都不能进能力清单——否则 core.hello 会向 Main 虚报能力。
-        assert_eq!(DECLARED_NOT_IMPLEMENTED.len(), 11);
-        for name in DECLARED_NOT_IMPLEMENTED {
-            assert!(
-                !IMPLEMENTED.contains(name),
-                "{name} 尚未接线，不能出现在 IMPLEMENTED 里"
-            );
+    fn declared_table_is_empty_after_m2_wiring() {
+        // M2 把 `llm.*` 接进 dispatch 后，没有「定义了但没接线」的方法了。
+        // 一旦有人新增协议方法却忘了接线，这里会先响——比 Main 侧收到
+        // 一片 `-32601` 才发现要好得多。
+        assert!(
+            DECLARED_NOT_IMPLEMENTED.is_empty(),
+            "M2 收尾后待接线方法表应为空，实际：{DECLARED_NOT_IMPLEMENTED:?}"
+        );
+        for name in [
+            llm::CHAT_STREAM,
+            llm::CANCEL,
+            llm::LIST_MODELS,
+            llm::COUNT_TOKENS,
+        ] {
+            assert!(IMPLEMENTED.contains(&name), "{name} 应已接线");
         }
-        assert!(DECLARED_NOT_IMPLEMENTED.contains(&provider::UPSERT));
-        assert!(DECLARED_NOT_IMPLEMENTED.contains(&model::DELETE));
-        assert!(DECLARED_NOT_IMPLEMENTED.contains(&llm::CHAT_STREAM));
-        assert!(DECLARED_NOT_IMPLEMENTED.contains(&llm::COUNT_TOKENS));
     }
 
     #[test]

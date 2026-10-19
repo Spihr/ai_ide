@@ -14,6 +14,7 @@ path = "src/main.rs"
 ai-ide-protocol = { workspace = true }
 ai-ide-workspace = { workspace = true }
 ai-ide-indexer = { workspace = true }
+ai-ide-llm = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -1,9 +1,13 @@
 //! 方法分发：把一条入站报文路由到对应处理器。
 //!
-//! M0 的方法集很小，直接用 `match` 分派即可；等到方法数上量（workspace /
-//! llm / agent / terminal / mcp …）再引入注册表，避免过早抽象。
+//! 方法集仍然用 `match` 分派——协议方法数是两位数，穷举分支比注册表更好读，
+//! 编译器还能替我们检查漏接。M2 之后 `provider.*` / `model.*` / `llm.*` 都有分支，
+//! `methods::IMPLEMENTED` 与这里一一对应；尚未接线的方法留在
+//! `methods::DECLARED_NOT_IMPLEMENTED` 里，调用会如实返回 `-32601`。
 
+use crate::llm_api;
 use crate::peer::Peer;
+use crate::provider_api;
 use crate::state::{now_ms, AppState};
 use crate::sysinfo;
 use crate::version::CORE_VERSION;
@@ -76,6 +80,21 @@ async fn handle_request(peer: &Peer, state: &AppState, req: Request) {
         methods::search::FILES => ws::search_files(peer, state, &req).await,
         methods::search::CONTENT => ws::search_content(peer, state, &req).await,
 
+        // Provider 与模型目录（M2）
+        methods::provider::UPSERT => provider_api::provider_upsert(peer, state, &req).await,
+        methods::provider::LIST => provider_api::provider_list(peer, state, &req).await,
+        methods::provider::DELETE => provider_api::provider_delete(peer, state, &req).await,
+        methods::provider::TEST => provider_api::provider_test(peer, state, &req).await,
+        methods::model::UPSERT => provider_api::model_upsert(peer, state, &req).await,
+        methods::model::LIST => provider_api::model_list(peer, state, &req).await,
+        methods::model::DELETE => provider_api::model_delete(peer, state, &req).await,
+
+        // 流式对话与模型枚举（M2）
+        methods::llm::CHAT_STREAM => llm_api::chat_stream(peer, state, &req).await,
+        methods::llm::CANCEL => llm_api::cancel(peer, state, &req).await,
+        methods::llm::LIST_MODELS => llm_api::list_models(peer, state, &req).await,
+        methods::llm::COUNT_TOKENS => llm_api::count_tokens(peer, state, &req).await,
+
         other => {
             warn!(method = %other, "未实现的方法");
             peer.respond_error(&req.id, &ErrorObject::method_not_found(other))
@@ -90,8 +109,15 @@ async fn handle_notification(peer: &Peer, state: &AppState, notif: Notification)
     match notif.method.as_str() {
         methods::cancel::REQUEST => match parse_params::<CancelParams>(notif.params.as_ref()) {
             Ok(params) => {
-                state.mark_cancelled(&params.id);
-                debug!(id = %params.id, "已登记取消");
+                // `id` 既可能是「还没派发的请求」，也可能是「已在途的流」：
+                // 前者登记给派发前检查，后者直接掐掉上游连接。两条路都走一遍，
+                // 顺序无所谓——命中在途流的概率更高，就放前面。
+                if state.streams().cancel(&params.id) {
+                    debug!(stream_id = %params.id, "已请求取消在途流");
+                } else {
+                    state.mark_cancelled(&params.id);
+                    debug!(id = %params.id, "已登记取消");
+                }
             }
             Err(err) => warn!(message = %err.message, "$/cancelRequest 参数非法，已忽略"),
         },

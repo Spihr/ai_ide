@@ -158,14 +158,45 @@ export const Methods = {
     files: "search.files",
     content: "search.content",
   },
+  provider: {
+    upsert: "provider.upsert",
+    list: "provider.list",
+    delete: "provider.delete",
+    test: "provider.test",
+  },
+  model: {
+    upsert: "model.upsert",
+    list: "model.list",
+    delete: "model.delete",
+  },
+  llm: {
+    chatStream: "llm.chat_stream",
+    cancel: "llm.cancel",
+    listModels: "llm.list_models",
+    countTokens: "llm.count_tokens",
+  },
   event: {
     log: "core.log",
     workspaceChanged: "workspace.changed",
     workspaceIndexed: "workspace.indexed",
+    providerChanged: "provider.changed",
+    llmStarted: "llm.started",
+    llmDelta: "llm.delta",
+    llmReasoning: "llm.reasoning",
+    llmToolCall: "llm.tool_call",
+    llmUsage: "llm.usage",
+    llmFinished: "llm.finished",
+    llmError: "llm.error",
   },
 } as const;
 
-/** M0 + M1 已实现的方法全集。对应 Rust `methods::IMPLEMENTED`。 */
+/**
+ * 已实现的方法全集。对应 Rust `methods::IMPLEMENTED`。
+ *
+ * M0 + M1（协议内核 / 工作区 / 检索）+ M2 的 `provider.*` / `model.*` / `llm.*`
+ * （Provider 与模型目录，含密钥内存保管与脱敏视图；流式对话、取消与用量统计），
+ * 共 27 项，与 Rust `methods::IMPLEMENTED` 逐项对齐。
+ */
 export const IMPLEMENTED_METHODS = [
   Methods.core.hello,
   Methods.core.ping,
@@ -183,4 +214,26 @@ export const IMPLEMENTED_METHODS = [
   Methods.workspace.reveal,
   Methods.search.files,
   Methods.search.content,
+  Methods.provider.upsert,
+  Methods.provider.list,
+  Methods.provider.delete,
+  Methods.provider.test,
+  Methods.model.upsert,
+  Methods.model.list,
+  Methods.model.delete,
+  Methods.llm.chatStream,
+  Methods.llm.cancel,
+  Methods.llm.listModels,
+  Methods.llm.countTokens,
 ] as const;
+
+/**
+ * 协议面已定、内核尚未接线的方法。对应 Rust `methods::DECLARED_NOT_IMPLEMENTED`。
+ *
+ * M2 收口后 `llm.*` 已接进 `crates/core` 的 dispatch，本清单为空——空表是给后续
+ * 里程碑（会话 / Agent / 终端…）留的位置：协议先行定义、实现后补，谁没接线谁待在这里。
+ *
+ * 它**不能**与 `IMPLEMENTED_METHODS` 有交集：`core.hello` 会把已实现清单当能力
+ * 回给外壳，一旦虚报，外壳照单调用只会拿到一片 `-32601`。
+ */
+export const DECLARED_NOT_IMPLEMENTED_METHODS: readonly string[] = [];

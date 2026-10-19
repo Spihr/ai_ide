@@ -97,6 +97,13 @@ pub struct HttpResponse {
     pub body: ResponseBody,
 }
 
+/// 读错误响应体时的字节上限。
+///
+/// 错误体只用来给用户看一句话（`{"error":{"message":...}}`），几 KB 足够；
+/// 上限的作用是防住「上游把一整页 HTML 或一坨日志当错误体吐回来」把内存吃光，
+/// 同时保证即使响应声明了超大 `content-length` 也不会卡住收尾流程。
+pub const ERROR_BODY_LIMIT: usize = 8 * 1024;
+
 impl HttpResponse {
     /// 便捷构造：非流式响应（主要服务于测试替身）。
     pub fn text(status: u16, body: impl Into<String>) -> Self {
@@ -120,6 +127,35 @@ impl HttpResponse {
         match &self.body {
             ResponseBody::Text(text) => Some(text),
             ResponseBody::Chunks(_) | ResponseBody::Empty => None,
+        }
+    }
+
+    /// 把响应体读成字符串；流式响应会把剩余字节读干（按 `max_bytes` 截断）。
+    ///
+    /// `chat_stream` 发出的请求一律带 `accept: text/event-stream`，真实网关在
+    /// 401/429 时回的却是 **一段 JSON 错误体**，落在 `ResponseBody::Chunks` 上。
+    /// 只认 `Text` 形态会让错误详情整段消失，用户最终只看到一句
+    /// 「鉴权失败（HTTP 401）：」——所以非 200 分支必须走这个方法来取 body。
+    pub async fn into_text(self, max_bytes: usize) -> String {
+        match self.body {
+            ResponseBody::Text(text) => text,
+            ResponseBody::Empty => String::new(),
+            ResponseBody::Chunks(mut chunks) => {
+                let mut bytes: Vec<u8> = Vec::new();
+                while let Some(item) = chunks.next().await {
+                    let Ok(chunk) = item else {
+                        // 读错误体的过程中上游断了：能读多少算多少，
+                        // 不值得为此再报一个传输错误盖掉真实的状态码。
+                        break;
+                    };
+                    bytes.extend_from_slice(&chunk);
+                    if bytes.len() >= max_bytes {
+                        bytes.truncate(max_bytes);
+                        break;
+                    }
+                }
+                String::from_utf8_lossy(&bytes).to_string()
+            }
         }
     }
 }
@@ -351,5 +387,59 @@ mod tests {
             .push(("Retry-After".to_string(), "2".to_string()));
         assert_eq!(response.header("retry-after"), Some("2"));
         assert_eq!(response.text_body(), Some("{}"));
+    }
+
+    #[tokio::test]
+    async fn into_text_reads_chunked_body_and_caps_size() {
+        let chunks = vec![
+            Ok(b"{\"error\":".to_vec()),
+            Ok(b"{\"message\":\"boom\"}}".to_vec()),
+        ];
+        let response = HttpResponse {
+            status: 400,
+            headers: Vec::new(),
+            body: ResponseBody::Chunks(Box::pin(futures_util::stream::iter(chunks))),
+        };
+        assert_eq!(
+            response.into_text(ERROR_BODY_LIMIT).await,
+            r#"{"error":{"message":"boom"}}"#,
+            "流式响应体必须能被读出来（非 200 分支依赖它）"
+        );
+
+        // 上限之外的字节直接丢掉，避免上游回一大坨东西把内存吃光。
+        let big = vec![Ok(vec![b'x'; ERROR_BODY_LIMIT + 512])];
+        let response = HttpResponse {
+            status: 502,
+            headers: Vec::new(),
+            body: ResponseBody::Chunks(Box::pin(futures_util::stream::iter(big))),
+        };
+        assert_eq!(
+            response.into_text(ERROR_BODY_LIMIT).await.len(),
+            ERROR_BODY_LIMIT
+        );
+    }
+
+    #[tokio::test]
+    async fn into_text_tolerates_errors_and_multibyte_cut() {
+        // 读到一半上游断了：返回已读到的部分，不把状态码信息盖掉。
+        let chunks = vec![
+            Ok("上游说：".as_bytes().to_vec()),
+            Err(LlmError::Transport("连接中断".to_string())),
+        ];
+        let response = HttpResponse {
+            status: 500,
+            headers: Vec::new(),
+            body: ResponseBody::Chunks(Box::pin(futures_util::stream::iter(chunks))),
+        };
+        assert_eq!(response.into_text(ERROR_BODY_LIMIT).await, "上游说：");
+
+        // 截断点落在多字节字符中间时用 lossy 兜底，不 panic。
+        let raw = "你好".as_bytes().to_vec();
+        let response = HttpResponse {
+            status: 500,
+            headers: Vec::new(),
+            body: ResponseBody::Chunks(Box::pin(futures_util::stream::iter(vec![Ok(raw)]))),
+        };
+        assert!(!response.into_text(3).await.is_empty());
     }
 }

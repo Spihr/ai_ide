@@ -14,7 +14,7 @@ AIGC:
 模型可插拔的 AI 原生代码编辑器。技术栈：**Electron + React + TypeScript（外壳/UI） + Rust（内核）**。
 
 > 文档状态：v0.1（设计基线，待审阅）
-> 实现状态：**M0 / M1 已完成并通过实测验收，M2 尚未开工**（截至 2026-10-19）。本套文档撰写于编码之前，部分表述已与实现不符，凡有冲突以本文「实现状态」章节为准。
+> 实现状态：**M0 / M1 已完成并通过实测验收；M2 的内核侧已完成（`provider.*` / `model.*` / `llm.*` 已接线，流式对话、取消与错误分类端到端可跑），M2 的设置界面（Provider 配置 UI）与 M3 起尚未开工**（截至 2026-10-19）。本套文档撰写于编码之前，部分表述已与实现不符，凡有冲突以本文「实现状态」章节为准。
 
 ---
 
@@ -38,7 +38,7 @@ AIGC:
 |---|---|---|
 | M0 | 骨架与通信 | 已完成，实测见 [06-M0-验收报告.md](./06-M0-验收报告.md) |
 | M1 | 编辑器壳 | 已完成，实测见 [07-M1-验收报告.md](./07-M1-验收报告.md) |
-| M2 | 模型接入 | 未开工 |
+| M2 | 模型接入 | 内核侧已完成（`provider.*` / `model.*` / `llm.*` 共新增 11 个请求方法，能力清单方法数 16 → 27；目录落盘与密钥加密、流式对话 / 取消 / 错误分类已端到端可跑）；设置界面（Provider 配置 UI）待做 |
 | M3–M8 | 上下文引用 / Agent 闭环 / 持久化 / 终端与 Git / MCP / 打包 | 未开工 |
 
 ### 已落地的技术栈（实测）
@@ -49,7 +49,7 @@ AIGC:
 | UI | React 19 + TypeScript 5.6 + Monaco 0.57 | 状态管理为手写 store（`useSyncExternalStore` 订阅），未引入第三方状态库 |
 | 样式 | 手写 CSS | 未引入 Tailwind / Radix 等 UI 框架 |
 | 测试 | Vitest 3 + playwright-core | 前端单测 + Electron 真界面 E2E |
-| 内核 | Rust 2021（rust-version 1.79）+ tokio | 四个 crate：`protocol` / `workspace` / `indexer` / `core` |
+| 内核 | Rust 2021（rust-version 1.79）+ tokio | 五个 crate：`protocol` / `workspace` / `indexer` / `llm` / `core` |
 | 通信 | JSON-RPC 2.0 over stdio（NDJSON） | 帧与 DTO 定义在 `crates/protocol`，TS 类型由 ts-rs 生成 |
 
 > `02-系统架构设计.md` 中的技术栈清单（React 18、Zustand、Tailwind、Radix、features 分层等）与实测**存在偏差**，属待拍板事项，未擅自改写。
@@ -59,12 +59,16 @@ AIGC:
 - `core.*`：`hello` / `ping` / `stats` / `shutdown`
 - `workspace.*`：`open` / `close` / `tree` / `read_file` / `write_file` / `create` / `rename` / `delete` / `reveal`
 - `search.*`：`files`（文件名模糊）、`content`（内容检索，支持正则）
-- 事件：`workspace.changed`
+- `provider.*` / `model.*`：`upsert` / `list` / `delete`（provider 另有 `test`）；目录落盘 `AI_IDE_DATA_DIR/providers.json`，密钥经 `ai-ide-llm` 的 `secret` 模块加密后存储
+- `llm.*`：`chat_stream`（流式）、`cancel`、`list_models`、`count_tokens`；上游协议为 OpenAI Chat Completions 兼容
+- 事件：`workspace.changed`、`provider.changed`、`llm.started` / `delta` / `reasoning` / `tool_call` / `usage` / `finished` / `error`
 - 外壳能力：主进程策略闸门、内核进程监管与优雅退出、preload 能力收窄、渲染端工作区/文件树/多标签/搜索状态机与 Monaco 集成
 
 ### 尚未实现（设计图纸状态）
 
-`llm.*` / `provider.*` / `model.*` / `session.*` / `agent.*` / `terminal.*` / `git.*` / `mcp.*` / `permission.*` / `search.symbols` / `workspace.indexed` / `core.log` 主动推送，以及 `crates/llm` / `agent` / `mcp` / `terminal` / `store` / `parser` 等模块。
+- 协议面：`session.*` / `agent.*` / `terminal.*` / `git.*` / `mcp.*` / `permission.*` / `search.symbols` / `workspace.indexed` / `core.log` 主动推送（`DECLARED_NOT_IMPLEMENTED` 目前为空表，这些方法尚未进协议常量表）
+- 模块：`crates/agent` / `mcp` / `terminal` / `store` / `parser`（`crates/llm` 已创建，见上）
+- 界面：M2 的 Provider / 模型设置 UI 与对话面板尚未接入渲染端，`llm.*` 目前只能经内核协议直连调用
 
 ### 质量门禁实测（2026-10-19）
 

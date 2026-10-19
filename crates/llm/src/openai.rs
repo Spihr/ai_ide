@@ -16,11 +16,13 @@ use ai_ide_protocol::dto::{
 };
 use serde_json::{json, Map, Value};
 
-use crate::error::LlmError;
+use crate::error::{
+    is_context_overflow, parse_upstream_error, truncate, upstream_message, LlmError,
+};
 use crate::provider::{CancelToken, Provider, ProviderSpec};
 use crate::secret::SecretString;
 use crate::sse::{translate_openai_chunk, SseDecoder, TranslatedChunk};
-use crate::transport::{HttpRequest, HttpTransport, ResponseBody, Utf8Decoder};
+use crate::transport::{HttpRequest, HttpTransport, ResponseBody, Utf8Decoder, ERROR_BODY_LIMIT};
 use crate::types::{emit, ChatRequest, EventSink, HealthReport, StreamEvent, Usage};
 
 /// Chat Completions 适配器。
@@ -136,7 +138,17 @@ impl OpenAiProvider {
         body_text: &str,
     ) -> LlmError {
         let upstream = parse_upstream_error(body_text);
-        let message = upstream_message(&upstream).unwrap_or_else(|| truncate(body_text, 400));
+        let message = upstream
+            .as_ref()
+            .and_then(upstream_message)
+            .unwrap_or_else(|| truncate(body_text, 400));
+
+        // 400 里混着两种完全不同的处境：上下文塞太满（该裁剪/换长窗口模型）
+        // 和参数/模型名写错（该改配置）。只靠状态码分不开，看错误体。
+        if is_context_overflow(status, &message, &upstream) {
+            return LlmError::ContextOverflow { message, upstream };
+        }
+
         match status {
             401 | 403 => LlmError::AuthFailed {
                 status,
@@ -199,8 +211,13 @@ impl Provider for OpenAiProvider {
 
         let response = self.transport.send(http).await?;
         if response.status != 200 {
-            let text = response.text_body().unwrap_or_default().to_string();
-            return Err(self.classify_error(response.status, &response.headers, &text));
+            // 流式请求的响应体落在 `Chunks` 上，必须显式读出来：真实网关的
+            // 401/429 回的就是一小段 JSON 错误体，只取 `Text` 会让详情整段丢失，
+            // UI 最后只能显示「鉴权失败（HTTP 401）：」。
+            let status = response.status;
+            let headers = response.headers.clone();
+            let text = response.into_text(ERROR_BODY_LIMIT).await;
+            return Err(self.classify_error(status, &headers, &text));
         }
 
         let ResponseBody::Chunks(mut chunks) = response.body else {
@@ -401,32 +418,6 @@ fn tool_choice_wire(choice: ToolChoice) -> &'static str {
         ToolChoice::None => "none",
         ToolChoice::Required => "required",
     }
-}
-
-/// 从上游错误响应体里提取 `error.message` / `message`。
-fn parse_upstream_error(body: &str) -> Option<Value> {
-    let value: Value = serde_json::from_str(body).ok()?;
-    Some(value)
-}
-
-fn upstream_message(upstream: &Option<Value>) -> Option<String> {
-    let value = upstream.as_ref()?;
-    value
-        .get("error")
-        .and_then(|error| error.get("message"))
-        .or_else(|| value.get("message"))
-        .and_then(|message| message.as_str())
-        .map(|message| message.to_string())
-}
-
-fn truncate(text: &str, max_chars: usize) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= max_chars {
-        return text.to_string();
-    }
-    let mut out: String = chars[..max_chars].iter().collect();
-    out.push('…');
-    out
 }
 
 /// 解析 `Retry-After`（秒）。
@@ -665,13 +656,51 @@ mod tests {
     }
 
     #[test]
+    fn a_400_is_split_into_overflow_and_plain_bad_request() {
+        let provider = provider();
+
+        // 上下文超限：给 UI 的信号是「裁剪上下文 / 换长窗口模型」。
+        let overflow = provider.classify_error(
+            400,
+            &[],
+            r#"{"error":{"message":"This model's maximum context length is 8192 tokens","code":"context_length_exceeded"}}"#,
+        );
+        assert_eq!(
+            overflow.code(),
+            ai_ide_protocol::ErrorCode::CONTEXT_OVERFLOW,
+            "超限必须与普通 400 分开，否则提示语只会是「请求不合法」"
+        );
+        assert!(matches!(overflow, LlmError::ContextOverflow { .. }));
+        assert!(
+            overflow
+                .upstream()
+                .is_some_and(|value| value["error"]["code"] == json!("context_length_exceeded")),
+            "原始错误体要一路带到 UI"
+        );
+
+        // 模型名写错：同样 400，但该做的是改配置。
+        let bad_model =
+            provider.classify_error(400, &[], r#"{"error":{"message":"model `foo` not found"}}"#);
+        assert!(
+            !matches!(bad_model, LlmError::ContextOverflow { .. }),
+            "别把「模型名写错」也说成上下文超限"
+        );
+    }
+
+    #[test]
     fn upstream_message_is_extracted_from_error_object() {
         let upstream = parse_upstream_error(r#"{"error":{"message":"配额不足"}}"#);
-        assert_eq!(upstream_message(&upstream).as_deref(), Some("配额不足"));
+        assert_eq!(
+            upstream.as_ref().and_then(upstream_message).as_deref(),
+            Some("配额不足")
+        );
         let flat = parse_upstream_error(r#"{"message":"模型不存在"}"#);
-        assert_eq!(upstream_message(&flat).as_deref(), Some("模型不存在"));
+        assert_eq!(
+            flat.as_ref().and_then(upstream_message).as_deref(),
+            Some("模型不存在")
+        );
         let not_json = parse_upstream_error("<html>");
-        assert_eq!(upstream_message(&not_json), None);
+        assert_eq!(not_json.as_ref().and_then(upstream_message), None);
     }
 
     #[test]

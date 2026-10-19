@@ -3,6 +3,8 @@
 //! M0 只保存两样东西：进程启动时刻（用于上报 uptime）与取消登记表。
 //! 后续里程碑会把工作区句柄、索引、会话、Provider 配置等挂到这里。
 
+use crate::llm_api::StreamHub;
+use crate::llm_runtime::{default_store_path, LlmRuntime};
 use crate::peer::Peer;
 use ai_ide_indexer::FileIndex;
 use ai_ide_workspace::{Workspace, WorkspaceError, WorkspaceManager};
@@ -26,6 +28,11 @@ pub struct AppState {
     active: Mutex<Option<String>>,
     /// 对端句柄，用于主动推送事件。单测里不注入，事件静默丢弃。
     peer: Mutex<Option<Arc<Peer>>>,
+    /// 模型接入层状态（M2：Provider 目录 / 注册表 / 内存密钥）。
+    llm: LlmRuntime,
+    /// 在途流式对话的取消句柄表（M2）。放在状态里是因为「取消」是一条独立报文，
+    /// 需要按 `stream_id` 找到那条流。
+    streams: Arc<StreamHub>,
 }
 
 impl Default for AppState {
@@ -43,12 +50,34 @@ impl AppState {
             indices: Mutex::new(HashMap::new()),
             active: Mutex::new(None),
             peer: Mutex::new(None),
+            // 用默认落盘路径起步；单测用 `with_llm_runtime` 换成临时目录 + 替身传输。
+            llm: LlmRuntime::new(default_store_path()),
+            streams: Arc::new(StreamHub::new()),
         }
     }
 
     /// 进程已运行时长（毫秒）。
     pub fn uptime_ms(&self) -> u64 {
         self.started_at.elapsed().as_millis() as u64
+    }
+
+    /// 模型接入层状态：Provider 目录、注册表与内存密钥（M2）。
+    pub fn llm(&self) -> &LlmRuntime {
+        &self.llm
+    }
+
+    /// 在途流式对话的取消句柄表（M2）。
+    pub fn streams(&self) -> Arc<StreamHub> {
+        Arc::clone(&self.streams)
+    }
+
+    /// 换上一个现成的模型接入运行时。
+    ///
+    /// 落盘目录与 HTTP 传输都在 [`LlmRuntime`] 构造时确定，所以单测用它把
+    /// 存储挪到临时目录、把传输换成测试替身，整条 `provider.*` 链路即可离线验收。
+    pub fn with_llm_runtime(mut self, llm: LlmRuntime) -> Self {
+        self.llm = llm;
+        self
     }
 
     /// 登记一条取消请求。

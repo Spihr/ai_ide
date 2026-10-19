@@ -12,6 +12,7 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  DECLARED_NOT_IMPLEMENTED_METHODS,
   IMPLEMENTED_METHODS,
   JSONRPC_VERSION,
   Methods,
@@ -46,8 +47,27 @@ describe('协议常量', () => {
       wsReveal: Methods.workspace.reveal,
       searchFiles: Methods.search.files,
       searchContent: Methods.search.content,
+      providerUpsert: Methods.provider.upsert,
+      providerList: Methods.provider.list,
+      providerDelete: Methods.provider.delete,
+      providerTest: Methods.provider.test,
+      modelUpsert: Methods.model.upsert,
+      modelList: Methods.model.list,
+      modelDelete: Methods.model.delete,
+      llmChatStream: Methods.llm.chatStream,
+      llmCancel: Methods.llm.cancel,
+      llmListModels: Methods.llm.listModels,
+      llmCountTokens: Methods.llm.countTokens,
       wsChanged: Methods.event.workspaceChanged,
-      wsIndexed: Methods.event.workspaceIndexed
+      wsIndexed: Methods.event.workspaceIndexed,
+      providerChanged: Methods.event.providerChanged,
+      llmStarted: Methods.event.llmStarted,
+      llmDelta: Methods.event.llmDelta,
+      llmReasoning: Methods.event.llmReasoning,
+      llmToolCall: Methods.event.llmToolCall,
+      llmUsage: Methods.event.llmUsage,
+      llmFinished: Methods.event.llmFinished,
+      llmError: Methods.event.llmError
     }).toEqual({
       hello: 'core.hello',
       ping: 'core.ping',
@@ -66,8 +86,27 @@ describe('协议常量', () => {
       wsReveal: 'workspace.reveal',
       searchFiles: 'search.files',
       searchContent: 'search.content',
+      providerUpsert: 'provider.upsert',
+      providerList: 'provider.list',
+      providerDelete: 'provider.delete',
+      providerTest: 'provider.test',
+      modelUpsert: 'model.upsert',
+      modelList: 'model.list',
+      modelDelete: 'model.delete',
+      llmChatStream: 'llm.chat_stream',
+      llmCancel: 'llm.cancel',
+      llmListModels: 'llm.list_models',
+      llmCountTokens: 'llm.count_tokens',
       wsChanged: 'workspace.changed',
-      wsIndexed: 'workspace.indexed'
+      wsIndexed: 'workspace.indexed',
+      providerChanged: 'provider.changed',
+      llmStarted: 'llm.started',
+      llmDelta: 'llm.delta',
+      llmReasoning: 'llm.reasoning',
+      llmToolCall: 'llm.tool_call',
+      llmUsage: 'llm.usage',
+      llmFinished: 'llm.finished',
+      llmError: 'llm.error'
     })
   })
 
@@ -88,7 +127,27 @@ describe('协议常量', () => {
       'workspace.delete',
       'workspace.reveal',
       'search.files',
-      'search.content'
+      'search.content',
+      'provider.upsert',
+      'provider.list',
+      'provider.delete',
+      'provider.test',
+      'model.upsert',
+      'model.list',
+      'model.delete',
+      'llm.chat_stream',
+      'llm.cancel',
+      'llm.list_models',
+      'llm.count_tokens'
     ])
+  })
+
+  it('未接线清单已清空（M2 收口），且与已实现清单互斥', () => {
+    // M2 把 llm.* 接进 dispatch 后，「协议已定义」与「内核已接线」的差值应为空。
+    expect([...DECLARED_NOT_IMPLEMENTED_METHODS]).toEqual([])
+    for (const method of DECLARED_NOT_IMPLEMENTED_METHODS) {
+      // 虚报能力会让外壳照单调进一片 -32601，互斥关系必须钉死。
+      expect(IMPLEMENTED_METHODS as readonly string[]).not.toContain(method)
+    }
   })
 })

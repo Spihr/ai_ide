@@ -16,6 +16,7 @@ name = "ai-ide-core"
 version = "0.1.0"
 dependencies = [
  "ai-ide-indexer",
+ "ai-ide-llm",
  "ai-ide-protocol",
  "ai-ide-workspace",
  "anyhow",

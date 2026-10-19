@@ -9,6 +9,7 @@
 //! 分开之后，单测可以分别覆盖「分帧边界」和「厂商字段差异」，不用互相牵连。
 
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::error::LlmError;
 use crate::types::{StreamEvent, Usage};
@@ -133,6 +134,11 @@ pub fn translate_openai_chunk(data: &str) -> Result<TranslatedChunk, LlmError> {
         LlmError::BadResponse(format!("分片不是合法 JSON: {err}; 原文: {trimmed}"))
     })?;
 
+    // 流中错误优先于一切：这一帧里不会有内容增量，但它的含义是「后面没有了」。
+    if let Some(error) = envelope.error {
+        return Err(crate::error::classify_stream_error(&error));
+    }
+
     let mut out = TranslatedChunk {
         message_id: envelope.id.clone(),
         ..TranslatedChunk::default()
@@ -206,6 +212,11 @@ struct ChunkEnvelope {
     choices: Vec<ChunkChoice>,
     #[serde(default)]
     usage: Option<UsagePayload>,
+    /// 有些上游（DeepSeek / Kimi / 各类网关）会在流中途塞一个错误帧。
+    /// 不认这个字段的话，`choices` 为空 + `error` 被当未知字段丢掉，
+    /// 整条流就变成「没有内容地正常结束」——半截回答配一句"完成"。
+    #[serde(default)]
+    error: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -445,6 +456,45 @@ mod tests {
         assert!(
             matches!(err, LlmError::BadResponse(_)),
             "非法分片应归类为响应解析错误: {err}"
+        );
+    }
+
+    #[test]
+    fn mid_stream_error_frame_is_surfaced_not_swallowed() {
+        // 上游在流中途报错时发的是这种帧：没有 choices，只有一个 error。
+        // 不认它的话整条流会「没有内容地正常结束」，用户只看到半截回答。
+        let err = translate_openai_chunk(
+            r#"{"error":{"code":"context_length_exceeded","message":"maximum context length is 65536 tokens"}}"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("上下文超限"),
+            "流中错误要和请求被拒走同一套分类: {err}"
+        );
+
+        let rate_limited = translate_openai_chunk(
+            r#"{"error":{"type":"rate_limit_exceeded","message":"slow down"}}"#,
+        )
+        .unwrap_err();
+        assert!(
+            rate_limited.to_string().contains("限流"),
+            "限流要能被区分出来: {rate_limited}"
+        );
+    }
+
+    #[test]
+    fn null_error_field_is_not_a_failure() {
+        // 正常分片里带上 `"error": null` 的网关不少，别把它当报错。
+        let chunk = translate_openai_chunk(
+            r#"{"id":"chatcmpl-1","error":null,"choices":[{"index":0,"delta":{"content":"好"}}]}"#,
+        )
+        .expect("error 为 null 时应当正常翻译");
+        assert_eq!(
+            chunk.events,
+            vec![StreamEvent::Delta {
+                text: "好".to_string()
+            }],
+            "内容增量要照常发出去"
         );
     }
 }

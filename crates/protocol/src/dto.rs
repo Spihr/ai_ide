@@ -1040,6 +1040,11 @@ pub struct LlmErrorEvent {
     /// 上游原始错误体（脱敏后），便于用户自查配额与模型名。
     #[serde(default)]
     pub upstream: Option<serde_json::Value>,
+    /// 上游建议的重试等待（毫秒，来自 `Retry-After`）。
+    ///
+    /// 有它 UI 才能显示「N 秒后重试」；只报一句「限流了」等于把最有用的一半信息丢掉。
+    #[serde(default)]
+    pub retry_after_ms: Option<u64>,
 }
 
 /// `provider.changed` 事件载荷。

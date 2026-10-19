@@ -2,15 +2,25 @@
 //!
 //! AI IDE 的 Rust 内核。
 //!
-//! **M1 阶段的职责**：在 M0 的通信骨架上接入工作区能力——打开 / 关闭工作区、
-//! 目录树、文件读写、创建 / 重命名 / 删除 / 定位，以及文件名模糊检索与内容检索。
-//! 通信部分不变：从 stdin 逐行读 NDJSON → 分发到处理器 → 结果写回 stdout，
-//! 另有 `core.*` 四个基础方法与 `$/cancelRequest` 取消机制。
+//! **M2 阶段的职责**：把 Provider / 模型目录接进通信骨架——`provider.upsert` /
+//! `provider.list` / `provider.delete` / `provider.test` 与 `model.upsert` /
+//! `model.list` / `model.delete` 七个方法真正可路由，目录落盘在
+//! `AI_IDE_DATA_DIR`（缺省 `%APPDATA%\ai-ide`）下的 `providers.json`。
+//! M1 的工作区能力（打开 / 目录树 / 读写 / 检索）保持不变。
 //!
-//! 已实现的方法全集见 [`ai_ide_protocol::methods::IMPLEMENTED`]，
-//! `workspace.*` / `search.*` 的处理集中在 [`ws`] 模块。
+//! **`llm.*` 已接线**：`llm.chat_stream` / `llm.cancel` / `llm.list_models` /
+//! `llm.count_tokens` 四个方法在 [`llm_api`] 里，会把 `ai-ide-llm` 的运行期事件
+//! 翻成 `llm.started` / `llm.delta` / `llm.reasoning` / `llm.tool_call` /
+//! `llm.usage` / `llm.finished` / `llm.error` 推送，并保证「一次流恰好一条开始事件、
+//! `finished` 与 `error` 互斥」这两条不变量。因此
+//! [`ai_ide_protocol::methods::DECLARED_NOT_IMPLEMENTED`] 现在是空表——
+//! 那两张表互斥，谁没接线谁才待在那里。
 //!
-//! 后续里程碑在此骨架上继续挂载：llm / agent / terminal / mcp / store 等模块。
+//! 已实现的方法全集见 [`ai_ide_protocol::methods::IMPLEMENTED`]：
+//! `workspace.*` / `search.*` 在 [`ws`] 模块，`provider.*` / `model.*` 在
+//! [`provider_api`] 模块，两者共用的运行期状态在 [`state`] / [`llm_runtime`]。
+//!
+//! 后续里程碑在此骨架上继续挂载：agent / terminal / mcp / store 等模块。
 //!
 //! ## 绝对约定：stdout 只跑协议
 //!
@@ -18,7 +28,10 @@
 //! 主进程侧的行解析就会崩，而且这种 bug 极难定位。
 
 pub mod dispatch;
+pub mod llm_api;
+pub mod llm_runtime;
 pub mod peer;
+pub mod provider_api;
 pub mod state;
 pub mod sysinfo;
 pub mod version;
@@ -42,6 +55,9 @@ pub async fn run() -> Result<()> {
     let peer = Arc::new(Peer::new());
     // 把对端句柄交给状态：`workspace.changed` 这类事件需要主动推送。
     state.attach_peer(Arc::clone(&peer));
+
+    // 启动即装载落盘目录：进程重启后 Provider 列表不丢（密钥需主进程重新注入）。
+    llm_runtime::report_bootstrap(state.llm().bootstrap());
 
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
@@ -77,6 +93,13 @@ pub async fn run() -> Result<()> {
                 break;
             }
         }
+    }
+
+    // 在途流式对话不在 `inflight` 里（它读的是上游，不是 stdin），得单独阻断：
+    // 否则退出时那条任务的请求会一直挂在网络上，直到进程被系统收走。
+    let blocked = state.streams().cancel_all();
+    if blocked > 0 {
+        info!(streams = blocked, "退出：已阻断在途流式对话");
     }
 
     drain_inflight(&mut inflight).await;

@@ -23,7 +23,11 @@ struct FakeTransport {
 
 enum Reply {
     /// 流式：按给定字节块依次下发（用于模拟任意位置的分片）。
-    Stream(Vec<Vec<u8>>),
+    Stream {
+        status: u16,
+        headers: Vec<(String, String)>,
+        chunks: Vec<Vec<u8>>,
+    },
     /// 非流式：固定状态码 + 文本响应体。
     Text {
         status: u16,
@@ -34,8 +38,22 @@ enum Reply {
 
 impl FakeTransport {
     fn stream(chunks: Vec<Vec<u8>>) -> Arc<Self> {
+        Self::stream_status(200, Vec::new(), chunks)
+    }
+
+    /// 流式响应但状态码非 200：**真实网关回 401/429 就是这么回的**
+    /// （请求带 `accept: text/event-stream`，响应体却是一段 JSON 错误）。
+    fn stream_status(
+        status: u16,
+        headers: Vec<(String, String)>,
+        chunks: Vec<Vec<u8>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            reply: Reply::Stream(chunks),
+            reply: Reply::Stream {
+                status,
+                headers,
+                chunks,
+            },
             requests: Mutex::new(Vec::new()),
         })
     }
@@ -88,12 +106,16 @@ impl HttpTransport for FakeTransport {
             .expect("请求记录锁未被污染")
             .push(request);
         Ok(match &self.reply {
-            Reply::Stream(chunks) => {
+            Reply::Stream {
+                status,
+                headers,
+                chunks,
+            } => {
                 let items: Vec<Result<Vec<u8>, LlmError>> =
                     chunks.iter().map(|chunk| Ok(chunk.clone())).collect();
                 HttpResponse {
-                    status: 200,
-                    headers: Vec::new(),
+                    status: *status,
+                    headers: headers.clone(),
                     body: ResponseBody::Chunks(Box::pin(futures_util::stream::iter(items))),
                 }
             }
@@ -375,6 +397,70 @@ async fn auth_failure_surfaces_upstream_message() {
         }
         other => panic!("期望 AuthFailed，实际: {other}"),
     }
+}
+
+#[tokio::test]
+async fn streaming_error_response_still_yields_upstream_message() {
+    // 回归：`chat_stream` 走的是流式读取，非 200 时响应体是 `Chunks` 而不是 `Text`。
+    // 早先只从 `Text` 取 body，导致真实网关的 401/429 详情被整段丢掉，
+    // 用户只看到「鉴权失败（HTTP 401）：」——而只构造 `Text` 的测试发现不了。
+    let transport = FakeTransport::stream_status(
+        401,
+        Vec::new(),
+        split_every_two_bytes(r#"{"error":{"message":"Invalid API key provided"}}"#),
+    );
+    let provider = provider_with(transport, Some("sk-abcdefghijklmnop"));
+    let (sink, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+    let err = provider
+        .chat_stream(user_request(), sink, CancelToken::new())
+        .await
+        .unwrap_err();
+    match &err {
+        LlmError::AuthFailed {
+            status, message, ..
+        } => {
+            assert_eq!(*status, 401);
+            assert!(
+                message.contains("Invalid API key"),
+                "流式响应上的错误体也要读出来并透传: {message}"
+            );
+        }
+        other => panic!("期望 AuthFailed，实际: {other}"),
+    }
+    let upstream = err.upstream().expect("上游原话应被记住");
+    assert_eq!(
+        upstream["error"]["message"], "Invalid API key provided",
+        "上游原话要进 upstream 字段，供用户自助排查"
+    );
+}
+
+#[tokio::test]
+async fn streaming_rate_limit_keeps_retry_after_hint() {
+    // 状态码、Retry-After 头、错误体三者都在流式响应上，缺任何一项都会让
+    // 前端无法提示「稍后重试，等 N 秒」。
+    let transport = FakeTransport::stream_status(
+        429,
+        vec![("Retry-After".to_string(), "3".to_string())],
+        split_every_two_bytes(r#"{"error":{"message":"rate limited"}}"#),
+    );
+    let provider = provider_with(transport, Some("sk-abcdefghijklmnop"));
+    let (sink, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+    let err = provider
+        .chat_stream(user_request(), sink, CancelToken::new())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        ai_ide_protocol::ErrorCode::PROVIDER_RATE_LIMITED,
+        "限流要折成 2003 而不是泛化失败"
+    );
+    assert_eq!(err.retry_after_ms(), Some(3000));
+    assert!(
+        err.to_string().contains("rate limited"),
+        "限流也要带上上游原话: {err}"
+    );
 }
 
 #[tokio::test]
