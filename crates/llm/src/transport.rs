@@ -252,8 +252,12 @@ impl HttpTransport for ReqwestTransport {
 }
 
 /// 把 reqwest 的错误压成可读、可分类的一句话（超时 vs 连接失败对用户意味着不同动作）。
+///
+/// reqwest 的顶层信息经常只有一句 `error sending request for url (...)`——真正的原因
+/// （连接被拒 / 连接被重置 / 流被掐断）藏在 `source` 链里。对用户来说这句话已经够用，
+/// 但对「偶发的传输失败」这类问题，没有错误链就只能靠反复复现去猜，所以一并带上。
 fn describe_reqwest_error(err: &reqwest::Error) -> String {
-    if err.is_timeout() {
+    let mut text = if err.is_timeout() {
         format!("请求超时: {err}")
     } else if err.is_connect() {
         format!("连接失败（检查网络或 base_url）: {err}")
@@ -261,7 +265,18 @@ fn describe_reqwest_error(err: &reqwest::Error) -> String {
         format!("响应解码失败: {err}")
     } else {
         err.to_string()
+    };
+
+    let mut cause = std::error::Error::source(err);
+    while let Some(err) = cause {
+        let detail = err.to_string();
+        if !text.contains(&detail) {
+            text.push_str(" ← ");
+            text.push_str(&detail);
+        }
+        cause = err.source();
     }
+    text
 }
 
 /// 增量 UTF-8 解码器。

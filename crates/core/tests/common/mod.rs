@@ -12,8 +12,12 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::Duration;
+
+/// `AI_IDE_TEST_CORE_LOG` 指向目录时，给每个内核日志文件编号（进程内唯一）。
+static CORE_LOG_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 /// 单条报文的等待上限。超过即判定为死锁，直接失败而不是挂住 CI。
 pub const TIMEOUT: Duration = Duration::from_secs(20);
@@ -37,11 +41,33 @@ pub struct Core {
 impl Core {
     /// 启动内核，并把它的数据目录指到 `data_dir`。
     pub fn spawn(data_dir: &Path) -> Self {
+        // 内核日志走 stderr。默认丢弃，免得污染测试输出；排查间歇性失败时，
+        // 用 `AI_IDE_TEST_CORE_LOG=<文件或目录>` 把它落盘——「llm.error 到底报的是
+        // 哪一类错误」这种问题，没有内核日志就只能靠反复复现去猜。
+        // 给目录时按「测试进程号 + 序号」分文件：一个测试进程会拉起多个内核
+        // （用例之间还会并发），共用一个文件会把它们的日志搅在一起。
+        let stderr = match std::env::var_os("AI_IDE_TEST_CORE_LOG") {
+            Some(path) => {
+                let path = PathBuf::from(path);
+                let path = if path.is_dir() {
+                    let seq = CORE_LOG_SEQ.fetch_add(1, Ordering::Relaxed);
+                    path.join(format!("core-{}-{seq}.log", std::process::id()))
+                } else {
+                    path
+                };
+                Stdio::from(
+                    std::fs::File::create(&path)
+                        .unwrap_or_else(|err| panic!("创建内核日志文件失败：{err}")),
+                )
+            }
+            None => Stdio::null(),
+        };
+
         let mut child = Command::new(env!("CARGO_BIN_EXE_ai-ide-core"))
             .env("AI_IDE_DATA_DIR", data_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(stderr)
             .spawn()
             .expect("内核进程启动失败");
 

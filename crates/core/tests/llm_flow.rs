@@ -30,6 +30,19 @@ const MODEL: &str = "deepseek-chat";
 /// 单条事件的等待上限。流式链路卡住时要失败得干脆，而不是把 CI 挂住。
 const EVENT_WAIT: Duration = Duration::from_secs(10);
 
+/// 假上游的诊断开关：设了 `AI_IDE_TEST_UPSTREAM_TRACE` 就把 accept / serve 的关键节点
+/// 打到 stderr。用例失败时 libtest 会把它捕获的输出一并 dump 出来，这对付
+/// 「偶发、跑一次就消失」的失败是必要的——否则只能靠反复复现去猜。
+///
+/// 平时不打：正常路径不该被调试噪音淹没。
+macro_rules! utrace {
+    ($($arg:tt)*) => {
+        if std::env::var_os("AI_IDE_TEST_UPSTREAM_TRACE").is_some() {
+            eprintln!("[mock-upstream] {}", format!($($arg)*));
+        }
+    };
+}
+
 // ---------------------------------------------------------------------------
 // 假上游
 // ---------------------------------------------------------------------------
@@ -91,20 +104,41 @@ impl MockUpstream {
         let join = std::thread::spawn(move || {
             while !accepting.stop.load(Ordering::Relaxed) {
                 match listener.accept() {
-                    Ok((stream, _)) => {
+                    Ok((stream, peer)) => {
+                        utrace!("accept 成功 peer={peer}");
                         let shared = Arc::clone(&accepting);
                         // 取消用例要求连接能长期吊住，所以每连接一个线程。
-                        std::thread::spawn(move || {
-                            let _ = serve(stream, shared);
+                        std::thread::spawn(move || match serve(stream, shared) {
+                            Ok(()) => utrace!("serve 正常结束 peer={peer}"),
+                            Err(err) => utrace!("serve 出错 peer={peer}: {err:?}"),
                         });
                     }
-                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            ErrorKind::WouldBlock
+                                | ErrorKind::Interrupted
+                                | ErrorKind::TimedOut
+                                | ErrorKind::ConnectionAborted
+                        ) =>
+                    {
+                        // 队列里的连接被对端提前掐掉时，accept 会直接报错（Windows 上尤其常见）；
+                        // 那是某一条连接的事，不该把整个假上游带走。
+                        utrace!("accept 跳过一条异常的排队连接: {err:?}");
                         std::thread::sleep(Duration::from_millis(5));
                     }
-                    Err(_) => break,
+                    Err(err) => {
+                        // 静默退出会让「后续连接没人接」变成一堆看不懂的客户端超时，
+                        // 所以这里必须留痕。
+                        utrace!("accept 循环退出: {err:?}");
+                        break;
+                    }
                 }
             }
+            utrace!("accept 线程收工");
         });
+
+        utrace!("假上游监听 http://127.0.0.1:{port}/v1");
 
         Self {
             base_url: format!("http://127.0.0.1:{port}/v1"),
@@ -141,6 +175,7 @@ impl MockUpstream {
 
 impl Drop for MockUpstream {
     fn drop(&mut self) {
+        utrace!("关闭假上游 {}", self.base_url);
         self.shared.stop.store(true, Ordering::Relaxed);
         if let Some(join) = self.join.take() {
             let _ = join.join();
@@ -156,8 +191,16 @@ const SSE_HEAD: &str = "HTTP/1.1 200 OK\r\n\
 
 /// 处理一条连接：读完整请求 → 按剧本响应。
 fn serve(mut stream: TcpStream, shared: Arc<Shared>) -> std::io::Result<()> {
+    // accept 出来的连接会继承监听套接字的非阻塞状态（Windows 上如此，而 Linux 不继承）。
+    // 不显式改回阻塞，第一条 `read` 只要请求还没到就会立刻以 WouldBlock 失败、连接被关掉，
+    // 客户端那侧看到的是一句没头没脑的「连接在消息完成前被关闭」——
+    // 这正是「偶发、且只在回环上跑得快时才出现」的那类失败的来源。
+    //
+    // 非阻塞只该属于 accept 轮询，不该跟着连接走：连接上的读写要能等。
+    stream.set_nonblocking(false)?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let head = read_head(&mut stream)?;
+    utrace!("读到请求头 {} 字节", head.len());
 
     let mut lines = head.lines();
     let request_line = lines.next().unwrap_or_default().to_string();
@@ -176,12 +219,15 @@ fn serve(mut stream: TcpStream, shared: Arc<Shared>) -> std::io::Result<()> {
 
     let mut raw = vec![0u8; content_length];
     if content_length > 0 {
-        stream.read_exact(&mut raw)?;
+        stream.read_exact(&mut raw).inspect_err(|err| {
+            utrace!("读请求体失败（期望 {content_length} 字节）: {err:?}");
+        })?;
     }
 
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_string();
     let path = parts.next().unwrap_or_default().to_string();
+    utrace!("请求 {method} {path} content_length={content_length}");
     shared.seen.lock().expect("请求记录锁").push(SeenRequest {
         method,
         path: path.clone(),
@@ -215,6 +261,7 @@ fn serve(mut stream: TcpStream, shared: Arc<Shared>) -> std::io::Result<()> {
             headers,
             body,
         } => {
+            utrace!("剧本 Failure status={status}");
             let mut extra = String::new();
             for (name, value) in &headers {
                 extra.push_str(&format!("{name}: {value}\r\n"));
@@ -228,6 +275,7 @@ fn serve(mut stream: TcpStream, shared: Arc<Shared>) -> std::io::Result<()> {
             )
         }
         Script::Stream { frames } => {
+            utrace!("剧本 Stream 帧数={}", frames.len());
             write_text(&mut stream, SSE_HEAD)?;
             for frame in &frames {
                 write_chunk(&mut stream, frame)?;
@@ -236,6 +284,7 @@ fn serve(mut stream: TcpStream, shared: Arc<Shared>) -> std::io::Result<()> {
             write_text(&mut stream, "0\r\n\r\n")
         }
         Script::Stall { frames, hold } => {
+            utrace!("剧本 Stall 帧数={} hold={hold:?}", frames.len());
             write_text(&mut stream, SSE_HEAD)?;
             for frame in &frames {
                 write_chunk(&mut stream, frame)?;
@@ -252,10 +301,12 @@ fn read_head(stream: &mut TcpStream) -> std::io::Result<String> {
     let mut byte = [0u8; 1];
     while !buf.ends_with(b"\r\n\r\n") {
         if stream.read(&mut byte)? == 0 {
+            utrace!("请求头读到 EOF，仅 {} 字节", buf.len());
             break;
         }
         buf.push(byte[0]);
         if buf.len() > 64 * 1024 {
+            utrace!("请求头超过 64KiB，放弃");
             break;
         }
     }
@@ -403,7 +454,9 @@ fn 流式对话_端到端_事件有序且无重复() {
                 assert_eq!(params["completion_tokens"], json!(4));
             }
             "llm.finished" => finished = params.clone(),
-            other => panic!("流式链路不该出现 {other}"),
+            // 把事件整条打出来：断言只报「出现了 llm.error」时，看不出到底是
+            // 超时、断流还是上游错误帧，排查只能靠复现。
+            other => panic!("流式链路不该出现 {other}：{event}"),
         }
         methods.push(method);
     }
