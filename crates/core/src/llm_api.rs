@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use ai_ide_llm::tokens::{estimate_text, estimate_tokens, ESTIMATE_NOTE};
+use ai_ide_llm::tokens::TokenCounter;
 use ai_ide_llm::{CancelToken, ChatRequest, LlmError, Provider, StreamEvent};
 use ai_ide_protocol::dto::{
     ChatMessage, ChatRole, FinishReason, LlmCancelParams, LlmChatStreamParams, LlmChatStreamResult,
@@ -486,17 +486,19 @@ pub async fn list_models(peer: &Peer, state: &AppState, req: &Request) {
 // llm.count_tokens
 // ---------------------------------------------------------------------------
 
-/// token 估算。
+/// token 计数。
 ///
-/// M2 不做真实分词：口径见 [`ai_ide_llm::tokens`]（CJK 一字≈1 token、ASCII 4 字符≈1 token、
-/// 每条消息固定开销），因此 `exact` 一律为 `false`，并附口径说明供 UI 提示「预算值」。
+/// 口径按 `model_ref.model_id` 分流（映射见 [`ai_ide_llm::tokens::encoding_for_model`]）：
+/// 认识的模型族走 tiktoken 真实词表精确分词（`exact: true`，`note` 点明用的哪套词表），
+/// 其余模型回落内核估算器（`exact: false`）。调用方只依赖 `exact` 与 `note` 两个字段，
+/// 协议字段含义不变。
 ///
-/// M3 起入参有两种口径，都算进同一个结果：`messages`（对话历史）与 `texts`（额外的
+/// 入参有两种口径，都算进同一个结果：`messages`（对话历史）与 `texts`（额外的
 /// 裸文本，典型用途是输入框里还没拼成消息的草稿、以及 @引用到的片段）。两者可以同时给，
-/// 服务的是「发送前估算总量」这一个目的。
+/// 服务的是「发送前看清总量」这一个目的。
 ///
-/// **不查注册表**：估算纯本地计算，调不通上游也要能算——输入框的 token 计数
-/// 不该因为网关挂了而消失。
+/// **不查注册表**：计数纯本地计算，调不通上游也要能算——输入框的 token 计数
+/// 不该因为网关挂了而消失。首次精确计数会解析一次内嵌词表（百毫秒量级，进程内只做一次）。
 pub async fn count_tokens(peer: &Peer, _state: &AppState, req: &Request) {
     let params: LlmCountTokensParams = match parse_params(req.params.as_ref()) {
         Ok(params) => params,
@@ -504,17 +506,18 @@ pub async fn count_tokens(peer: &Peer, _state: &AppState, req: &Request) {
     };
 
     // 工具定义也占 token，但 DTO 里这一项还没定（`docs/03` §2.4 只列了 messages），
-    // 因此先按空表估算；口径在 note 里说明，不假装精确。
-    let mut tokens = estimate_tokens(&params.messages, &[]);
+    // 因此先按空表计；口径在 note 里说明，不假装比实际更全。
+    let counter = TokenCounter::for_model(&params.model_ref.model_id);
+    let mut tokens = counter.count_messages(&params.messages);
     for text in &params.texts {
-        tokens += estimate_text(text);
+        tokens += counter.count_text(text);
     }
     peer.respond(
         &req.id,
         &LlmCountTokensResult {
             tokens,
-            exact: false,
-            note: Some(ESTIMATE_NOTE.to_string()),
+            exact: counter.is_exact(),
+            note: Some(counter.note().to_string()),
         },
     )
     .await;

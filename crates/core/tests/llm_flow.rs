@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use ai_ide_llm::tokens::estimate_text;
+use ai_ide_llm::tokens::{estimate_text, TokenCounter};
 use ai_ide_protocol::ErrorCode;
 use serde_json::{json, Value};
 
@@ -1146,7 +1146,11 @@ fn token_估算_合并_messages_与_texts_两个口径() {
             "messages": [{ "role": "user", "content": "你好世界" }],
         }),
     );
-    assert_eq!(plain["exact"], json!(false), "M3 仍是估算，不能谎报精确");
+    assert_eq!(
+        plain["exact"],
+        json!(false),
+        "deepseek-chat 不在已接词表族内，回落估算，不能谎报精确"
+    );
     assert!(
         plain["note"].is_string(),
         "口径说明要带出去，UI 才能提示这是估算值：{plain}"
@@ -1176,5 +1180,79 @@ fn token_估算_合并_messages_与_texts_两个口径() {
         empty["tokens"],
         json!(0),
         "两个口径都缺省时回 0 而不是报错：输入框每敲一个字都会调它"
+    );
+}
+
+#[test]
+fn token_精确计数_认识模型族走分词器_其余回落估算() {
+    // 计数不查注册表：Provider 没注册、上游没配，输入框的计数照常工作。
+    let data = TempDataDir::new("llm-count-exact");
+    let mut core = Core::spawn(&data.root);
+
+    // 1) o200k_base 族：gpt-4o 走真实词表，与内核分词器同值。
+    let o200k = core.ok(
+        "llm.count_tokens",
+        json!({
+            "model_ref": { "provider_id": "p-未注册", "model_id": "gpt-4o" },
+            "texts": ["你好世界"],
+        }),
+    );
+    assert_eq!(o200k["exact"], json!(true), "gpt-4o 应走精确口径：{o200k}");
+    assert_eq!(
+        o200k["tokens"],
+        json!(TokenCounter::for_model("gpt-4o").count_text("你好世界"))
+    );
+    let note = o200k["note"].as_str().expect("精确口径也要带口径说明");
+    assert!(
+        note.contains("o200k_base"),
+        "note 要点明用的是哪套词表：{note}"
+    );
+
+    // 2) cl100k_base 族：gpt-4-turbo。
+    let cl100k = core.ok(
+        "llm.count_tokens",
+        json!({
+            "model_ref": { "provider_id": "p-未注册", "model_id": "gpt-4-turbo" },
+            "texts": ["你好世界"],
+        }),
+    );
+    assert_eq!(cl100k["exact"], json!(true));
+    assert_eq!(
+        cl100k["tokens"],
+        json!(TokenCounter::for_model("gpt-4-turbo").count_text("你好世界"))
+    );
+    assert!(
+        cl100k["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cl100k_base"),
+        "{cl100k}"
+    );
+
+    // 3) 未识别模型族：回落估算，且与既有估算器逐值一致（口径没被悄悄换掉）。
+    let estimated = core.ok(
+        "llm.count_tokens",
+        json!({
+            "model_ref": { "provider_id": "p-未注册", "model_id": "deepseek-chat" },
+            "texts": ["你好世界"],
+        }),
+    );
+    assert_eq!(estimated["exact"], json!(false));
+    assert_eq!(estimated["tokens"], json!(estimate_text("你好世界")));
+
+    // 4) 精确口径下 messages 与 texts 仍相加，且结构开销与估算口径一致（每消息 +4）。
+    let counter = TokenCounter::for_model("gpt-4o");
+    let mixed = core.ok(
+        "llm.count_tokens",
+        json!({
+            "model_ref": { "provider_id": "p-未注册", "model_id": "gpt-4o" },
+            "messages": [{ "role": "user", "content": "abcd" }],
+            "texts": ["export const draft = 1;\n"],
+        }),
+    );
+    assert_eq!(
+        mixed["tokens"],
+        json!(4 + counter.count_text("abcd") + counter.count_text("export const draft = 1;\n")),
+        "两个口径相加，结构开销沿用每消息 +4：{mixed}"
     );
 }

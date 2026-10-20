@@ -52,6 +52,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # 工具
 uuid = { version = "1.10", features = ["v4", "serde"] }
 
+# 精确分词（M3）：按模型族选编码（o200k_base / cl100k_base），词表随二进制内嵌
+tiktoken-rs = "0.11"
+
 # 文件系统与检索
 ignore = "0.4"
 globset = "0.4"

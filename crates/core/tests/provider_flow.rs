@@ -177,7 +177,7 @@ fn provider_与模型目录_端到端链路() {
         2001
     );
 
-    // 13) token 估算是纯本地计算，网关没了也得能算——输入框的计数不该随上游一起消失。
+    // 13) token 计数是纯本地计算，网关没了也得能算——输入框的计数不该随上游一起消失。
     let counted = core.ok(
         "llm.count_tokens",
         json!({
@@ -186,7 +186,11 @@ fn provider_与模型目录_端到端链路() {
         }),
     );
     assert!(counted["tokens"].as_u64().unwrap_or(0) > 0, "{counted}");
-    assert_eq!(counted["exact"], json!(false), "M2 只有估算，不能谎报精确");
+    assert_eq!(
+        counted["exact"],
+        json!(false),
+        "deepseek-chat 不在已接词表族内，回落估算，不能谎报精确"
+    );
     assert!(counted["note"].is_string(), "必须带口径说明：{counted}");
 
     // 14) 取消未命中不算错误：取消请求常与「流刚好自己结束」竞态，

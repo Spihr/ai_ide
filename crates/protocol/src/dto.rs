@@ -1053,9 +1053,10 @@ pub struct LlmCountTokensParams {
 pub struct LlmCountTokensResult {
     #[ts(type = "number")]
     pub tokens: u64,
-    /// 是否为精确值。M2 未接真实分词器，一律为 false（估算口径见 crate 文档）。
+    /// 是否为精确值。模型族已接真实分词器（`o200k_base` / `cl100k_base`）时为 true，
+    /// 未识别模型族回落估算为 false；两种口径都在 `note` 里说明。
     pub exact: bool,
-    /// 估算口径说明。
+    /// 计数口径说明。
     #[serde(default)]
     pub note: Option<String>,
 }

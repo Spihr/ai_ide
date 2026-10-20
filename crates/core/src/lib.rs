@@ -23,7 +23,9 @@
 //! **M3 起 `llm.chat_stream` 消费上下文引用**：`context.refs` 里的
 //! `@文件 / @文件夹 / @选区 / 当前文件` 由 [`context`] 渲染成带行号与来源标注的文本，
 //! 按 token 预算裁剪后插成第一条 `system` 消息；越界路径直接拒绝请求。
-//! `llm.count_tokens` 同时接受 `messages` 与 `texts`，口径不变（`exact:false`）。
+//! `llm.count_tokens` 同时接受 `messages` 与 `texts`；认识的模型族按 tiktoken 真实词表
+//! 精确计数（`exact:true`），其余回落估算（`exact:false`），字段含义不变。
+//! 引用预算裁剪仍走估算口径，不因精确计数而改变。
 //!
 //! 后续里程碑在此骨架上继续挂载：agent / terminal / mcp / store 等模块。
 //!

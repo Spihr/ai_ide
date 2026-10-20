@@ -11,7 +11,7 @@
 //! | [`registry`] | Provider 注册表与工厂 |
 //! | [`store`] | Provider / 模型目录持久化（**结构上不含密钥**） |
 //! | [`secret`] | 密钥内存保管与脱敏 |
-//! | [`tokens`] | token 估算（`llm.count_tokens`） |
+//! | [`tokens`] | token 计数（精确分词 + 估算回落，`llm.count_tokens`） |
 //!
 //! ## 边界
 //!
