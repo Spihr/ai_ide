@@ -8,7 +8,7 @@
 //! │  模型（TurnRequest）                          │
 //! │      ↓ 无 tool_calls → Completed，收工        │
 //! │      ↓ 有 tool_calls                          │
-//! │  逐个派发（ToolRegistry::dispatch）           │
+//! │  逐个派发（PermissionGate → dispatch）        │
 //! │      ↓ 每条调用都回一条 role=tool 消息        │
 //! │  回到开头                                     │
 //! └──────────────────────────────────────────────┘
@@ -23,14 +23,24 @@
 //! 3. **致命即停**：路径越界 / 敏感路径 / 模型故障直接向上抛，不做任何容错（见
 //!    [`AgentError::is_fatal`]）。安全边界不是可以「再试一次」的东西。
 //!
+//! ## 权限闸门（M4 第三切片）
+//!
+//! 挂上 [`PermissionGate`]（[`AgentLoop::with_gate`]）后，每次派发前先过闸门：
+//! 策略放行照常执行；策略硬拒（越界 `1002` / 敏感 `1003` / 高危命令 `3001`）与上面
+//! 那条「致命即停」同口径，直接终止循环；需要审批却被拒或超时**不算**致命——只把
+//! 拒绝原因折成一条 `role = tool` 的错误消息回灌给模型。工具根本没执行，磁盘不会有
+//! 任何改动。
+//!
 //! 循环把「消息流」原样带出来（[`RunOutcome::messages`]），所以上层要落历史、要出 UI
 //! 卡片、要做 diff 预览，都能直接拿到全量轨迹，不必再反向解析。
 
 use crate::error::AgentError;
 use crate::message;
+use crate::permission::{PermissionGate, Ruling, ToolCall};
 use crate::registry::{ToolContext, ToolRegistry};
 use ai_ide_protocol::dto::{ChatMessage, ChatRole, ChatToolCall, ToolSpec};
 use async_trait::async_trait;
+use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// 默认最大轮数（模型调用次数）。
@@ -170,17 +180,29 @@ impl RunOutcome {
 pub struct AgentLoop<'a> {
     model: &'a dyn ModelTurn,
     registry: &'a ToolRegistry,
+    gate: Option<&'a PermissionGate>,
     limits: RunLimits,
 }
 
 impl<'a> AgentLoop<'a> {
-    /// 用默认上限构造。
+    /// 用默认上限构造；不带权限闸门（默认策略不介入，行为与接入前完全一致）。
     pub fn new(model: &'a dyn ModelTurn, registry: &'a ToolRegistry) -> Self {
         Self {
             model,
             registry,
+            gate: None,
             limits: RunLimits::default(),
         }
+    }
+
+    /// 挂上权限闸门：每次派发前先过它（M4 第三切片）。
+    ///
+    /// 闸门按引用传入：`allow_always` 的进程内记忆住在闸门里，同一个闸门跨多次
+    /// 循环复用，才能真正做到「同工具同范围不再问」。
+    #[must_use]
+    pub fn with_gate(mut self, gate: &'a PermissionGate) -> Self {
+        self.gate = Some(gate);
+        self
     }
 
     /// 换一套上限。
@@ -291,6 +313,43 @@ impl<'a> AgentLoop<'a> {
                     continue;
                 }
 
+                // 权限闸门：调用前先判一次。策略放行照常往下走；策略硬拒（越界 1002 /
+                // 敏感 1003 / 高危命令 3001）按既有 fatal 口径终止循环；需要审批却被拒
+                // 或超时则只回一条工具错误——工具没执行，磁盘不会有任何改动，循环继续。
+                if let Some(gate) = self.gate {
+                    if let Some(args) = gate_arguments(&call.arguments) {
+                        let probe = gate_call(&call.name, &args);
+                        match gate.ruling(ctx, &probe) {
+                            Ruling::Allow => {}
+                            Ruling::Deny(err) => {
+                                for pending in &reply.tool_calls[handled..] {
+                                    results.push(unexecuted(pending));
+                                }
+                                state.messages.append(&mut results);
+                                return Err(err);
+                            }
+                            Ruling::Ask(_) => {
+                                // `ruling` 是纯函数，`authorize` 会再判一次并走审批，
+                                // 所以这里只认它的答复，不重复解释判定结果。
+                                //
+                                // 审批被拒 / 超时回的也是 `3001`，但它不是策略硬拒：
+                                // 这里**不**按 `is_fatal` 分流，一律折成工具错误回灌，
+                                // 让模型换个办法——反正工具根本没执行，磁盘没动过。
+                                if let Err(err) = gate.authorize(ctx, &probe).await {
+                                    let reason = err.to_string();
+                                    state
+                                        .assistant_errors
+                                        .push(format!("{}: {reason}", call.name));
+                                    results.push(message::tool_error_message(
+                                        &call.id, &call.name, &reason,
+                                    ));
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 state.steps += 1;
                 match self.registry.dispatch(ctx, &call.name, &call.arguments) {
                     Ok(outcome) => results.push(outcome.into_message(&call.id)),
@@ -349,6 +408,45 @@ impl State {
 
 fn unexecuted(call: &ChatToolCall) -> ChatMessage {
     message::tool_error_message(&call.id, &call.name, "本轮已达到步数上限，该调用未执行")
+}
+
+/// 为闸门解析一次参数。
+///
+/// 返回 `None` 表示「参数压根不是合法 JSON 对象」：这种调用连工具都进不去，
+/// 由 `dispatch` 回一条可恢复的 `BadArgs` 就够了，没必要为它弹一次审批。
+fn gate_arguments(arguments: &str) -> Option<Value> {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        return Some(Value::Object(serde_json::Map::new()));
+    }
+    serde_json::from_str::<Value>(trimmed)
+        .ok()
+        .filter(Value::is_object)
+}
+
+/// 从「工具名 + 参数」抽出闸门判定要的三样：工具名、目标路径、命令内容。
+///
+/// 纯读取参数、不碰磁盘：路径是否越界、命令是否高危，全交给闸门判。
+fn gate_call<'a>(name: &'a str, args: &'a Value) -> ToolCall<'a> {
+    let mut probe = ToolCall::new(name);
+    if let Some(path) = args.get("path").and_then(Value::as_str) {
+        probe = probe.path(path);
+    }
+    if let Some(program) = args.get("cmd").and_then(Value::as_str) {
+        let argv: Vec<String> = args
+            .get("args")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        probe = probe.command(program, &argv);
+    }
+    probe
 }
 
 fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {

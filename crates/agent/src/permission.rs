@@ -29,8 +29,9 @@
 //! 裁决者缺失、裁决者没答复（`None`）、等待超时——三种情况**一律判拒**。
 //! 「审批通道坏了」不等于「用户同意了」，这条默认值写在 [`PermissionGate::authorize`] 里。
 //!
-//! 本模块只做判定与审批，**不碰** `runner` / `registry` 的既有派发路径；
-//! 把闸门挂到派发点上属下一片切片。
+//! 本模块只做判定与审批，不自己派发工具：接线点在
+//! [`AgentLoop::with_gate`](crate::runner::AgentLoop::with_gate)——循环每次派发前先过
+//! 这里的判定，`Deny` 终止循环，`Ask` 被拒 / 超时折成工具错误回灌。
 
 use crate::error::AgentError;
 use crate::registry::ToolContext;

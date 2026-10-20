@@ -26,8 +26,9 @@
 //! ## 这一层**不**负责什么
 //!
 //! diff 视图、审批 UI、工具调用卡片 UI 都属 M4 的后续切片。[`permission`] 已把
-//! 权限判定本身做扎实（三态 + 可注入裁决者 + 缺省判拒），但**还没挂到派发点上**：
-//! 把闸门接到 `runner` / `registry`、以及 `core` 侧的 `agent.*` 接线，都属下一片切片。
+//! 权限判定本身做扎实（三态 + 可注入裁决者 + 缺省判拒），并已挂到循环的派发点上
+//! （[`AgentLoop::with_gate`]）：策略硬拒终止循环，审批被拒 / 超时只回灌一条工具错误。
+//! `core` 侧的 `agent.*` 接线与审批 UI 仍属下一片切片。
 //!
 //! ```
 //! use ai_ide_agent::{AgentError, AgentLoop, ModelTurn, ToolContext, ToolRegistry, TurnReply, TurnRequest};

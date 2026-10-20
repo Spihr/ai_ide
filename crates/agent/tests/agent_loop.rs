@@ -7,8 +7,10 @@
 use ai_ide_agent::message;
 use ai_ide_agent::registry::ToolContext;
 use ai_ide_agent::runner::{AgentLoop, ModelTurn, RunLimits, StopReason, TurnReply, TurnRequest};
-use ai_ide_agent::{AgentError, ToolRegistry};
-use ai_ide_protocol::dto::{ChatMessage, ChatToolCall};
+use ai_ide_agent::{
+    AgentError, ApprovalReply, ApprovalRequest, Decider, PermissionGate, ToolRegistry,
+};
+use ai_ide_protocol::dto::{ApprovalDecision, ChatMessage, ChatToolCall};
 use ai_ide_protocol::ErrorCode;
 use ai_ide_workspace::{Workspace, WorkspaceManager};
 use async_trait::async_trait;
@@ -849,4 +851,280 @@ async fn escaping_paths_and_sensitive_targets_are_refused_end_to_end() {
     assert!(err.is_fatal());
     assert!(!sandbox.exists(".env"));
     assert_eq!(model.calls(), 1);
+}
+
+// ------------------------------------------------------------ 权限闸门
+//
+// 闸门挂在 `AgentLoop::with_gate` 上：放行的照常跑，策略硬拒当场终止，
+// 审批被拒 / 超时只折成一条工具错误回灌、循环接着转。
+
+/// 会记账的假裁决者：记下问了几次，按预设答复（或者干脆拖着不答）。
+#[derive(Clone)]
+struct StubDecider {
+    calls: Arc<AtomicU64>,
+    reply: Arc<Mutex<Option<ApprovalReply>>>,
+    delay: Duration,
+}
+
+impl StubDecider {
+    /// 每次都被问到，回同一个动作。
+    fn answering(decision: ApprovalDecision) -> Self {
+        Self {
+            calls: Arc::new(AtomicU64::new(0)),
+            reply: Arc::new(Mutex::new(Some(ApprovalReply::new(decision)))),
+            delay: Duration::ZERO,
+        }
+    }
+
+    /// 同上，但带上拒绝原因（供回灌）。
+    fn answering_with(decision: ApprovalDecision, reason: &str) -> Self {
+        let stub = Self::answering(decision);
+        *stub.reply.lock().unwrap_or_else(|err| err.into_inner()) =
+            Some(ApprovalReply::with_reason(decision, reason));
+        stub
+    }
+
+    /// 有答复，但拖到超时之后。
+    fn stalling(delay: Duration) -> Self {
+        let mut stub = Self::answering(ApprovalDecision::AllowOnce);
+        stub.delay = delay;
+        stub
+    }
+
+    fn calls(&self) -> u64 {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl Decider for StubDecider {
+    async fn decide(&self, _request: &ApprovalRequest) -> Option<ApprovalReply> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if !self.delay.is_zero() {
+            tokio::time::sleep(self.delay).await;
+        }
+        self.reply
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+    }
+}
+
+#[tokio::test]
+async fn gated_read_inside_the_workspace_runs_as_before() {
+    let sandbox = Sandbox::new("gate-allow");
+    sandbox.write("a.txt", "hello\n");
+    let model = Scripted::new(vec![
+        Ok(TurnReply::with_tool_calls(
+            "",
+            vec![call("c1", "read", json!({ "path": "a.txt" }))],
+        )),
+        Ok(TurnReply::text_only("读到了")),
+    ]);
+    let registry = ToolRegistry::core();
+    // 裁决者只会拒绝：默认策略放行时压根不该惊动它。
+    let stub = StubDecider::answering(ApprovalDecision::Deny);
+    let gate = PermissionGate::with_decider(stub.clone());
+
+    let outcome = AgentLoop::new(&model, &registry)
+        .with_gate(&gate)
+        .run(&sandbox.ctx(), vec![message::user_message("看看 a.txt")])
+        .await
+        .expect("工作区内的读该照常跑完");
+
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    assert_eq!(outcome.steps, 1);
+    assert!(
+        outcome.assistant_errors.is_empty(),
+        "不该有工具错误：{:?}",
+        outcome.assistant_errors
+    );
+    assert_eq!(stub.calls(), 0, "默认策略放行不该走审批");
+    let result = outcome.tool_messages().next().expect("应有工具结果");
+    assert!(result.content.contains("hello"), "{}", result.content);
+    assert!(!result.content.contains("<tool_error"));
+}
+
+#[tokio::test]
+async fn gated_policy_denial_stops_the_loop_before_anything_is_written() {
+    let sandbox = Sandbox::new("gate-deny");
+    let registry = ToolRegistry::core();
+    // 裁决者「有求必应」：硬拒必须自己站得住，不能靠审批兜底。
+    let stub = StubDecider::answering(ApprovalDecision::AllowAlways);
+    let gate = PermissionGate::with_decider(stub.clone());
+
+    // 敏感路径（1003）。
+    let model = Scripted::new(vec![
+        Ok(TurnReply::with_tool_calls(
+            "",
+            vec![call(
+                "c1",
+                "write",
+                json!({ "path": ".env", "content": "SECRET=1\n" }),
+            )],
+        )),
+        Ok(TurnReply::text_only("不该走到这里")),
+    ]);
+    let err = AgentLoop::new(&model, &registry)
+        .with_gate(&gate)
+        .run(&sandbox.ctx(), vec![message::user_message("写密钥文件")])
+        .await
+        .expect_err("敏感路径必须终止循环");
+    assert_eq!(err.code(), ErrorCode::PATH_DENIED);
+    assert_eq!(err.code().as_i32(), 1003);
+    assert!(err.is_fatal());
+    assert_eq!(model.calls(), 1, "致命错误后不该再喊模型");
+    assert!(!sandbox.exists(".env"), "被拒的目标绝不能落盘");
+
+    // 越界路径（1002）。
+    let model = Scripted::new(vec![
+        Ok(TurnReply::with_tool_calls(
+            "",
+            vec![call(
+                "c2",
+                "write",
+                json!({ "path": "../outside.txt", "content": "nope\n" }),
+            )],
+        )),
+        Ok(TurnReply::text_only("不该走到这里")),
+    ]);
+    let err = AgentLoop::new(&model, &registry)
+        .with_gate(&gate)
+        .run(
+            &sandbox.ctx(),
+            vec![message::user_message("写到工作区外面")],
+        )
+        .await
+        .expect_err("越界写必须终止循环");
+    assert_eq!(err.code(), ErrorCode::PATH_OUT_OF_WORKSPACE);
+    assert_eq!(err.code().as_i32(), 1002);
+    assert!(err.is_fatal());
+    assert!(!sandbox.exists("../outside.txt"), "越界目标不该被建出来");
+
+    assert_eq!(stub.calls(), 0, "策略硬拒不该走审批");
+}
+
+#[tokio::test]
+async fn gated_approval_denial_is_fed_back_and_the_loop_keeps_going() {
+    let sandbox = Sandbox::new("gate-refused");
+    sandbox.write("keep.txt", "still here\n");
+    // `git init` 真跑起来会在工作区建出 `.git`；被拒之后它必须连影子都没有。
+    let model = Scripted::new(vec![
+        Ok(TurnReply::with_tool_calls(
+            "",
+            vec![call(
+                "c1",
+                "run_command",
+                json!({ "cmd": "git", "args": ["init"] }),
+            )],
+        )),
+        Ok(TurnReply::with_tool_calls(
+            "",
+            vec![call("c2", "read", json!({ "path": "keep.txt" }))],
+        )),
+        Ok(TurnReply::text_only("那换个法子")),
+    ]);
+    let registry = ToolRegistry::core();
+    let stub = StubDecider::answering_with(
+        ApprovalDecision::DenyWithReason,
+        "这个命令会往工作区里塞 .git，先别跑",
+    );
+    let gate = PermissionGate::with_decider(stub.clone());
+
+    let outcome = AgentLoop::new(&model, &registry)
+        .with_gate(&gate)
+        .run(&sandbox.ctx(), vec![message::user_message("初始化仓库")])
+        .await
+        .expect("审批被拒不是致命错误，循环得继续");
+
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    assert_eq!(outcome.rounds, 3, "被拒后模型还被喊了一次");
+    assert_eq!(outcome.steps, 1, "被拒的那次没执行，不该记步");
+    assert_eq!(stub.calls(), 1);
+    assert!(!sandbox.exists(".git"), "被拒的命令绝不能落盘");
+    assert_eq!(outcome.assistant_errors.len(), 1, "被拒只回灌一条工具错误");
+
+    let results: Vec<String> = outcome
+        .tool_messages()
+        .map(|msg| msg.content.clone())
+        .collect();
+    assert_eq!(results.len(), 2, "被拒一次 + 真读一次");
+    assert!(results[0].contains("<tool_error"), "{}", results[0]);
+    assert!(
+        results[0].contains("这个命令会往工作区里塞 .git"),
+        "拒绝原因要回灌给模型：{}",
+        results[0]
+    );
+    assert!(results[1].contains("still here"), "回灌之后循环要继续干活");
+}
+
+#[tokio::test]
+async fn gated_approval_timeout_is_fed_back_too() {
+    let sandbox = Sandbox::new("gate-timeout");
+    let model = Scripted::new(vec![
+        Ok(TurnReply::with_tool_calls(
+            "",
+            vec![call(
+                "c1",
+                "run_command",
+                json!({ "cmd": "git", "args": ["init"] }),
+            )],
+        )),
+        Ok(TurnReply::text_only("那算了")),
+    ]);
+    let registry = ToolRegistry::core();
+    let stub = StubDecider::stalling(Duration::from_millis(500));
+    let gate = PermissionGate::with_decider(stub.clone()).with_timeout(Duration::from_millis(20));
+
+    let outcome = AgentLoop::new(&model, &registry)
+        .with_gate(&gate)
+        .run(&sandbox.ctx(), vec![message::user_message("跑个命令")])
+        .await
+        .expect("审批超时不是致命错误，循环得继续");
+
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    assert_eq!(outcome.steps, 0);
+    assert_eq!(stub.calls(), 1);
+    assert!(!sandbox.exists(".git"), "超时的命令绝不能落盘");
+    let result = outcome.tool_messages().next().expect("应有工具结果");
+    assert!(result.content.contains("<tool_error"), "{}", result.content);
+    assert!(result.content.contains("超时"), "{}", result.content);
+}
+
+#[tokio::test]
+async fn gated_allow_always_skips_the_second_ask() {
+    let sandbox = Sandbox::new("gate-always");
+    // 用一个不存在的程序：过了闸门也启不动，副作用为零，
+    // 但「第二次还问不问裁决者」看得清清楚楚。
+    let probe = json!({ "cmd": "definitely-not-a-real-program-xyz" });
+    let model = Scripted::new(vec![
+        Ok(TurnReply::with_tool_calls(
+            "",
+            vec![call("c1", "run_command", probe.clone())],
+        )),
+        Ok(TurnReply::with_tool_calls(
+            "",
+            vec![call("c2", "run_command", probe.clone())],
+        )),
+        Ok(TurnReply::text_only("好吧")),
+    ]);
+    let registry = ToolRegistry::core();
+    let stub = StubDecider::answering(ApprovalDecision::AllowAlways);
+    let gate = PermissionGate::with_decider(stub.clone());
+
+    let outcome = AgentLoop::new(&model, &registry)
+        .with_gate(&gate)
+        .run(&sandbox.ctx(), vec![message::user_message("连跑两次")])
+        .await
+        .expect("放行后启不动只是可恢复的工具错误");
+
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    assert_eq!(outcome.steps, 2, "两次都过了闸门、都真派发下去了");
+    assert_eq!(stub.calls(), 1, "allow_always 之后同工具同范围不该再问");
+    assert_eq!(
+        outcome.assistant_errors.len(),
+        2,
+        "两次都是「启不动」的可恢复错误：{:?}",
+        outcome.assistant_errors
+    );
 }
