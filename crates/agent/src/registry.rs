@@ -101,9 +101,11 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
-    /// M4 切片一的六个核心工具：`read` / `list` / `grep` / `write` / `edit` / `create`。
+    /// M4 的八个核心工具：`read` / `list` / `grep` / `write` / `edit` / `create`
+    /// 六个读写工具，加切片二的 `run_command` 与 `apply_diff`。
     ///
-    /// `run_command` 属后续切片，**刻意**不在这里注册。
+    /// 权限规则表与裁决点属后续切片：这里注册的是「能力」，不是「许可」——
+    /// `run_command` 自身只做命令黑名单与路径闸门（安全底线），审批由上层裁决。
     pub fn core() -> Self {
         Self {
             tools: vec![
@@ -113,6 +115,8 @@ impl ToolRegistry {
                 Box::new(tools::write::WriteTool),
                 Box::new(tools::edit::EditTool),
                 Box::new(tools::create::CreateTool),
+                Box::new(tools::run_command::RunCommandTool),
+                Box::new(tools::apply_diff::ApplyDiffTool),
             ],
         }
     }
@@ -211,14 +215,36 @@ mod tests {
     use crate::testing::Sandbox;
 
     #[test]
-    fn core_registry_declares_exactly_the_six_tools() {
+    fn core_registry_declares_the_eight_tools() {
         let names = ToolRegistry::core().names();
-        assert_eq!(names.len(), 6);
-        for expected in ["read", "list", "grep", "write", "edit", "create"] {
+        assert_eq!(names.len(), 8);
+        for expected in [
+            "read",
+            "list",
+            "grep",
+            "write",
+            "edit",
+            "create",
+            "run_command",
+            "apply_diff",
+        ] {
             assert!(names.contains(&expected), "缺少工具 {expected}");
         }
-        // run_command 属后续切片，绝不能被顺手注册进来。
-        assert!(!names.contains(&"run_command"));
+        // 权限裁决、审批 UI、diff 视图都还没落地，注册表里不该混进别的东西。
+        assert_eq!(
+            names,
+            vec![
+                "read",
+                "list",
+                "grep",
+                "write",
+                "edit",
+                "create",
+                "run_command",
+                "apply_diff"
+            ],
+            "注册顺序即声明顺序，后续切片要追加也只能追加在末尾"
+        );
     }
 
     #[test]
@@ -250,7 +276,7 @@ mod tests {
     fn unknown_tool_is_recoverable() {
         let sandbox = Sandbox::new("registry-unknown");
         let err = ToolRegistry::core()
-            .dispatch(&sandbox.ctx(), "run_command", "{}")
+            .dispatch(&sandbox.ctx(), "web_search", "{}")
             .unwrap_err();
         assert!(matches!(err, AgentError::UnknownTool(_)));
         assert!(!err.is_fatal(), "模型点错工具名，应回灌让它改");
@@ -289,7 +315,7 @@ mod tests {
         let registry = ToolRegistry::core();
         assert!(registry.get("edit").is_some());
         assert!(registry.get("nope").is_none());
-        assert_eq!(registry.len(), 6);
+        assert_eq!(registry.len(), 8);
         assert!(!registry.is_empty());
     }
 }

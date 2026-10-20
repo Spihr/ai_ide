@@ -53,6 +53,15 @@ pub enum AgentError {
     /// 模型调用失败（终止循环）。
     #[error("模型调用失败：{0}")]
     Model(String),
+
+    /// 命令被安全策略拒绝（终止循环）。
+    ///
+    /// M4 切片二还没有权限规则表与裁决点（那是后续切片），危险命令黑名单是硬编码的
+    /// deny；语义上归到既有的 `3001 TOOL_NOT_ALLOWED`（`docs/03` §1.3 记作
+    /// 「权限策略为 deny」），**不新增协议码、不改既有码的含义**。
+    /// 与 `Path` 同族：一旦命中就不该再让模型拿着同一条命令重试，所以直接终止循环。
+    #[error("{tool} 拒绝执行：{reason}")]
+    CommandDenied { tool: String, reason: String },
 }
 
 impl AgentError {
@@ -60,7 +69,10 @@ impl AgentError {
     pub fn is_fatal(&self) -> bool {
         matches!(
             self,
-            Self::Path(_) | Self::Model(_) | Self::Workspace(WorkspaceError::Path(_))
+            Self::Path(_)
+                | Self::Model(_)
+                | Self::CommandDenied { .. }
+                | Self::Workspace(WorkspaceError::Path(_))
         )
     }
 
@@ -75,6 +87,7 @@ impl AgentError {
             Self::UnknownTool(_) | Self::BadArgs { .. } => ErrorCode::INVALID_PARAMS,
             Self::ToolFailed { .. } => ErrorCode::INTERNAL_ERROR,
             Self::Conflict { .. } => ErrorCode::DIFF_APPLY_CONFLICT,
+            Self::CommandDenied { .. } => ErrorCode::TOOL_NOT_ALLOWED,
             Self::Model(_) => ErrorCode::PROVIDER_UNAVAILABLE,
         }
     }

@@ -65,6 +65,14 @@ encoding_rs = "0.8"
 sha2 = "0.10"
 trash = "3.3"
 
+# Windows 专用（M4 切片二）：Job Object 保证超时后整棵进程树被回收
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
 # 内部 crate
 ai-ide-protocol = { path = "crates/protocol" }
 ai-ide-workspace = { path = "crates/workspace" }

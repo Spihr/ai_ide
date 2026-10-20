@@ -1,4 +1,8 @@
-//! 六个核心工具，以及它们共用的参数读取器。
+//! 核心工具，以及它们共用的参数读取器。
+//!
+//! `read` / `list` / `grep` / `write` / `edit` / `create` 是 M4 切片一的六件套；
+//! 切片二补上 `run_command`（跑外部命令，管住进程树与输出）与 `apply_diff`
+//! （生成 unified diff、按 hunk 逐块落地）。
 //!
 //! 每个工具的职责边界都遵守同一套约定：
 //!
@@ -7,11 +11,13 @@
 //! 2. **失败可回灌**：找不到文件、目标不唯一、乐观锁冲突都返回非致命错误，
 //!    由 `runner` 折成 `role = tool` 的消息交给模型自己纠正。
 
+pub mod apply_diff;
 pub mod create;
 pub mod edit;
 pub mod grep;
 pub mod list;
 pub mod read;
+pub mod run_command;
 pub mod write;
 
 use crate::error::AgentError;
@@ -63,6 +69,24 @@ impl<'a> Args<'a> {
         }
     }
 
+    /// 可选字符串，**允许空串**（`apply_diff` 的 `content`：空串表示清空文件）。
+    pub(crate) fn opt_text(&self, key: &str) -> Result<Option<&'a str>, AgentError> {
+        let value: &'a Value = self.value;
+        match value.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(text)) => Ok(Some(text)),
+            Some(_) => Err(self.bad(key, "应为字符串")),
+        }
+    }
+
+    /// 参数是否**显式出现**（`null` 与缺省都算没给）。
+    ///
+    /// 用来区分「没给 `accept`」和「`accept` 是空数组」——前者是全部接受，
+    /// 后者是「一块都不接受」，两者不能混为一谈。
+    pub(crate) fn has(&self, key: &str) -> bool {
+        matches!(self.value.get(key), Some(value) if !value.is_null())
+    }
+
     /// 可选整数。
     pub(crate) fn opt_u32(&self, key: &str) -> Result<Option<u32>, AgentError> {
         let value: &'a Value = self.value;
@@ -104,6 +128,32 @@ impl<'a> Args<'a> {
                 Ok(out)
             }
             Some(_) => Err(self.bad(key, "应为字符串数组")),
+        }
+    }
+
+    /// 可选整数数组；缺省为空数组（`apply_diff` 的 `accept`）。
+    pub(crate) fn opt_u32_list(&self, key: &str) -> Result<Vec<u32>, AgentError> {
+        let value: &'a Value = self.value;
+        match value.get(key) {
+            None | Some(Value::Null) => Ok(Vec::new()),
+            Some(Value::Array(items)) => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        Value::Number(number) => {
+                            match number.as_u64().and_then(|v| u32::try_from(v).ok()) {
+                                Some(number) => out.push(number),
+                                None => {
+                                    return Err(self.bad(key, "应为 0 到 4294967295 之间的整数数组"))
+                                }
+                            }
+                        }
+                        _ => return Err(self.bad(key, "应为整数数组")),
+                    }
+                }
+                Ok(out)
+            }
+            Some(_) => Err(self.bad(key, "应为整数数组")),
         }
     }
 

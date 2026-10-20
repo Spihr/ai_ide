@@ -19,5 +19,9 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
 
+# Windows 专用（M4 切片二）：run_command 用 Job Object 兜住整棵进程树。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true }

@@ -501,7 +501,7 @@ mod tests {
             .unwrap();
 
         let request = model.last_request();
-        assert_eq!(request.tools.len(), 6, "每轮都要把工具声明带上");
+        assert_eq!(request.tools.len(), 8, "每轮都要把工具声明带上");
         assert_eq!(request.messages.len(), 3);
         assert_eq!(request.messages[0].role, ChatRole::User);
         assert_eq!(request.messages[1].role, ChatRole::Assistant);
@@ -575,7 +575,7 @@ mod tests {
         let model = Scripted::new(vec![
             Ok(TurnReply::with_tool_calls(
                 "",
-                vec![call("c1", "run_command", "{}")],
+                vec![call("c1", "web_search", "{}")],
             )),
             Ok(TurnReply::text_only("换个工具")),
         ]);

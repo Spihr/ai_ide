@@ -8,7 +8,11 @@
 //!    或者撞上轮次 / 步数上限，或者被取消。每一轮的助手消息与工具结果消息由
 //!    [`message`] 按协议 [`ChatMessage`](ai_ide_protocol::dto::ChatMessage) 拼装。
 //! 2. **工具注册表**（[`registry`]）：工具声明（JSON Schema）、按名派发、结果回传。
-//! 3. **六个核心工具**（[`tools`]）：`read` / `list` / `grep` / `write` / `edit` / `create`。
+//! 3. **八个核心工具**（[`tools`]）：`read` / `list` / `grep` / `write` /
+//!    `edit` / `create` 六个读写工具，加上切片二的 `run_command`（跑外部命令、
+//!    管住进程树与输出）与 `apply_diff`（unified diff 的生成与逐块落地）。
+//! 4. **diff 引擎**（[`diff`]）：unified diff 的生成、解析与按 hunk 应用，
+//!    纯函数、不碰磁盘，工具与后续的 diff 视图共用同一套行/块模型。
 //!
 //! ## 复用既有约定，不另起一套
 //!
@@ -21,8 +25,10 @@
 //!
 //! ## 这一层**不**负责什么
 //!
-//! `run_command`、diff 引擎与 diff 视图、权限规则与审批 UI、工具调用卡片 UI 都属
-//! M4 的后续切片；`core` 侧的 `agent.*` 方法接线同样还没做——本模块只提供可测的内核。
+//! diff 视图、权限规则与审批 UI、工具调用卡片 UI 都属 M4 的后续切片；这套内核
+//! 只把「命令怎么跑、树怎么杀、diff 怎么生成与落地」做扎实，裁决点（谁允许
+//! 执行）留给下一片切片。`core` 侧的 `agent.*` 方法接线同样还没做——本模块
+//! 只提供可测的内核。
 //!
 //! ```
 //! use ai_ide_agent::{AgentError, AgentLoop, ModelTurn, ToolContext, ToolRegistry, TurnReply, TurnRequest};
@@ -46,6 +52,7 @@
 //! # }
 //! ```
 
+pub mod diff;
 pub mod error;
 pub mod message;
 pub mod registry;
