@@ -26,10 +26,10 @@
 
 use super::Args;
 use crate::error::AgentError;
+use crate::permission::{dangerous_pattern, dangerous_program, exe_stem};
 use crate::registry::{Tool, ToolContext, ToolOutcome};
 use serde_json::{json, Value};
 use std::io::Read;
-use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -52,25 +52,8 @@ const DRAIN_GRACE: Duration = Duration::from_millis(1_000);
 /// 轮询子进程状态的间隔。
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-/// 危险可执行程序（比对可执行文件名去掉扩展名后的 **全等** 匹配）。
-const BLOCKED_PROGRAMS: &[&str] = &[
-    "format", "diskpart", "fdisk", "mkfs", "shutdown", "bcdedit", "cipher", "vssadmin",
-];
-
-/// 危险命令行特征（比对「程序名 + 全部参数」拼成的文本的子串）。
-const BLOCKED_PATTERNS: &[&str] = &[
-    "reg delete",
-    "reg add",
-    "net user",
-    "net localgroup",
-    "rm -rf",
-    "rm -fr",
-    "del /",
-    "rd /s",
-    "rmdir /s",
-    "takeown",
-    "icacls",
-];
+// 危险程序 / 危险命令行特征的黑名单住在 `crate::permission`：权限策略与这里
+// 的起进程前闸门必须用同一个事实来源，否则两处各存一份、改一处漏一处。
 
 /// 手工拼 shell 命令行的特征。
 const SHELL_PATTERNS: &[&str] = &["|", "&&", "||", ">", "<", "\n"];
@@ -227,17 +210,14 @@ fn render_command(program: &str, argv: &[String]) -> String {
 }
 
 /// 危险命令黑名单：命中即终止循环（`3001`），不降级成「回灌重试」。
+///
+/// 名单本身在 [`crate::permission`]，与权限闸门的「高危命令直接拒」共用一份。
 fn screen(program: &str, rendered: &str) -> Result<(), AgentError> {
-    let name = exe_stem(program);
-    if let Some(blocked) = BLOCKED_PROGRAMS.iter().find(|blocked| name == **blocked) {
+    if let Some(blocked) = dangerous_program(program) {
         return Err(denied(format!("`{blocked}` 属于禁止执行的程序")));
     }
 
-    let text = rendered.to_ascii_lowercase();
-    if let Some(pattern) = BLOCKED_PATTERNS
-        .iter()
-        .find(|pattern| text.contains(**pattern))
-    {
+    if let Some(pattern) = dangerous_pattern(rendered) {
         return Err(denied(format!("命令行特征 `{pattern}` 属于禁止执行的操作")));
     }
     Ok(())
@@ -266,14 +246,8 @@ fn shell_inline_hint(program: &str, argv: &[String]) -> Result<(), AgentError> {
     Ok(())
 }
 
-/// 可执行程序名：取路径末段、去掉扩展名、转小写。
-fn exe_stem(program: &str) -> String {
-    Path::new(program)
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_else(|| program.to_ascii_lowercase())
-}
-
+/// 可执行程序名的取法（去扩展名、转小写）在 [`crate::permission::exe_stem`]：
+/// 黑名单比对与权限闸门必须用同一套规则，别再在这里立一份。
 fn denied(reason: String) -> AgentError {
     AgentError::CommandDenied {
         tool: NAME.to_string(),

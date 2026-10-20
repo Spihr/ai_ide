@@ -25,10 +25,9 @@
 //!
 //! ## 这一层**不**负责什么
 //!
-//! diff 视图、权限规则与审批 UI、工具调用卡片 UI 都属 M4 的后续切片；这套内核
-//! 只把「命令怎么跑、树怎么杀、diff 怎么生成与落地」做扎实，裁决点（谁允许
-//! 执行）留给下一片切片。`core` 侧的 `agent.*` 方法接线同样还没做——本模块
-//! 只提供可测的内核。
+//! diff 视图、审批 UI、工具调用卡片 UI 都属 M4 的后续切片。[`permission`] 已把
+//! 权限判定本身做扎实（三态 + 可注入裁决者 + 缺省判拒），但**还没挂到派发点上**：
+//! 把闸门接到 `runner` / `registry`、以及 `core` 侧的 `agent.*` 接线，都属下一片切片。
 //!
 //! ```
 //! use ai_ide_agent::{AgentError, AgentLoop, ModelTurn, ToolContext, ToolRegistry, TurnReply, TurnRequest};
@@ -55,6 +54,7 @@
 pub mod diff;
 pub mod error;
 pub mod message;
+pub mod permission;
 pub mod registry;
 pub mod runner;
 pub mod tools;
@@ -63,5 +63,9 @@ pub mod tools;
 pub(crate) mod testing;
 
 pub use error::AgentError;
+pub use permission::{
+    ApprovalReply, ApprovalRequest, Decider, Grant, PermissionGate, Ruling, ToolCall,
+    DEFAULT_APPROVAL_TIMEOUT,
+};
 pub use registry::{Tool, ToolContext, ToolOutcome, ToolRegistry};
 pub use runner::{AgentLoop, ModelTurn, RunLimits, RunOutcome, StopReason, TurnReply, TurnRequest};
