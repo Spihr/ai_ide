@@ -1,0 +1,23 @@
+[package]
+name = "ai-ide-agent"
+description = "Agent 闭环：工具注册表、六个核心工具与多轮循环调度（M4 切片一）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ai-ide-protocol = { workspace = true }
+ai-ide-workspace = { workspace = true }
+ai-ide-indexer = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

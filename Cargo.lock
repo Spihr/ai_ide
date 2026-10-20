@@ -12,6 +12,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ai-ide-agent"
+version = "0.1.0"
+dependencies = [
+ "ai-ide-indexer",
+ "ai-ide-protocol",
+ "ai-ide-workspace",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "ai-ide-core"
 version = "0.1.0"
 dependencies = [

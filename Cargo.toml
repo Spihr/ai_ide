@@ -5,6 +5,7 @@ members = [
     "crates/workspace",
     "crates/indexer",
     "crates/llm",
+    "crates/agent",
     "crates/core",
 ]
 
@@ -69,6 +70,7 @@ ai-ide-protocol = { path = "crates/protocol" }
 ai-ide-workspace = { path = "crates/workspace" }
 ai-ide-indexer = { path = "crates/indexer" }
 ai-ide-llm = { path = "crates/llm" }
+ai-ide-agent = { path = "crates/agent" }
 
 [profile.release]
 lto = "thin"
