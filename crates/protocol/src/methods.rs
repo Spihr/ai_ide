@@ -62,6 +62,13 @@ pub mod llm {
     pub const COUNT_TOKENS: &str = "llm.count_tokens";
 }
 
+/// Agent 运行时（M4 第三切片：协议面先行定义，`crates/core` 的接线在下一轮）。
+pub mod agent {
+    pub const START: &str = "agent.start";
+    pub const STOP: &str = "agent.stop";
+    pub const DECIDE: &str = "agent.decide";
+}
+
 /// Core → Main 的通知（事件）。
 pub mod event {
     /// 内核日志转发，便于 Main 侧统一落盘。
@@ -86,6 +93,11 @@ pub mod event {
     pub const LLM_ERROR: &str = "llm.error";
     /// Provider 目录发生变化（M2），供设置界面刷新。
     pub const PROVIDER_CHANGED: &str = "provider.changed";
+
+    /// Agent 需要用户裁决某次工具调用（M4）。
+    pub const AGENT_APPROVAL_REQUIRED: &str = "agent.approval_required";
+    /// Agent 一次运行结束（M4），成功 / 失败 / 被取消都走它。
+    pub const AGENT_FINISHED: &str = "agent.finished";
 }
 
 /// 内核**真正接线并可路由**的方法全集，用于单测与能力声明。
@@ -95,6 +107,11 @@ pub mod event {
 /// 这里的「已实现」有严格含义：`crates/core` 的 `dispatch.rs` 里有对应分支，
 /// 调用不会返回 `-32601`。协议里**定义了但还没接线**的方法见
 /// [`DECLARED_NOT_IMPLEMENTED`]。
+///
+/// M4 第三切片的例外：`agent.*` 三个方法按里程碑安排**先登记、后接线**——协议与
+/// DTO 已定稿，`crates/core` 的 dispatch 分支在下一轮落地。在这之前 `core.hello`
+/// 会把这三项一并报成能力，外壳若照单调进会拿到 `-32601`；接线那轮必须把这段
+/// 说明删掉。
 pub const IMPLEMENTED: &[&str] = &[
     core::HELLO,
     core::PING,
@@ -123,6 +140,10 @@ pub const IMPLEMENTED: &[&str] = &[
     llm::CANCEL,
     llm::LIST_MODELS,
     llm::COUNT_TOKENS,
+    // M4 第三切片：协议面先行定义（接线在下一轮，见上方说明）。
+    agent::START,
+    agent::STOP,
+    agent::DECIDE,
 ];
 
 /// 协议面**已定义、但内核尚未接线**的方法。
@@ -142,8 +163,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn implemented_list_covers_core_m1_m2_domains() {
-        assert_eq!(IMPLEMENTED.len(), 27);
+    fn implemented_list_covers_core_m1_m2_agent_domains() {
+        assert_eq!(IMPLEMENTED.len(), 30);
         assert!(IMPLEMENTED.contains(&"core.ping"));
         assert!(IMPLEMENTED.contains(&"$/cancelRequest"));
         assert!(IMPLEMENTED.contains(&"workspace.read_file"));
@@ -155,6 +176,10 @@ mod tests {
         assert!(IMPLEMENTED.contains(&llm::CANCEL));
         assert!(IMPLEMENTED.contains(&llm::LIST_MODELS));
         assert!(IMPLEMENTED.contains(&llm::COUNT_TOKENS));
+        // M4 第三切片：`agent.*` 三个方法进清单（协议面先行，`core` 接线下一轮）。
+        assert!(IMPLEMENTED.contains(&agent::START));
+        assert!(IMPLEMENTED.contains(&agent::STOP));
+        assert!(IMPLEMENTED.contains(&agent::DECIDE));
     }
 
     #[test]
@@ -184,7 +209,7 @@ mod tests {
         all.sort_unstable();
         all.dedup();
         assert_eq!(all.len(), total, "两张表不得有重叠");
-        assert_eq!(total, 27, "应恰好覆盖协议里定义的全部 27 个请求方法");
+        assert_eq!(total, 30, "应恰好覆盖协议里定义的全部 30 个请求方法");
     }
 
     #[test]
@@ -201,6 +226,8 @@ mod tests {
             event::LLM_FINISHED,
             event::LLM_ERROR,
             event::PROVIDER_CHANGED,
+            event::AGENT_APPROVAL_REQUIRED,
+            event::AGENT_FINISHED,
         ] {
             assert!(!IMPLEMENTED.contains(&event), "事件不该进能力清单: {event}");
             assert!(

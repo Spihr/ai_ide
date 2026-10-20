@@ -126,6 +126,21 @@ export type { CompressStrategy } from "./generated/CompressStrategy";
 export type { ContextRef } from "./generated/ContextRef";
 export type { ContextRefKind } from "./generated/ContextRefKind";
 
+// ---- agent.* 方法（M4）----
+export type { AgentMode } from "./generated/AgentMode";
+export type { AgentRunStatus } from "./generated/AgentRunStatus";
+export type { ApprovalDecision } from "./generated/ApprovalDecision";
+export type { ApprovalRisk } from "./generated/ApprovalRisk";
+export type { AgentPermissionOverride } from "./generated/AgentPermissionOverride";
+export type { AgentStartParams } from "./generated/AgentStartParams";
+export type { AgentStartResult } from "./generated/AgentStartResult";
+export type { AgentStopParams } from "./generated/AgentStopParams";
+export type { AgentStopResult } from "./generated/AgentStopResult";
+export type { AgentDecideParams } from "./generated/AgentDecideParams";
+export type { AgentDecideResult } from "./generated/AgentDecideResult";
+export type { AgentApprovalRequiredEvent } from "./generated/AgentApprovalRequiredEvent";
+export type { AgentFinishedEvent } from "./generated/AgentFinishedEvent";
+
 // ---- 协议常量（与 Rust 侧保持一致的运行时镜像）----
 
 /** JSON-RPC 版本字面量。对应 Rust `ai_ide_protocol::JSONRPC_VERSION`。 */
@@ -182,6 +197,11 @@ export const Methods = {
     listModels: "llm.list_models",
     countTokens: "llm.count_tokens",
   },
+  agent: {
+    start: "agent.start",
+    stop: "agent.stop",
+    decide: "agent.decide",
+  },
   event: {
     log: "core.log",
     workspaceChanged: "workspace.changed",
@@ -194,6 +214,8 @@ export const Methods = {
     llmUsage: "llm.usage",
     llmFinished: "llm.finished",
     llmError: "llm.error",
+    agentApprovalRequired: "agent.approval_required",
+    agentFinished: "agent.finished",
   },
 } as const;
 
@@ -202,7 +224,8 @@ export const Methods = {
  *
  * M0 + M1（协议内核 / 工作区 / 检索）+ M2 的 `provider.*` / `model.*` / `llm.*`
  * （Provider 与模型目录，含密钥内存保管与脱敏视图；流式对话、取消与用量统计），
- * 共 27 项，与 Rust `methods::IMPLEMENTED` 逐项对齐。
+ * 再加 M4 第三切片的 `agent.*` 三项（协议与 DTO 先行定义，内核 dispatch 接线在
+ * 下一轮），共 30 项，与 Rust `methods::IMPLEMENTED` 逐项对齐。
  */
 export const IMPLEMENTED_METHODS = [
   Methods.core.hello,
@@ -232,6 +255,9 @@ export const IMPLEMENTED_METHODS = [
   Methods.llm.cancel,
   Methods.llm.listModels,
   Methods.llm.countTokens,
+  Methods.agent.start,
+  Methods.agent.stop,
+  Methods.agent.decide,
 ] as const;
 
 /**

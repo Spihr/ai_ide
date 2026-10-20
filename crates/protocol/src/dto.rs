@@ -1172,6 +1172,183 @@ pub struct ProviderChangedEvent {
     pub provider_id: String,
 }
 
+// ---------------------------------------------------------------------------
+// agent.* —— Agent 运行时（M4）
+// ---------------------------------------------------------------------------
+//
+// M4 第三切片先定协议面：`agent.start` / `agent.stop` / `agent.decide` 三个请求，
+// 以及 `agent.approval_required` / `agent.finished` 两条通知；内核接线在下一轮。
+//
+// 裁决动作只有一处定义（[`ApprovalDecision`]）：`crates/agent` 的权限裁决点直接
+// 复用它，不另立一套枚举，免得两侧漂移成「协议说 allow_once、内核说 allow」。
+
+/// Agent 运行模式。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentMode {
+    /// 纯对话，不跑工具。
+    Chat,
+    /// 闭环执行：模型 → 工具 → 模型。
+    #[default]
+    Agent,
+    /// 行内小改写。
+    Inline,
+}
+
+/// 一次 Agent 运行的终态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentRunStatus {
+    /// 模型正常收手。
+    Completed,
+    /// 撞上限，或模型 / 工具故障。
+    Failed,
+    /// 被 `agent.stop` 或 `$/cancelRequest` 打断。
+    Cancelled,
+}
+
+/// 用户对一次工具调用的裁决动作。
+///
+/// - `allow_once`：只放行本次。
+/// - `allow_always`：同一工具同一范围在**本进程内**不再重复询问。
+/// - `deny` / `deny_with_reason`：拒绝；后者额外带上 `reason`，供回灌模型自纠。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDecision {
+    AllowOnce,
+    AllowAlways,
+    Deny,
+    DenyWithReason,
+}
+
+/// 待裁决调用的风险等级，供 UI 决定要不要标红。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalRisk {
+    Low,
+    Medium,
+    High,
+}
+
+/// `agent.start` 的权限覆盖（只收窄，不放大）。
+///
+/// 内核的安全红线（越界路径 `1002`、敏感路径 `1003`、高危命令 `3001`）是硬拒，
+/// 这里的 `allow_tools` 翻不动它们。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AgentPermissionOverride {
+    /// 直接放行的工具名（精确匹配）。
+    #[serde(default)]
+    pub allow_tools: Vec<String>,
+    /// 直接拒绝的工具名（精确匹配，优先于 `allow_tools`）。
+    #[serde(default)]
+    pub deny_tools: Vec<String>,
+}
+
+/// `agent.start` 请求参数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AgentStartParams {
+    /// 会话 id；留空表示本次运行不落会话。
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// 本次运行使用的模型。
+    pub model_ref: ModelRef,
+    /// 目标描述（自然语言）。
+    pub goal: String,
+    /// 运行模式；缺省 `agent`。
+    #[serde(default)]
+    pub mode: AgentMode,
+    /// 首轮注入的上下文引用，口径与 `llm.chat_stream` 的 `context.refs` 一致。
+    #[serde(default)]
+    pub context_refs: Vec<ContextRef>,
+    /// 步数上限；留空用内核默认值。
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub max_steps: Option<u32>,
+    /// 权限覆盖；留空即内核默认策略。
+    #[serde(default)]
+    pub permissions_override: Option<AgentPermissionOverride>,
+}
+
+/// `agent.start` 响应结果（立即返回，不等跑完）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AgentStartResult {
+    /// 本次运行的句柄；`agent.stop` / `agent.decide` 与 `agent.*` 事件族都用它。
+    pub run_id: String,
+}
+
+/// `agent.stop` 请求参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AgentStopParams {
+    pub run_id: String,
+}
+
+/// `agent.stop` 响应结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AgentStopResult {
+    pub ok: bool,
+    /// 停止前已完成的步数，便于 UI 交代「走到哪停的」。
+    #[ts(type = "number")]
+    pub steps_done: u32,
+}
+
+/// `agent.decide` 请求参数：对一次权限询问的应答。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AgentDecideParams {
+    pub run_id: String,
+    /// 被裁决的询问 id（来自 `agent.approval_required`）。
+    pub approval_id: String,
+    pub decision: ApprovalDecision,
+    /// 拒绝理由；`deny_with_reason` 时可带上，供回灌模型自纠。
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// `agent.decide` 响应结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AgentDecideResult {
+    pub ok: bool,
+}
+
+/// `agent.approval_required` 事件载荷：这一步需要用户裁决。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AgentApprovalRequiredEvent {
+    pub run_id: String,
+    pub approval_id: String,
+    /// 工具名（`read` / `edit` / `run_command` …）。
+    pub tool: String,
+    /// 工具参数原文，直接给 UI 展示「它打算干什么」。
+    pub args: serde_json::Value,
+    pub risk: ApprovalRisk,
+    /// 为什么问这一声（人话，不是错误码）。
+    pub reason: String,
+}
+
+/// `agent.finished` 事件载荷：一次运行结束。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AgentFinishedEvent {
+    pub run_id: String,
+    pub status: AgentRunStatus,
+    /// 实际走了多少步。
+    #[ts(type = "number")]
+    pub steps: u32,
+    /// 给用户看的一句话收尾（模型总结或失败原因）。
+    #[serde(default)]
+    pub summary: Option<String>,
+}
+
 /// 布尔字段的 serde 默认值：`true`。
 fn default_true() -> bool {
     true
@@ -1241,5 +1418,128 @@ mod tests {
         let summarize: CompressOptions =
             serde_json::from_value(serde_json::json!({ "strategy": "summarize" })).unwrap();
         assert_eq!(summarize.strategy, CompressStrategy::Summarize);
+    }
+
+    #[test]
+    fn approval_decision_serializes_to_the_four_wire_values() {
+        for (decision, expected) in [
+            (ApprovalDecision::AllowOnce, "\"allow_once\""),
+            (ApprovalDecision::AllowAlways, "\"allow_always\""),
+            (ApprovalDecision::Deny, "\"deny\""),
+            (ApprovalDecision::DenyWithReason, "\"deny_with_reason\""),
+        ] {
+            assert_eq!(serde_json::to_string(&decision).unwrap(), expected);
+        }
+    }
+
+    /// 拼错的裁决值必须在协议层就被拒。静默降级成 `deny` 会让「随时放行」变成
+    /// 「随时拒绝」，而用户以为自己点的是允许。
+    #[test]
+    fn approval_decision_rejects_unknown_value() {
+        let err = serde_json::from_value::<ApprovalDecision>(serde_json::json!("yes"))
+            .expect_err("未知裁决值不该被解析成功");
+        assert!(
+            err.to_string().contains("unknown variant"),
+            "报错要指明取值非法：{err}"
+        );
+    }
+
+    #[test]
+    fn agent_start_params_default_to_agent_mode() {
+        let params: AgentStartParams = serde_json::from_value(serde_json::json!({
+            "model_ref": { "provider_id": "p1", "model_id": "m1" },
+            "goal": "给 src/api.ts 的请求加超时"
+        }))
+        .unwrap();
+        assert_eq!(params.mode, AgentMode::Agent, "缺省即闭环执行");
+        assert!(params.session_id.is_none());
+        assert!(params.context_refs.is_empty());
+        assert_eq!(params.max_steps, None);
+        assert!(params.permissions_override.is_none());
+
+        let json = serde_json::to_value(&params).unwrap();
+        assert_eq!(json["mode"], "agent");
+        let back: AgentStartParams = serde_json::from_value(json).unwrap();
+        assert_eq!(back, params);
+    }
+
+    #[test]
+    fn agent_decide_params_carry_reason_for_deny_with_reason() {
+        let decide: AgentDecideParams = serde_json::from_value(serde_json::json!({
+            "run_id": "r1",
+            "approval_id": "a1",
+            "decision": "deny_with_reason",
+            "reason": "改的是密钥文件"
+        }))
+        .unwrap();
+        assert_eq!(decide.decision, ApprovalDecision::DenyWithReason);
+        assert_eq!(decide.reason.as_deref(), Some("改的是密钥文件"));
+
+        let plain: AgentDecideParams = serde_json::from_value(serde_json::json!({
+            "run_id": "r1", "approval_id": "a1", "decision": "allow_once"
+        }))
+        .unwrap();
+        assert_eq!(plain.reason, None);
+    }
+
+    #[test]
+    fn agent_approval_required_event_carries_call_detail() {
+        let event: AgentApprovalRequiredEvent = serde_json::from_value(serde_json::json!({
+            "run_id": "r1",
+            "approval_id": "a1",
+            "tool": "run_command",
+            "args": { "cmd": "pnpm test" },
+            "risk": "medium",
+            "reason": "会执行外部命令"
+        }))
+        .unwrap();
+        assert_eq!(event.tool, "run_command");
+        assert_eq!(event.args["cmd"], "pnpm test");
+        assert_eq!(event.risk, ApprovalRisk::Medium);
+    }
+
+    #[test]
+    fn agent_finished_event_roundtrips_all_three_statuses() {
+        for (status, expected) in [
+            (AgentRunStatus::Completed, "completed"),
+            (AgentRunStatus::Failed, "failed"),
+            (AgentRunStatus::Cancelled, "cancelled"),
+        ] {
+            let event = AgentFinishedEvent {
+                run_id: "r1".into(),
+                status,
+                steps: 3,
+                summary: None,
+            };
+            let json = serde_json::to_value(&event).unwrap();
+            assert_eq!(json["status"], expected);
+            assert_eq!(json["steps"], 3);
+            let back: AgentFinishedEvent = serde_json::from_value(json).unwrap();
+            assert_eq!(back, event);
+        }
+    }
+
+    /// 启动 / 停止的返回值必须带着 `run_id`，否则外壳攒不出「谁在跑」的列表。
+    #[test]
+    fn agent_start_and_stop_results_keep_run_id() {
+        let started = AgentStartResult {
+            run_id: "run-7".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&started).unwrap()["run_id"],
+            serde_json::json!("run-7")
+        );
+
+        let stopped = AgentStopResult {
+            ok: true,
+            steps_done: 2,
+        };
+        let json = serde_json::to_value(&stopped).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["steps_done"], 2);
+        assert_eq!(
+            serde_json::from_value::<AgentStopResult>(json).unwrap(),
+            stopped
+        );
     }
 }

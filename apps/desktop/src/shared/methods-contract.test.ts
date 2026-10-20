@@ -97,6 +97,9 @@ describe('协议常量', () => {
       llmCancel: 'llm.cancel',
       llmListModels: 'llm.list_models',
       llmCountTokens: 'llm.count_tokens',
+      agentStart: 'agent.start',
+      agentStop: 'agent.stop',
+      agentDecide: 'agent.decide',
       wsChanged: 'workspace.changed',
       wsIndexed: 'workspace.indexed',
       providerChanged: 'provider.changed',
@@ -106,7 +109,9 @@ describe('协议常量', () => {
       llmToolCall: 'llm.tool_call',
       llmUsage: 'llm.usage',
       llmFinished: 'llm.finished',
-      llmError: 'llm.error'
+      llmError: 'llm.error',
+      agentApprovalRequired: 'agent.approval_required',
+      agentFinished: 'agent.finished'
     })
   })
 
@@ -138,7 +143,10 @@ describe('协议常量', () => {
       'llm.chat_stream',
       'llm.cancel',
       'llm.list_models',
-      'llm.count_tokens'
+      'llm.count_tokens',
+      'agent.start',
+      'agent.stop',
+      'agent.decide'
     ])
   })
 
