@@ -894,8 +894,8 @@ pub enum CompressStrategy {
     /// 按 token 预算裁剪（M3 落地的策略）。
     #[default]
     Truncate,
-    /// 摘要压缩。需要模型参与，M3 **未实现**：内核收到它按 `truncate` 处理并记日志，
-    /// 而不是假装做过摘要。
+    /// 摘要压缩（M3 落地）：放不下的引用保留段头与段尾、中间以标注交代省略行数，
+    /// 结构完整。走**本地抽取**，不调用模型、不读密钥、不联网；*模型*摘要属后续切片。
     Summarize,
 }
 
@@ -1215,5 +1215,31 @@ mod tests {
     fn log_level_is_lowercase() {
         let json = serde_json::to_string(&LogLevel::Warn).unwrap();
         assert_eq!(json, "\"warn\"");
+    }
+
+    /// 未知压缩策略必须在协议层就被拒：内核只认 `truncate` / `summarize`，
+    /// 把拼错的值静默当成 `truncate` 会让调用方以为自己拿到了摘要。
+    #[test]
+    fn compress_strategy_rejects_unknown_value() {
+        let err = serde_json::from_value::<CompressOptions>(serde_json::json!({
+            "strategy": "summarise"
+        }))
+        .expect_err("未知策略不该被解析成功");
+        assert!(
+            err.to_string().contains("unknown variant"),
+            "报错要指明取值非法：{err}"
+        );
+    }
+
+    #[test]
+    fn compress_options_default_to_truncate() {
+        let options: CompressOptions = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(options.enabled, "缺省开启裁剪");
+        assert_eq!(options.strategy, CompressStrategy::Truncate);
+        assert_eq!(options.budget_tokens, None);
+
+        let summarize: CompressOptions =
+            serde_json::from_value(serde_json::json!({ "strategy": "summarize" })).unwrap();
+        assert_eq!(summarize.strategy, CompressStrategy::Summarize);
     }
 }

@@ -1133,6 +1133,133 @@ fn 上下文引用_预算不足时裁剪并留下裁剪说明() {
 }
 
 #[test]
+fn 上下文引用_summarize_策略按摘要裁剪而非截断() {
+    let upstream = MockUpstream::start(
+        vec![Script::Stream {
+            frames: vec![
+                delta("好"),
+                sse(json!({
+                    "id": "chatcmpl-summarize",
+                    "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+                })),
+            ],
+        }],
+        json!({ "data": [] }),
+    );
+    let data = TempDataDir::new("llm-context-summarize");
+    let workspace = TempWorkspace::new("summarize");
+    let mut core = Core::spawn(&data.root);
+    let provider_id = setup_provider(&mut core, &upstream);
+    let workspace_id = open_workspace(&mut core, &workspace);
+
+    let mut big = String::new();
+    for line in 0..800 {
+        big.push_str(&format!("export const value_{line} = {line};\n"));
+    }
+    std::fs::write(workspace.root.join("big.ts"), big).expect("写大文件");
+
+    let budget = 200u64;
+    let (_, accepted) = core.ok_async(
+        "llm.chat_stream",
+        chat_params_with_context(
+            "s-摘要",
+            &provider_id,
+            &workspace_id,
+            json!([{ "kind": "file", "path": "big.ts" }]),
+            json!({ "enabled": true, "strategy": "summarize", "budget_tokens": budget }),
+        ),
+    );
+    assert_eq!(accepted["stream_id"], json!("s-摘要"));
+    assert_eq!(drain_stream(&mut core), "好");
+
+    let messages = injected_messages(&upstream);
+    let injected = messages[0]["content"]
+        .as_str()
+        .expect("system 内容是字符串");
+
+    assert!(
+        estimate_text(injected) <= budget,
+        "摘要后同样必须落在预算内：{} > {budget}",
+        estimate_text(injected)
+    );
+    assert!(
+        injected.contains("<file path=\"big.ts\" lines=\"1-800\">"),
+        "段头要留住：{injected}"
+    );
+    assert!(
+        injected.contains("</file>"),
+        "摘要是完整结构，闭合标签必须在：{injected}"
+    );
+    assert!(
+        injected.contains("<!-- 摘要：原文正文共 800 行"),
+        "摘要要写明原文规模与省略行数：{injected}"
+    );
+    assert!(
+        injected.contains("value_0 = 0;") && injected.contains("value_799 = 799;"),
+        "摘要要同时留住开头与结尾：{injected}"
+    );
+    assert!(
+        !injected.contains("value_400"),
+        "中间内容确实被摘要掉了：{injected}"
+    );
+    assert!(
+        injected.contains("因 token 预算不足"),
+        "被摘要的引用没完整进来，仍要出说明行：{injected}"
+    );
+}
+
+/// 预算小到连摘要都摆不下时，内核按保底值处理并如实说明——**不静默丢内容**。
+/// 此时注入正文允许略超调用方给的数字：把「有东西没进来」说清楚比死守一个
+/// 小到放不下任何东西的预算更重要。
+#[test]
+fn 上下文引用_极小预算也不静默丢弃() {
+    let upstream = MockUpstream::start(
+        vec![Script::Stream {
+            frames: vec![
+                delta("好"),
+                sse(json!({
+                    "id": "chatcmpl-tiny",
+                    "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+                })),
+            ],
+        }],
+        json!({ "data": [] }),
+    );
+    let data = TempDataDir::new("llm-context-tiny");
+    let workspace = TempWorkspace::new("tiny");
+    let mut core = Core::spawn(&data.root);
+    let provider_id = setup_provider(&mut core, &upstream);
+    let workspace_id = open_workspace(&mut core, &workspace);
+
+    std::fs::write(workspace.root.join("big.ts"), "x\n".repeat(400)).expect("写文件");
+
+    let (_, accepted) = core.ok_async(
+        "llm.chat_stream",
+        chat_params_with_context(
+            "s-极小",
+            &provider_id,
+            &workspace_id,
+            json!([{ "kind": "file", "path": "big.ts" }]),
+            json!({ "enabled": true, "strategy": "truncate", "budget_tokens": 1 }),
+        ),
+    );
+    assert_eq!(accepted["stream_id"], json!("s-极小"));
+    assert_eq!(drain_stream(&mut core), "好");
+
+    let messages = injected_messages(&upstream);
+    assert_eq!(messages.len(), 2, "引用消息仍要插进去：{messages:?}");
+    let injected = messages[0]["content"]
+        .as_str()
+        .expect("system 内容是字符串");
+
+    assert!(
+        injected.contains("因 token 预算不足"),
+        "预算再小也要留下说明行，不能静默：{injected}"
+    );
+    assert!(!injected.trim().is_empty(), "抬头与说明行兜住了最坏情况");
+}
+
+#[test]
 fn token_估算_合并_messages_与_texts_两个口径() {
     // 估算不查注册表：网关挂了，输入框的计数也该照常工作。
     let data = TempDataDir::new("llm-count");

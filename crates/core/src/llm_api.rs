@@ -188,6 +188,13 @@ pub async fn chat_stream(peer: &Peer, state: &AppState, req: &Request) {
                 refs = params.context.as_ref().map_or(0, |r| r.refs.len()),
                 injected_tokens = injected.tokens,
                 omitted = injected.omitted.len(),
+                summarized = injected.summarized.len(),
+                strategy = ?params
+                    .context
+                    .as_ref()
+                    .and_then(|r| r.compress.as_ref())
+                    .map(|c| c.strategy)
+                    .unwrap_or(ai_ide_protocol::dto::CompressStrategy::Truncate),
                 "已注入上下文引用"
             );
             messages.insert(

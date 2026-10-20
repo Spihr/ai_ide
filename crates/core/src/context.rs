@@ -14,8 +14,19 @@
 //!    宁可丢掉，也不能挤掉用户真正的问题。口径与 `llm.count_tokens` 共用同一个
 //!    估算器，`exact:false` 语义不变。
 //!
-//! M3 **不做**真实摘要：`strategy:"summarize"` 按 `truncate` 处理并记日志，不假装
-//! 压过；也不引入分词器依赖，按 token 精确切分留给后续切片。
+//! 4. **超限不静默**：只要有引用没完整进来，注入正文末尾一定带说明行；预算小到
+//!    连抬头与说明行都容不下时，内核把预算抬到保底值并在日志里记下这次抬升——
+//!    静默丢内容比略超预算严重得多。
+//!
+//! `compress.strategy` 走两条**可观察行为不同**的路径（协议取值集合不变）：
+//!
+//! - `truncate`：放不下的引用按行保留**前缀**，留下的是被切断的内容；
+//! - `summarize`：放不下的引用做**离线抽取式摘要**——保留段头（来源标注）与段尾
+//!   （闭合标签），中间只留头尾若干行，并用一行标注交代省掉了多少行。摘要不调用
+//!   模型、不读密钥、不联网，断网或没配 Provider 时照常可用（门禁因此不依赖外部
+//!   服务）；*模型*摘要（`docs/04` §2.3 第 4 级）仍属后续切片。
+//!
+//! 也不引入分词器依赖：按 token 精确切分留给后续切片。
 
 use std::path::Path;
 
@@ -37,9 +48,6 @@ pub const FOLDER_DEPTH: u32 = 2;
 /// 未指定 `budget_tokens` 时的默认注入预算。
 pub const DEFAULT_BUDGET_TOKENS: u64 = 8_000;
 
-/// 为「有内容被裁剪/省略」的说明行预留的预算。
-const OMISSION_HEADROOM_TOKENS: u64 = 64;
-
 /// 剩余预算低于这个值时，不再保留半截内容，整段跳过。
 const MIN_SEGMENT_TOKENS: u64 = 40;
 
@@ -49,6 +57,28 @@ const PREAMBLE: &str =
 
 /// 省略说明里最多列几个路径。
 const OMISSION_LIST_LIMIT: usize = 5;
+
+/// 压缩策略的落地形态。
+///
+/// 协议层只有 `truncate` / `summarize` 两个取值（未知取值在反序列化阶段就被拒，
+/// 见 `ai_ide_protocol::dto::CompressStrategy`），内核把它们映射成两条可观察行为
+/// 不同的裁剪路径，而不是共用一个分支。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Plan {
+    /// 按行保留前缀：内容被切断，闭合标签也留不下。
+    Truncate,
+    /// 离线抽取式摘要：保留段头与段尾，中间以标注交代省略行数。
+    Summarize,
+}
+
+impl Plan {
+    fn of(strategy: CompressStrategy) -> Self {
+        match strategy {
+            CompressStrategy::Truncate => Plan::Truncate,
+            CompressStrategy::Summarize => Plan::Summarize,
+        }
+    }
+}
 
 /// 一个渲染好的引用块。
 struct Segment {
@@ -67,6 +97,8 @@ pub struct Injected {
     pub tokens: u64,
     /// 被裁剪或省略的引用路径，按出现顺序。
     pub omitted: Vec<String>,
+    /// 走了摘要裁剪（而非整段省略）的引用路径。只有 `strategy:"summarize"` 下非空。
+    pub summarized: Vec<String>,
 }
 
 impl Injected {
@@ -76,6 +108,7 @@ impl Injected {
             content: String::new(),
             tokens: 0,
             omitted: Vec::new(),
+            summarized: Vec::new(),
         }
     }
 
@@ -95,8 +128,11 @@ pub fn render(workspace: &Workspace, context: &ChatContext) -> Result<Injected, 
     }
 
     let options = context.compress.clone().unwrap_or_default();
-    if matches!(options.strategy, CompressStrategy::Summarize) {
-        debug!("compress.strategy=summarize 在 M3 未实现，本次按 truncate 处理");
+    let plan = Plan::of(options.strategy);
+    if plan == Plan::Summarize {
+        // 摘要走本地抽取：不调模型、不读密钥、不联网，因此断网或没配 Provider 也不
+        // 会影响这条路径（门禁因此不必依赖外部服务）。如实记录，方便对账。
+        debug!("compress.strategy=summarize：按离线抽取式摘要处理（不调用模型）");
     }
     let limit = if options.enabled {
         Some(options.budget_tokens.unwrap_or(DEFAULT_BUDGET_TOKENS))
@@ -109,7 +145,7 @@ pub fn render(workspace: &Workspace, context: &ChatContext) -> Result<Injected, 
         segments.push(render_ref(&workspace.guard, reference)?);
     }
 
-    Ok(assemble(segments, limit))
+    Ok(assemble(segments, limit, plan))
 }
 
 /// 渲染单条引用。越界路径在此冒泡。
@@ -242,21 +278,52 @@ fn render_folder(guard: &PathGuard, abs: &Path, relative: &str) -> Result<Segmen
     })
 }
 
-/// 按预算顺序装配：放得下就整段放，放不下先按行留一部分，其后整体省略。
-fn assemble(segments: Vec<Segment>, limit: Option<u64>) -> Injected {
+/// 按预算顺序装配：放得下就整段放，放不下的段按 `plan` 裁剪，其后引用整体省略。
+///
+/// 两条硬约束：
+/// 1. 正常情况下注入正文不超过预算；
+/// 2. 「有引用没完整进来」这件事**必须**出现在正文里（末尾说明行）。预算小到连
+///    抬头与说明行都容不下时，内核把预算抬到保底值并记日志——静默丢内容比略超
+///    调用方给的数字严重得多。
+fn assemble(segments: Vec<Segment>, limit: Option<u64>, plan: Plan) -> Injected {
     let costs: Vec<u64> = segments.iter().map(|s| estimate_text(&s.text)).collect();
     let preamble_cost = estimate_text(PREAMBLE);
     let demand = preamble_cost + costs.iter().sum::<u64>();
 
-    // 有内容装不下时先扣出说明行的位置，否则「说明自己被截掉」会变成静默丢弃。
-    let headroom = match limit {
-        Some(limit) if demand > limit => OMISSION_HEADROOM_TOKENS.min(limit),
-        _ => 0,
+    let Some(budget) = limit else {
+        // `compress.enabled:false`：调用方明确表示不要裁剪，全部注入。
+        let mut content = String::from(PREAMBLE);
+        for segment in &segments {
+            content.push_str(&segment.text);
+        }
+        let tokens = estimate_text(&content);
+        return Injected {
+            content,
+            tokens,
+            omitted: Vec::new(),
+            summarized: Vec::new(),
+        };
     };
-    let usable = match limit {
-        Some(limit) => limit.saturating_sub(headroom),
-        None => u64::MAX,
+
+    // 说明行的位置先按「最坏情况（全部引用都要列进清单）」留出来，否则
+    // 「说明自己被挤掉」又会退化成静默丢弃。
+    let over_budget = demand > budget;
+    let reserved = if over_budget {
+        estimate_text(&omission_note(&paths_of(&segments)))
+    } else {
+        0
     };
+    let floor = preamble_cost + reserved;
+    let limit = if over_budget && budget < floor {
+        warn!(
+            requested = budget,
+            floor, "budget_tokens 低于保底预算（抬头+省略说明），已按保底值处理"
+        );
+        floor
+    } else {
+        budget
+    };
+    let usable = limit.saturating_sub(reserved);
 
     let mut content = String::new();
     let mut used = 0u64;
@@ -266,6 +333,7 @@ fn assemble(segments: Vec<Segment>, limit: Option<u64>) -> Injected {
     }
 
     let mut omitted: Vec<String> = Vec::new();
+    let mut summarized: Vec<String> = Vec::new();
     for (index, segment) in segments.iter().enumerate() {
         let cost = costs[index];
         if used.saturating_add(cost) <= usable {
@@ -275,9 +343,29 @@ fn assemble(segments: Vec<Segment>, limit: Option<u64>) -> Injected {
         }
         let remaining = usable.saturating_sub(used);
         if remaining >= MIN_SEGMENT_TOKENS {
-            let (kept, kept_cost) = trim_to_budget(&segment.text, remaining);
-            content.push_str(&kept);
-            used += kept_cost;
+            let trimmed = match plan {
+                Plan::Truncate => {
+                    let (kept, kept_cost) = trim_to_budget(&segment.text, remaining);
+                    (!kept.is_empty()).then_some((kept, kept_cost))
+                }
+                Plan::Summarize => summarize_to_budget(&segment.text, remaining),
+            };
+            match trimmed {
+                Some((kept, kept_cost)) => {
+                    content.push_str(&kept);
+                    used += kept_cost;
+                    if plan == Plan::Summarize {
+                        summarized.push(segment.path.clone());
+                    }
+                }
+                None => {
+                    // 摘要骨架都放不下：整段省略，交给说明行交代，不塞残片。
+                    debug!(
+                        path = %segment.path,
+                        remaining, "该段连摘要骨架都放不下，整段省略"
+                    );
+                }
+            }
         }
         omitted.push(segment.path.clone());
         omitted.extend(segments[index + 1..].iter().map(|s| s.path.clone()));
@@ -287,17 +375,19 @@ fn assemble(segments: Vec<Segment>, limit: Option<u64>) -> Injected {
     if !omitted.is_empty() {
         let note = omission_note(&omitted);
         let note_cost = estimate_text(&note);
-        match limit {
-            Some(limit) if used + note_cost > limit => {
-                warn!(
-                    omitted = omitted.len(),
-                    "预算过紧，省略说明也放不下；已静默丢弃超出部分"
-                );
-            }
-            _ => {
-                content.push_str(&note);
-                used += note_cost;
-            }
+        if used + note_cost <= limit {
+            content.push_str(&note);
+            used += note_cost;
+        } else {
+            // 路径清单放不下就退成只报数量的短说明：说明行本身不能被挤掉。
+            let short = omission_note_short(omitted.len());
+            let short_cost = estimate_text(&short);
+            debug!(
+                omitted = omitted.len(),
+                "省略说明放不下路径清单，已退成计数说明"
+            );
+            content.push_str(&short);
+            used += short_cost;
         }
     }
 
@@ -305,7 +395,13 @@ fn assemble(segments: Vec<Segment>, limit: Option<u64>) -> Injected {
         content,
         tokens: used,
         omitted,
+        summarized,
     }
+}
+
+/// 段落路径清单（说明行按最坏情况预留位置时用）。
+fn paths_of(segments: &[Segment]) -> Vec<String> {
+    segments.iter().map(|s| s.path.clone()).collect()
 }
 
 /// 逐行累加直到预算用尽。返回保留的文本与实际占用。
@@ -327,6 +423,83 @@ fn trim_to_budget(text: &str, budget: u64) -> (String, u64) {
     (kept, used)
 }
 
+/// 摘要式裁剪：保留段头（来源标注）与段尾（闭合标签），中间只留头尾若干行，
+/// 并用一行标注交代省掉了多少行——结构完整，模型不会把半截内容当成全文。
+///
+/// 返回 `None` 表示连摘要骨架（段头 + 标注 + 段尾）都放不下：此时整段省略，
+/// 由调用方记进 `omitted`，而不是塞一段没有闭合标签的残片。
+///
+/// **离线**：只用本地字符串处理，不调用模型、不读密钥、不联网。
+fn summarize_to_budget(text: &str, budget: u64) -> Option<(String, u64)> {
+    let lines: Vec<&str> = text.lines().collect();
+    // 少于三行（段头 + 正文 + 段尾）就没有可摘要的中间层。
+    if lines.len() < 3 {
+        return None;
+    }
+    let head = lines[0];
+    let tail = lines[lines.len() - 1];
+    let body = &lines[1..lines.len() - 1];
+
+    let skeleton = compose_summary(head, body, 0, 0, tail);
+    let skeleton_cost = estimate_text(&skeleton);
+    if skeleton_cost > budget {
+        return None;
+    }
+
+    // 保留行越多成本越高（单调），所以二分找「放得下的最大保留行数」，
+    // 避免在大文件上退化成逐行试错的 O(n²)。
+    let (mut low, mut high) = (0usize, body.len());
+    let mut best = (skeleton, skeleton_cost);
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        let (front, back) = split_keep(mid);
+        let candidate = compose_summary(head, body, front, back, tail);
+        let cost = estimate_text(&candidate);
+        if cost <= budget {
+            best = (candidate, cost);
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    Some(best)
+}
+
+/// 拼出摘要文本：段头 + 保留的前 `front` 行 + 省略标注 + 保留的后 `back` 行 + 段尾。
+fn compose_summary(head: &str, body: &[&str], front: usize, back: usize, tail: &str) -> String {
+    let omitted = body.len() - front - back;
+    let mut out = String::new();
+    out.push_str(head);
+    out.push('\n');
+    for line in &body[..front] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(&summary_marker(body.len(), omitted));
+    for line in &body[body.len() - back..] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(tail);
+    out.push('\n');
+    out
+}
+
+/// 摘要标注：写明「原文几行、省掉几行」，模型才知道这里不是全文。
+fn summary_marker(total: usize, omitted: usize) -> String {
+    if omitted == 0 {
+        format!("<!-- 摘要：原文正文共 {total} 行，此处未省略 -->\n")
+    } else {
+        format!("<!-- 摘要：原文正文共 {total} 行，此处省略中间 {omitted} 行 -->\n")
+    }
+}
+
+/// 把要保留的 `keep` 行交替分给前段与后段（前段多一行），让摘要同时留住开头与结尾。
+fn split_keep(keep: usize) -> (usize, usize) {
+    let front = keep.div_ceil(2);
+    (front, keep - front)
+}
+
 /// 省略说明：让模型与用户都知道「有些引用没进来」。
 fn omission_note(paths: &[String]) -> String {
     let listed: Vec<String> = paths.iter().take(OMISSION_LIST_LIMIT).cloned().collect();
@@ -339,6 +512,11 @@ fn omission_note(paths: &[String]) -> String {
     }
     note.push_str(" -->\n");
     note
+}
+
+/// 说明行的兜底形态：预算紧到列不下路径清单时，至少把「几个引用没进来」说清楚。
+fn omission_note_short(count: usize) -> String {
+    format!("<!-- 因 token 预算不足被裁剪或省略的引用：{count} 个（详见内核日志） -->\n")
 }
 
 /// 按 1-based 闭区间取行；越界自动收敛，`start > end` 时交换。
@@ -664,5 +842,215 @@ mod tests {
         let injected = fixture.render(Vec::new(), None);
         assert!(injected.is_empty(), "没有引用就不该插入消息");
         assert_eq!(injected.tokens, 0);
+    }
+
+    /// 摘要策略：段头与段尾都留住，中间只留头尾若干行，并用标注交代省了多少行。
+    ///
+    /// 顺带证明这条路径**不依赖任何外部服务**：测试进程没有配 Provider、也没有出网
+    /// 许可，摘要照样成立——门禁因此不需要网络与密钥。
+    #[test]
+    fn summarize_keeps_head_and_tail_and_marks_omitted_lines() {
+        let fixture = Fixture::new("summarize");
+        let mut big = String::new();
+        for line in 0..400 {
+            big.push_str(&format!("export const value_{line} = {line};\n"));
+        }
+        fs::write(fixture.root.join("big.ts"), big).expect("写大文件");
+
+        let budget = 300u64;
+        let injected = fixture.render(
+            vec![file_ref(ContextRefKind::File, "big.ts")],
+            Some(ai_ide_protocol::dto::CompressOptions {
+                enabled: true,
+                strategy: CompressStrategy::Summarize,
+                budget_tokens: Some(budget),
+            }),
+        );
+
+        assert!(
+            estimate_text(&injected.content) <= budget,
+            "摘要后同样必须落在预算内：{} > {budget}",
+            estimate_text(&injected.content)
+        );
+        assert!(
+            injected
+                .content
+                .contains("<file path=\"big.ts\" lines=\"1-400\">"),
+            "段头要留住：{}",
+            injected.content
+        );
+        assert!(
+            injected.content.contains("</file>"),
+            "段尾要留住，模型才看得出这里被摘要过：{}",
+            injected.content
+        );
+        assert!(
+            injected.content.contains("<!-- 摘要：原文正文共 400 行"),
+            "标注要写明原文多少行、省了多少行：{}",
+            injected.content
+        );
+        assert!(
+            injected.content.contains("1| export const value_0 = 0;"),
+            "开头几行要留：{}",
+            injected.content
+        );
+        assert!(
+            injected
+                .content
+                .contains("400| export const value_399 = 399;"),
+            "结尾几行也要留：{}",
+            injected.content
+        );
+        assert!(
+            !injected.content.contains("value_200"),
+            "中间内容确实被摘要掉了"
+        );
+        assert_eq!(
+            injected.summarized,
+            vec!["big.ts".to_string()],
+            "走了摘要的引用要单独记账"
+        );
+        assert!(
+            injected.omitted.contains(&"big.ts".to_string()),
+            "被摘要的引用同样没完整进来，必须进 omitted：用户与模型都要知道"
+        );
+    }
+
+    /// 同一份文件、同一个预算，两条策略必须给出**可观察地不同**的结果。
+    #[test]
+    fn truncate_and_summarize_diverge_on_the_same_budget() {
+        let fixture = Fixture::new("strategy-diverge");
+        let mut big = String::new();
+        for line in 0..400 {
+            big.push_str(&format!("export const value_{line} = {line};\n"));
+        }
+        fs::write(fixture.root.join("big.ts"), big).expect("写大文件");
+
+        let budget = 300u64;
+        let render_with = |strategy| {
+            fixture.render(
+                vec![file_ref(ContextRefKind::File, "big.ts")],
+                Some(ai_ide_protocol::dto::CompressOptions {
+                    enabled: true,
+                    strategy,
+                    budget_tokens: Some(budget),
+                }),
+            )
+        };
+        let truncated = render_with(CompressStrategy::Truncate);
+        let summarized = render_with(CompressStrategy::Summarize);
+
+        assert!(estimate_text(&truncated.content) <= budget);
+        assert!(estimate_text(&summarized.content) <= budget);
+
+        assert!(
+            !truncated.content.contains("</file>"),
+            "截断只留前缀，闭合标签留不下：{}",
+            truncated.content
+        );
+        assert!(
+            !truncated.content.contains("<!-- 摘要"),
+            "truncate 路径不该冒出摘要标注：{}",
+            truncated.content
+        );
+        assert!(truncated.summarized.is_empty(), "truncate 不算摘要");
+
+        assert!(
+            summarized.content.contains("</file>"),
+            "摘要要留段尾：{}",
+            summarized.content
+        );
+        assert!(
+            summarized.content.contains("<!-- 摘要："),
+            "摘要路径要有标注：{}",
+            summarized.content
+        );
+        assert_eq!(summarized.summarized, vec!["big.ts".to_string()]);
+    }
+
+    /// 没超预算时摘要不该无端改写内容。
+    #[test]
+    fn summarize_within_budget_leaves_content_untouched() {
+        let fixture = Fixture::new("summarize-roomy");
+        let injected = fixture.render(
+            vec![file_ref(ContextRefKind::File, "a.ts")],
+            Some(ai_ide_protocol::dto::CompressOptions {
+                enabled: true,
+                strategy: CompressStrategy::Summarize,
+                budget_tokens: Some(10_000),
+            }),
+        );
+
+        assert!(injected.omitted.is_empty());
+        assert!(
+            injected.summarized.is_empty(),
+            "放得下就没有摘要这回事：{:?}",
+            injected.summarized
+        );
+        assert!(!injected.content.contains("摘要："), "{}", injected.content);
+        assert!(injected.content.contains("2| export const b = 2;"));
+    }
+
+    /// 摘要骨架（段头 + 标注 + 段尾）都放不下时整段省略，不塞残片。
+    #[test]
+    fn summarize_gives_up_the_whole_segment_when_skeleton_does_not_fit() {
+        let mut body = String::new();
+        for line in 0..50 {
+            body.push_str(&format!("line-{line}\n"));
+        }
+        let text = format!("<file path=\"big.ts\" lines=\"1-50\">\n{body}</file>\n");
+
+        let lines: Vec<&str> = text.lines().collect();
+        let skeleton = compose_summary(
+            lines[0],
+            &lines[1..lines.len() - 1],
+            0,
+            0,
+            lines[lines.len() - 1],
+        );
+        let skeleton_cost = estimate_text(&skeleton);
+
+        let (kept, cost) =
+            summarize_to_budget(&text, skeleton_cost).expect("刚好放得下骨架就该摘要");
+        assert!(kept.contains("</file>"), "摘要必须留闭合标签：{kept}");
+        assert!(kept.contains("<!-- 摘要：原文正文共 50 行"), "{kept}");
+        assert!(cost <= skeleton_cost);
+
+        assert!(
+            summarize_to_budget(&text, skeleton_cost - 1).is_none(),
+            "差一个 token 就该整段省略，而不是留下没有闭合标签的残片"
+        );
+        assert!(
+            summarize_to_budget("只有一行\n", 1_000).is_none(),
+            "单行文本没有可摘要的中间层"
+        );
+        assert!(
+            summarize_to_budget("两行\n也没中间层\n", 1_000).is_none(),
+            "两行同样没有中间层"
+        );
+    }
+
+    /// 预算小到离谱时，抬头与省略说明仍要出现：**绝不静默丢内容**。
+    #[test]
+    fn tiny_budget_still_reports_omissions() {
+        let fixture = Fixture::new("tiny-budget");
+        fs::write(fixture.root.join("big.ts"), "x\n".repeat(50)).expect("写文件");
+
+        let injected = fixture.render(
+            vec![file_ref(ContextRefKind::File, "big.ts")],
+            Some(ai_ide_protocol::dto::CompressOptions {
+                enabled: true,
+                strategy: CompressStrategy::Truncate,
+                budget_tokens: Some(1),
+            }),
+        );
+
+        assert!(
+            injected.content.contains("因 token 预算不足"),
+            "预算再小也要留下说明行，不能静默：{}",
+            injected.content
+        );
+        assert_eq!(injected.omitted, vec!["big.ts".to_string()]);
+        assert!(!injected.content.is_empty(), "抬头与说明行兜住了最坏情况");
     }
 }
