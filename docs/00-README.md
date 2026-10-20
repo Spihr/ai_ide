@@ -14,7 +14,7 @@ AIGC:
 模型可插拔的 AI 原生代码编辑器。技术栈：**Electron + React + TypeScript（外壳/UI） + Rust（内核）**。
 
 > 文档状态：v0.1（设计基线，待审阅）
-> 实现状态：**M0 / M1 已完成并通过实测验收；M2 的内核侧已完成（`provider.*` / `model.*` / `llm.*` 已接线，流式对话、取消与错误分类端到端可跑），M2 的设置界面（Provider 配置 UI）与 M3 起尚未开工**（截至 2026-10-19）。本套文档撰写于编码之前，部分表述已与实现不符，凡有冲突以本文「实现状态」章节为准。
+> 实现状态：**M0 / M1 / M2 已完成并通过实测验收；M3 已完成（上下文引用注入与预算裁剪、`@` 引用外壳链路、编辑器侧引用、`llm.count_tokens` 精确计数、`compress.strategy` 分流），M4 起尚未开工**（截至 2026-10-20）。本套文档撰写于编码之前，部分表述已与实现不符，凡有冲突以本文「实现状态」章节为准。
 
 ---
 
@@ -30,6 +30,7 @@ AIGC:
 | [06-M0-验收报告.md](./06-M0-验收报告.md) | M0 实测验收：交付物、验收结果、一键复跑命令 |
 | [07-M1-验收报告.md](./07-M1-验收报告.md) | M1 实测验收：编辑器壳功能面、e2e 19 条断言、缺陷复盘、遗留项 |
 | [08-M2-验收报告.md](./08-M2-验收报告.md) | M2 实测验收：内核 + 外壳全链路、门禁实测、三条硬指标对照、缺陷复盘、M3 起点 |
+| [09-M3-验收报告.md](./09-M3-验收报告.md) | M3 实测验收：引用注入与预算裁剪、精确计数与压缩分流、硬指标对照、缺陷复盘、三处限制 |
 
 ## 实现状态（截至 2026-10-19）
 
@@ -40,7 +41,8 @@ AIGC:
 | M0 | 骨架与通信 | 已完成，实测见 [06-M0-验收报告.md](./06-M0-验收报告.md) |
 | M1 | 编辑器壳 | 已完成，实测见 [07-M1-验收报告.md](./07-M1-验收报告.md) |
 | M2 | 模型接入 | 已完成（内核 + 外壳）：`provider.*` / `model.*` / `llm.*` 共新增 11 个请求方法，能力清单方法数 16 → 27；Provider 设置面板、密钥 `safeStorage` 托管、流式对话 / 取消 / 错误分类全链路可跑，实测见 [08-M2-验收报告.md](./08-M2-验收报告.md)。遗留：真实厂商接口与首 token 时延未实测 |
-| M3–M8 | 上下文引用 / Agent 闭环 / 持久化 / 终端与 Git / MCP / 打包 | 未开工 |
+| M3 | 上下文引用 | 已完成：`context.refs` 注入与预算裁剪、`truncate` / 离线 `summarize` 分流、tiktoken 按模型族精确计数，实测见 [09-M3-验收报告.md](./09-M3-验收报告.md)。遗留：tree-sitter 符号表、模型摘要、真实上游未验证 |
+| M4–M8 | Agent 闭环 / 持久化 / 终端与 Git / MCP / 打包 | 未开工 |
 
 ### 已落地的技术栈（实测）
 
@@ -61,7 +63,7 @@ AIGC:
 - `workspace.*`：`open` / `close` / `tree` / `read_file` / `write_file` / `create` / `rename` / `delete` / `reveal`
 - `search.*`：`files`（文件名模糊）、`content`（内容检索，支持正则）
 - `provider.*` / `model.*`：`upsert` / `list` / `delete`（provider 另有 `test`）；目录落盘 `AI_IDE_DATA_DIR/providers.json`，密钥经 `ai-ide-llm` 的 `secret` 模块加密后存储
-- `llm.*`：`chat_stream`（流式）、`cancel`、`list_models`、`count_tokens`；上游协议为 OpenAI Chat Completions 兼容
+- `llm.*`：`chat_stream`（流式，支持 `context.refs` 注入为前置 `system` 消息）、`cancel`、`list_models`、`count_tokens`（按模型族分流 tiktoken 精确计数 / 估算回落，`messages[]` 与 `texts[]` 相加）；上游协议为 OpenAI Chat Completions 兼容
 - 事件：`workspace.changed`、`provider.changed`、`llm.started` / `delta` / `reasoning` / `tool_call` / `usage` / `finished` / `error`
 - 外壳能力：主进程策略闸门、内核进程监管与优雅退出、preload 能力收窄、渲染端工作区/文件树/多标签/搜索状态机与 Monaco 集成
 
@@ -69,11 +71,11 @@ AIGC:
 
 - 协议面：`session.*` / `agent.*` / `terminal.*` / `git.*` / `mcp.*` / `permission.*` / `search.symbols` / `workspace.indexed` / `core.log` 主动推送（`DECLARED_NOT_IMPLEMENTED` 目前为空表，这些方法尚未进协议常量表）
 - 模块：`crates/agent` / `mcp` / `terminal` / `store` / `parser`（`crates/llm` 已创建，见上）
-- 界面：M2 的 Provider / 模型设置 UI 与对话面板尚未接入渲染端，`llm.*` 目前只能经内核协议直连调用
+- 界面：M2 的 Provider 配置 / 对话面板与 M3 的 `@` 补全、引用 chip 已接入渲染端；Inline Edit（Ctrl+K）、Tab 补全、LSP、会话历史 UI 未开工
 
-### 质量门禁实测（2026-10-19）
+### 质量门禁实测（2026-10-20，M3 收尾）
 
-`cargo test --workspace` 157 passed；`cargo clippy --workspace --all-targets -- -D warnings` 零告警；`cargo fmt --all -- --check` 通过；`pnpm test` 26 用例全过；`pnpm smoke:core` 6/6；`pnpm smoke:m1` 23/23；`pnpm e2e:m1` 19/19；`pnpm lint` 零问题（本轮新增 ESLint 配置后达成）。CI 定义已含上述全部步骤，可用 `pnpm verify:ci` 本地等价复现。
+`cargo test --workspace` **345 passed / 0 failed**；`cargo clippy --workspace --all-targets -- -D warnings` 零告警；`cargo fmt --all -- --check` 通过；`pnpm test` **118 用例全过**（7 文件）；`pnpm smoke:core` 6/6；`pnpm smoke:m1` 23/23；`pnpm e2e:m1` 19/19；`pnpm lint` / `pnpm typecheck` 零问题。CI 定义已含上述全部步骤，可用 `pnpm verify:ci` 本地等价复现。
 
 ## 建议阅读顺序
 
