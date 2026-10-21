@@ -26,12 +26,12 @@ AIGC:
 | M1 | 编辑器壳 | 已完成，验收见 [`docs/07-M1-验收报告.md`](./docs/07-M1-验收报告.md) |
 | M2 | 模型接入 | 已完成（内核 + 外壳），验收见 [`docs/08-M2-验收报告.md`](./docs/08-M2-验收报告.md) |
 | M3 | 上下文引用 | 已完成，验收见 [`docs/09-M3-验收报告.md`](./docs/09-M3-验收报告.md) |
-| M4 | Agent 闭环 | 内核与外壳主线已完成（Agent 循环与 8 个工具、权限闸门四动作、`agent.*` 协议与 core 接线、外壳运行面板与审批 UI），验收见 [`docs/10-M4-验收报告.md`](./docs/10-M4-验收报告.md)；端到端脚本化基线尚缺 |
+| M4 | Agent 闭环 | 内核与外壳主线已完成（Agent 循环与 8 个工具、权限闸门四动作、`agent.*` 协议与 core 接线、外壳运行面板与审批 UI），验收见 [`docs/10-M4-验收报告.md`](./docs/10-M4-验收报告.md)；端到端基线任务与真实上游实跑已完成（基线 4/4、`edit_file` 非唯一匹配 20/20），联调凭据默认读仓库根 `.e2e-m4-credentials.json`（已在 `.gitignore` 中忽略） |
 | M5–M8 | 持久化 / 终端与 Git / MCP / 打包 | 未开工 |
 
 **已可运行的能力**：打开工作区与文件树（懒加载、忽略规则）、Monaco 多标签编辑与保存（乐观锁 hash + CRLF 往返还原）、文件名模糊检索与内容检索、外部改动监听与通知、Main 侧策略闸门、内核进程监管与优雅退出、Rust 协议类型自动生成到 TS、Provider / 模型目录（落盘 `providers.json`、密钥加密存储）、OpenAI 兼容流式对话（`llm.chat_stream` / `cancel` / `list_models` / `count_tokens`，含 `llm.error` 错误分类）。
 
-**尚未实现**：会话持久化、内置终端、Git UI、MCP、安装包分发、Inline Edit（Ctrl+K）、Tab 补全、LSP；M4 遗留：端到端脚本化基线（`scripts/e2e-m4.mjs`）与真实上游模型的实跑验证。
+**尚未实现**：会话持久化、内置终端、Git UI、MCP、安装包分发、Inline Edit（Ctrl+K）、Tab 补全、LSP；M4 遗留：工具调用独立卡片组件、多模型复测（`scripts/e2e-m4.mjs` 已落地，跑 `pnpm e2e:m4` 即可，凭据默认读 `<仓库根>/.e2e-m4-credentials.json`，该文件已在 `.gitignore` 中忽略、也可用 `--creds` 覆盖）。
 
 ---
 
@@ -106,6 +106,7 @@ pnpm dev
 | `pnpm smoke:core` | 协议冒烟（握手 / ping / 错误路径 / 优雅退出） |
 | `pnpm smoke:m1` | 内核侧 M1 功能面冒烟 |
 | `pnpm e2e:m1` | Playwright + Electron 真界面端到端 |
+| `pnpm e2e:m4` | 真实模型 Agent 端到端联调（需本机凭据，不入 CI）；凭据默认读 `<仓库根>/.e2e-m4-credentials.json`（已在 `.gitignore` 中忽略），`--check-creds` 只做凭据自检 |
 | `pnpm bench:m1` | 树列举 / 读文件 / 搜索耗时基准 |
 | `pnpm verify:m0` / `pnpm verify:m1` | 对应里程碑的一键复跑 |
 | `pnpm verify:ci` | 本地等价复现 CI 全流程 |

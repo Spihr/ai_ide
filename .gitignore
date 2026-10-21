@@ -37,6 +37,11 @@ credentials.enc
 *.pem
 *.key
 
+# M4 真实模型联调凭据：scripts/e2e-m4.mjs 未传 --creds 时默认读这个文件，
+# 里面是本机真实厂商的 base_url + api_key，绝不入库（改动前请先读 docs/10 七-1）
+.e2e-m4-credentials.json
+.e2e-m4-credentials.local.json
+
 # ---- 编辑器 ----
 .vscode/*
 !.vscode/extensions.json
