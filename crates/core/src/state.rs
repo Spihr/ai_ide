@@ -3,6 +3,7 @@
 //! M0 只保存两样东西：进程启动时刻（用于上报 uptime）与取消登记表。
 //! 后续里程碑会把工作区句柄、索引、会话、Provider 配置等挂到这里。
 
+use crate::agent_api::AgentHub;
 use crate::llm_api::StreamHub;
 use crate::llm_runtime::{default_store_path, LlmRuntime};
 use crate::peer::Peer;
@@ -33,6 +34,9 @@ pub struct AppState {
     /// 在途流式对话的取消句柄表（M2）。放在状态里是因为「取消」是一条独立报文，
     /// 需要按 `stream_id` 找到那条流。
     streams: Arc<StreamHub>,
+    /// 在途 agent 运行的登记表（M4）。与 `streams` 同理：`agent.stop` / `agent.decide`
+    /// 都是独立报文，需要按 `run_id` / `approval_id` 找到那条运行或那条待决询问。
+    agents: Arc<AgentHub>,
 }
 
 impl Default for AppState {
@@ -53,6 +57,7 @@ impl AppState {
             // 用默认落盘路径起步；单测用 `with_llm_runtime` 换成临时目录 + 替身传输。
             llm: LlmRuntime::new(default_store_path()),
             streams: Arc::new(StreamHub::new()),
+            agents: Arc::new(AgentHub::new()),
         }
     }
 
@@ -69,6 +74,11 @@ impl AppState {
     /// 在途流式对话的取消句柄表（M2）。
     pub fn streams(&self) -> Arc<StreamHub> {
         Arc::clone(&self.streams)
+    }
+
+    /// 在途 agent 运行的登记表（M4）。
+    pub fn agent(&self) -> Arc<AgentHub> {
+        Arc::clone(&self.agents)
     }
 
     /// 换上一个现成的模型接入运行时。

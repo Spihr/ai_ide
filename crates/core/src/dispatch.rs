@@ -5,6 +5,7 @@
 //! `methods::IMPLEMENTED` 与这里一一对应；尚未接线的方法留在
 //! `methods::DECLARED_NOT_IMPLEMENTED` 里，调用会如实返回 `-32601`。
 
+use crate::agent_api;
 use crate::llm_api;
 use crate::peer::Peer;
 use crate::provider_api;
@@ -94,6 +95,11 @@ async fn handle_request(peer: &Peer, state: &AppState, req: Request) {
         methods::llm::CANCEL => llm_api::cancel(peer, state, &req).await,
         methods::llm::LIST_MODELS => llm_api::list_models(peer, state, &req).await,
         methods::llm::COUNT_TOKENS => llm_api::count_tokens(peer, state, &req).await,
+
+        // Agent 运行时（M4）
+        methods::agent::START => agent_api::start(peer, state, &req).await,
+        methods::agent::STOP => agent_api::stop(peer, state, &req).await,
+        methods::agent::DECIDE => agent_api::decide(peer, state, &req).await,
 
         other => {
             warn!(method = %other, "未实现的方法");

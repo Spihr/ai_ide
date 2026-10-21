@@ -34,6 +34,7 @@
 //! 任何日志、诊断、进度输出**必须**走 stderr。一旦有别的字节混进 stdout，
 //! 主进程侧的行解析就会崩，而且这种 bug 极难定位。
 
+pub mod agent_api;
 pub mod context;
 pub mod dispatch;
 pub mod llm_api;
@@ -108,6 +109,12 @@ pub async fn run() -> Result<()> {
     let blocked = state.streams().cancel_all();
     if blocked > 0 {
         info!(streams = blocked, "退出：已阻断在途流式对话");
+    }
+    // agent 运行同理：它跑在独立任务里等模型，而模型那头已经被上面那句掐断，
+    // 这里补一句是为了让「被停止」这件事在循环里立刻可见，不必等下一轮。
+    let runs = state.agent().cancel_all();
+    if runs > 0 {
+        info!(runs, "退出：已阻断在途 agent 运行");
     }
 
     drain_inflight(&mut inflight).await;

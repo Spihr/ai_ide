@@ -41,7 +41,7 @@ use crate::registry::{ToolContext, ToolRegistry};
 use ai_ide_protocol::dto::{ChatMessage, ChatRole, ChatToolCall, ToolSpec};
 use async_trait::async_trait;
 use serde_json::Value;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// 默认最大轮数（模型调用次数）。
 pub const DEFAULT_MAX_ROUNDS: u32 = 24;
@@ -182,6 +182,7 @@ pub struct AgentLoop<'a> {
     registry: &'a ToolRegistry,
     gate: Option<&'a PermissionGate>,
     limits: RunLimits,
+    progress: Option<&'a AtomicU32>,
 }
 
 impl<'a> AgentLoop<'a> {
@@ -192,6 +193,7 @@ impl<'a> AgentLoop<'a> {
             registry,
             gate: None,
             limits: RunLimits::default(),
+            progress: None,
         }
     }
 
@@ -209,6 +211,17 @@ impl<'a> AgentLoop<'a> {
     #[must_use]
     pub fn with_limits(mut self, limits: RunLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// 挂一个步数计数器：每执行完一步就把**当前累计步数**写进去。
+    ///
+    /// 存在的理由是 `agent.stop`——`RunOutcome` 要等循环收工才有，而「停止」是循环
+    /// 还在跑的时候发来的，需要当场回答「走到哪了」。计数器可选：不挂就完全不写，
+    /// 行为与接入前一致。
+    #[must_use]
+    pub fn with_progress(mut self, counter: &'a AtomicU32) -> Self {
+        self.progress = Some(counter);
         self
     }
 
@@ -351,6 +364,10 @@ impl<'a> AgentLoop<'a> {
                 }
 
                 state.steps += 1;
+                // 先记账再执行：这一步「已经发生」了，即便工具自己报错也不退回。
+                if let Some(counter) = self.progress {
+                    counter.store(state.steps, Ordering::SeqCst);
+                }
                 match self.registry.dispatch(ctx, &call.name, &call.arguments) {
                     Ok(outcome) => results.push(outcome.into_message(&call.id)),
                     Err(err) if err.is_fatal() => {
@@ -847,5 +864,62 @@ mod tests {
 
         let ids = tool_result_ids(&outcome.messages);
         assert_eq!(ids, vec!["c1", "c2", "c3", "c4"]);
+    }
+
+    #[tokio::test]
+    async fn progress_counter_tracks_executed_steps() {
+        let sandbox = Sandbox::new("loop-progress");
+        sandbox.write("a.txt", "hello\n");
+
+        let model = Scripted::new(vec![
+            Ok(TurnReply::with_tool_calls(
+                "",
+                vec![
+                    call("c1", "read", r#"{"path":"a.txt"}"#),
+                    call("c2", "read", r#"{"path":"a.txt"}"#),
+                ],
+            )),
+            Ok(TurnReply::text_only("done")),
+        ]);
+        let registry = ToolRegistry::core();
+        let progress = AtomicU32::new(0);
+
+        let outcome = AgentLoop::new(&model, &registry)
+            .with_progress(&progress)
+            .run(
+                &sandbox.ctx(),
+                vec![message::user_message("read the file twice")],
+            )
+            .await
+            .unwrap();
+
+        assert!(outcome.is_complete());
+        assert_eq!(outcome.steps, 2);
+        assert_eq!(
+            progress.load(Ordering::SeqCst),
+            2,
+            "计数器要能在外层读到「走到第几步」，agent.stop 靠它回答 steps_done"
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_counter_absent_keeps_behaviour() {
+        // 不挂计数器时不写任何东西，且循环结果与挂了计数器时一致（可选性验证）。
+        let sandbox = Sandbox::new("loop-progress-off");
+        sandbox.write("a.txt", "hello\n");
+
+        let model = Scripted::new(vec![Ok(TurnReply::with_tool_calls(
+            "",
+            vec![call("c1", "read", r#"{"path":"a.txt"}"#)],
+        )),
+            Ok(TurnReply::text_only("done"))]);
+        let registry = ToolRegistry::core();
+
+        let outcome = AgentLoop::new(&model, &registry)
+            .run(&sandbox.ctx(), vec![message::user_message("read")])
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.steps, 1);
     }
 }

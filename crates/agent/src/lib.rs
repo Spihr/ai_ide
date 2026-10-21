@@ -69,4 +69,7 @@ pub use permission::{
     DEFAULT_APPROVAL_TIMEOUT,
 };
 pub use registry::{Tool, ToolContext, ToolOutcome, ToolRegistry};
-pub use runner::{AgentLoop, ModelTurn, RunLimits, RunOutcome, StopReason, TurnReply, TurnRequest};
+pub use runner::{
+    AgentLoop, ModelTurn, RunLimits, RunOutcome, StopReason, TurnReply, TurnRequest,
+    DEFAULT_MAX_ROUNDS, DEFAULT_MAX_STEPS,
+};

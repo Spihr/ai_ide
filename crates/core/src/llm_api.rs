@@ -538,7 +538,10 @@ pub async fn count_tokens(peer: &Peer, _state: &AppState, req: &Request) {
 ///
 /// 越界（`PATH_OUT_OF_WORKSPACE`）走这里原样透出：UI 需要能区分「路径不合法」
 /// 与「工作区没打开」，两者对用户的下一步动作完全不同。
-fn workspace_error(err: &WorkspaceError) -> ErrorObject {
+///
+/// 对 `agent_api` 也开放：`agent.start` 的 `context_refs` 与 `llm.chat_stream`
+/// 的 `context.refs` 是同一种引用，出错口径必须一致，不能各写一份。
+pub(crate) fn workspace_error(err: &WorkspaceError) -> ErrorObject {
     ErrorObject::new(err.code(), err.to_string())
 }
 

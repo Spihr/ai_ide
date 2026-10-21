@@ -32,11 +32,13 @@ dependencies = [
 name = "ai-ide-core"
 version = "0.1.0"
 dependencies = [
+ "ai-ide-agent",
  "ai-ide-indexer",
  "ai-ide-llm",
  "ai-ide-protocol",
  "ai-ide-workspace",
  "anyhow",
+ "async-trait",
  "serde",
  "serde_json",
  "thiserror",
