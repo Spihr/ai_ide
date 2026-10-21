@@ -141,6 +141,29 @@ export type { AgentDecideResult } from "./generated/AgentDecideResult";
 export type { AgentApprovalRequiredEvent } from "./generated/AgentApprovalRequiredEvent";
 export type { AgentFinishedEvent } from "./generated/AgentFinishedEvent";
 
+// ---- session.* 方法（M5）----
+export type { SessionView } from "./generated/SessionView";
+export type { MessageView } from "./generated/MessageView";
+export type { SessionCreateParams } from "./generated/SessionCreateParams";
+export type { SessionCreateResult } from "./generated/SessionCreateResult";
+export type { SessionListParams } from "./generated/SessionListParams";
+export type { SessionListResult } from "./generated/SessionListResult";
+export type { SessionGetParams } from "./generated/SessionGetParams";
+export type { SessionGetResult } from "./generated/SessionGetResult";
+export type { SessionUpdateParams } from "./generated/SessionUpdateParams";
+export type { SessionDeleteParams } from "./generated/SessionDeleteParams";
+export type { SessionDeleteResult } from "./generated/SessionDeleteResult";
+export type { SessionAppendMessageParams } from "./generated/SessionAppendMessageParams";
+export type { SessionAppendMessageResult } from "./generated/SessionAppendMessageResult";
+export type { SessionMessagesParams } from "./generated/SessionMessagesParams";
+export type { SessionMessagesResult } from "./generated/SessionMessagesResult";
+export type { SessionExportFormat } from "./generated/SessionExportFormat";
+export type { SessionExportParams } from "./generated/SessionExportParams";
+export type { SessionExportResult } from "./generated/SessionExportResult";
+export type { SessionExportDocument } from "./generated/SessionExportDocument";
+export type { SessionForkParams } from "./generated/SessionForkParams";
+export type { SessionForkResult } from "./generated/SessionForkResult";
+
 // ---- 协议常量（与 Rust 侧保持一致的运行时镜像）----
 
 /** JSON-RPC 版本字面量。对应 Rust `ai_ide_protocol::JSONRPC_VERSION`。 */
@@ -202,6 +225,17 @@ export const Methods = {
     stop: "agent.stop",
     decide: "agent.decide",
   },
+  session: {
+    create: "session.create",
+    list: "session.list",
+    get: "session.get",
+    update: "session.update",
+    delete: "session.delete",
+    appendMessage: "session.append_message",
+    messages: "session.messages",
+    export: "session.export",
+    fork: "session.fork",
+  },
   event: {
     log: "core.log",
     workspaceChanged: "workspace.changed",
@@ -224,8 +258,8 @@ export const Methods = {
  *
  * M0 + M1（协议内核 / 工作区 / 检索）+ M2 的 `provider.*` / `model.*` / `llm.*`
  * （Provider 与模型目录，含密钥内存保管与脱敏视图；流式对话、取消与用量统计），
- * 再加 M4 第三切片的 `agent.*` 三项（协议与 DTO 先行定义，内核 dispatch 接线在
- * 下一轮），共 30 项，与 Rust `methods::IMPLEMENTED` 逐项对齐。
+ * 再加 M4 第三切片的 `agent.*` 三项与 M5 的 `session.*` 九项（会话 / 消息落盘，
+ * 含导出与分叉），共 39 项，与 Rust `methods::IMPLEMENTED` 逐项对齐。
  */
 export const IMPLEMENTED_METHODS = [
   Methods.core.hello,
@@ -258,6 +292,15 @@ export const IMPLEMENTED_METHODS = [
   Methods.agent.start,
   Methods.agent.stop,
   Methods.agent.decide,
+  Methods.session.create,
+  Methods.session.list,
+  Methods.session.get,
+  Methods.session.update,
+  Methods.session.delete,
+  Methods.session.appendMessage,
+  Methods.session.messages,
+  Methods.session.export,
+  Methods.session.fork,
 ] as const;
 
 /**

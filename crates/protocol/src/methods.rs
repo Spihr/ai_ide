@@ -78,6 +78,10 @@ pub mod session {
     pub const DELETE: &str = "session.delete";
     pub const APPEND_MESSAGE: &str = "session.append_message";
     pub const MESSAGES: &str = "session.messages";
+    /// 把会话导出成 Markdown / JSON 并写到指定路径（M5 切片三）。
+    pub const EXPORT: &str = "session.export";
+    /// 复制会话及其消息生成一个新会话，可截断到指定消息（M5 切片三）。
+    pub const FORK: &str = "session.fork";
 }
 
 /// Core → Main 的通知（事件）。
@@ -155,7 +159,7 @@ pub const IMPLEMENTED: &[&str] = &[
     agent::START,
     agent::STOP,
     agent::DECIDE,
-    // M5 切片二：会话与消息（crates/store 之上的协议接线）。
+    // M5 切片二 / 三：会话与消息、导出与分叉。
     session::CREATE,
     session::LIST,
     session::GET,
@@ -163,6 +167,9 @@ pub const IMPLEMENTED: &[&str] = &[
     session::DELETE,
     session::APPEND_MESSAGE,
     session::MESSAGES,
+    // M5 切片三：导出与分叉（`crates/core` 已有 dispatch 分支）。
+    session::EXPORT,
+    session::FORK,
 ];
 
 /// 协议面**已定义、但内核尚未接线**的方法。
@@ -184,7 +191,7 @@ mod tests {
 
     #[test]
     fn implemented_list_covers_core_m1_m2_agent_domains() {
-        assert_eq!(IMPLEMENTED.len(), 37);
+        assert_eq!(IMPLEMENTED.len(), 39);
         assert!(IMPLEMENTED.contains(&"core.ping"));
         assert!(IMPLEMENTED.contains(&"$/cancelRequest"));
         assert!(IMPLEMENTED.contains(&"workspace.read_file"));
@@ -208,6 +215,11 @@ mod tests {
         assert!(IMPLEMENTED.contains(&session::DELETE));
         assert!(IMPLEMENTED.contains(&session::APPEND_MESSAGE));
         assert!(IMPLEMENTED.contains(&session::MESSAGES));
+        // M5 切片三：`session.export` / `session.fork` 进清单，别只写在文档里。
+        assert!(IMPLEMENTED.contains(&session::EXPORT));
+        assert!(IMPLEMENTED.contains(&session::FORK));
+        assert_eq!(session::EXPORT, "session.export");
+        assert_eq!(session::FORK, "session.fork");
     }
 
     #[test]
@@ -237,7 +249,7 @@ mod tests {
         all.sort_unstable();
         all.dedup();
         assert_eq!(all.len(), total, "两张表不得有重叠");
-        assert_eq!(total, 37, "应恰好覆盖协议里定义的全部 37 个请求方法");
+        assert_eq!(total, 39, "应恰好覆盖协议里定义的全部 39 个请求方法");
     }
 
     #[test]

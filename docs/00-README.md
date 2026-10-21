@@ -43,7 +43,7 @@ AIGC:
 | M2 | 模型接入 | 已完成（内核 + 外壳）：`provider.*` / `model.*` / `llm.*` 共新增 11 个请求方法，能力清单方法数 16 → 27；Provider 设置面板、密钥 `safeStorage` 托管、流式对话 / 取消 / 错误分类全链路可跑，实测见 [08-M2-验收报告.md](./08-M2-验收报告.md)。遗留：`provider.test` 与流式首 token 时延未对真实厂商实测（M4 联调阶段已用真实网关跑通流式对话链路，见 [10-M4-验收报告.md](./10-M4-验收报告.md)） |
 | M3 | 上下文引用 | 已完成：`context.refs` 注入与预算裁剪、`truncate` / 离线 `summarize` 分流、tiktoken 按模型族精确计数，实测见 [09-M3-验收报告.md](./09-M3-验收报告.md)。遗留：tree-sitter 符号表、模型摘要；tiktoken 本地计数与上游 `usage` 未做端到端比对 |
 | M4 | Agent 闭环 | 已完成（内核 + 外壳主线）：`crates/agent` 循环调度与 8 个工具、权限闸门四动作、`agent.start` / `stop` / `decide` 协议与 `crates/core` 接线、外壳运行面板与审批卡片，实测见 [10-M4-验收报告.md](./10-M4-验收报告.md)。遗留：工具调用独立卡片组件、协议文档一致性巡检、多模型复测与多次采样 |
-| M5 | 持久化与治理 | 进行中（首个切片已落地）：`crates/store`（sqlx + SQLite 的会话 / 消息仓储，16 项测试）、`crates/protocol` 七个 `session.*` 方法 + DTO（能力清单 30 → 37）、`crates/core/src/session_api.rs` 接线与端到端测试（含杀进程重启后会话可恢复）。待做：`session.export` / `fork`、审计日志、检查点回滚、会话 UI |
+| M5 | 持久化与治理 | 进行中（切片二、三已落地）：`crates/store`（sqlx + SQLite 会话 / 消息仓储，19 项测试，含事务内 `fork_session`）、`crates/protocol` 九个 `session.*` 方法 + DTO（能力清单 37 → 39）、`crates/core/src/session_api.rs` 接线、`crates/core/src/session_export.rs` 渲染（Markdown / JSON 导出，无额外时间库依赖），端到端测试 8 项（含杀进程重启后会话可恢复、导出文件可重算一致、分叉父子链重映射）。待做：审计日志、检查点回滚、会话 UI |
 | M6–M7 | 终端与 Git / MCP | 未开工 |
 | M8 | 打包 | 打包链路（electron-builder + 打包脚本）已落地，验收未做 |
 
@@ -72,7 +72,7 @@ AIGC:
 
 ### 尚未实现（设计图纸状态）
 
-- 协议面：`session.*` / `terminal.*` / `git.*` / `mcp.*` / `permission.*` / `search.symbols` / `workspace.indexed` / `core.log` 主动推送（`DECLARED_NOT_IMPLEMENTED` 目前为空表，这些方法尚未进协议常量表；M4 的 `agent.*` 已接线并进入 `IMPLEMENTED`）
+- 协议面：`terminal.*` / `git.*` / `mcp.*` / `permission.*` / `search.symbols` / `workspace.indexed` / `core.log` 主动推送（`DECLARED_NOT_IMPLEMENTED` 目前为空表，这些方法尚未进协议常量表；M4 的 `agent.*` 已接线并进入 `IMPLEMENTED`）
 - 模块：`mcp` / `terminal` / `store` / `parser`（`crates/agent` 已创建，见上）
 - 界面：M2 的 Provider 配置 / 对话面板与 M3 的 `@` 补全、引用 chip、M4 的 Agent 运行面板与审批卡片均已接入渲染端；Inline Edit（Ctrl+K）、Tab 补全、LSP、会话历史 UI 未开工
 

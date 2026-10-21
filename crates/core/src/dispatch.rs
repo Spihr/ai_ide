@@ -110,6 +110,9 @@ async fn handle_request(peer: &Peer, state: &AppState, req: Request) {
         methods::session::DELETE => session_api::delete(peer, state, &req).await,
         methods::session::APPEND_MESSAGE => session_api::append_message(peer, state, &req).await,
         methods::session::MESSAGES => session_api::messages(peer, state, &req).await,
+        // M5 切片三：导出与分叉。
+        methods::session::EXPORT => session_api::export(peer, state, &req).await,
+        methods::session::FORK => session_api::fork(peer, state, &req).await,
 
         other => {
             warn!(method = %other, "未实现的方法");

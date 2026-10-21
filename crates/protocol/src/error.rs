@@ -61,6 +61,10 @@ impl ErrorCode {
     pub const STORE_UNAVAILABLE: Self = Self(5002);
     /// 会话库读写失败（SQLite 或 JSON 序列化报错）。
     pub const STORE_ERROR: Self = Self(5003);
+    /// 导出落盘失败：路径不可写、父目录建不出来、磁盘满等文件系统侧原因。
+    pub const EXPORT_FAILED: Self = Self(5004);
+    /// 会话过大：导出 / 分叉单次只处理 10000 条消息，超过就明确报错而不是静默截断。
+    pub const SESSION_TOO_LARGE: Self = Self(5005);
 
     pub const fn as_i32(self) -> i32 {
         self.0

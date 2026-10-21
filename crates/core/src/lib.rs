@@ -42,6 +42,7 @@ pub mod llm_runtime;
 pub mod peer;
 pub mod provider_api;
 pub mod session_api;
+pub mod session_export;
 pub mod state;
 pub mod sysinfo;
 pub mod version;

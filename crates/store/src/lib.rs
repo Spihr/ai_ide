@@ -43,5 +43,8 @@ pub mod repo;
 pub mod store;
 
 pub use error::{Result, StoreError};
-pub use model::{now_millis, Message, NewMessage, NewSession, Session, SessionQuery};
+pub use model::{
+    now_millis, ForkOutcome, Message, NewMessage, NewSession, Session, SessionQuery,
+    MAX_FORK_MESSAGES,
+};
 pub use store::{Store, MIGRATOR};

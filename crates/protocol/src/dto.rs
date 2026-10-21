@@ -1562,6 +1562,100 @@ pub struct SessionMessagesResult {
     pub total: u64,
 }
 
+// ---------------------------------------------------------------------------
+// session.export / session.fork（M5 切片三）
+// ---------------------------------------------------------------------------
+
+/// 会话导出格式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionExportFormat {
+    /// 人读的 Markdown（默认）：一张会话摘要表 + 逐条消息。
+    #[default]
+    Markdown,
+    /// 机器读的 JSON：`SessionExportDocument`，字段与协议 DTO 完全一致。
+    Json,
+}
+
+impl SessionExportFormat {
+    /// 文件扩展名（`out_path` 没带扩展名时补上）。
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Markdown => "md",
+            Self::Json => "json",
+        }
+    }
+}
+
+/// `session.export` 请求参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SessionExportParams {
+    pub session_id: String,
+    /// 导出格式，缺省 `markdown`。
+    #[serde(default)]
+    pub format: SessionExportFormat,
+    /// 落盘路径：必须是绝对路径。指向已存在的目录时，内核在里面按会话名生成文件；
+    /// 指向文件时直接写入（上层若已存在同名文件，由调用方决定是否覆盖）。
+    pub out_path: String,
+}
+
+/// `session.export` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SessionExportResult {
+    pub ok: bool,
+    /// 实际写入的绝对路径（目录入参已折算成具体文件名）。
+    pub path: String,
+    /// 写入字节数。
+    #[ts(type = "number")]
+    pub bytes: u64,
+    /// 导出的消息条数。
+    #[ts(type = "number")]
+    pub messages: u64,
+}
+
+/// JSON 导出的顶层文档。
+///
+/// `format_version` 固定为 1：将来字段演进时客户端据此判断兼容性，
+/// 不靠「猜字段在不在」。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SessionExportDocument {
+    pub format_version: u32,
+    #[ts(type = "number")]
+    pub exported_at_ms: i64,
+    pub session: SessionView,
+    pub messages: Vec<MessageView>,
+}
+
+/// `session.fork` 请求参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SessionForkParams {
+    /// 源会话 id。
+    pub session_id: String,
+    /// 截断点：给出时只复制到该消息（含）为止；缺省复制全部消息。
+    #[serde(default)]
+    pub from_message_id: Option<String>,
+    /// 新会话标题；缺省在原标题后加「（分支）」。
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+/// `session.fork` 响应结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SessionForkResult {
+    pub new_session_id: String,
+    /// 新会话快照，客户端可直接插进列表，不必再 `session.get`。
+    pub session: SessionView,
+    /// 复制过来的消息条数。
+    #[ts(type = "number")]
+    pub messages: u64,
+}
+
 /// 布尔字段的 serde 默认值：`true`。
 fn default_true() -> bool {
     true
@@ -1807,5 +1901,31 @@ mod tests {
         assert!(json["created_at_ms"].is_number());
         assert!(json["updated_at_ms"].is_number());
         assert_eq!(serde_json::from_value::<SessionView>(json).unwrap(), view);
+    }
+
+    /// 导出格式缺省 markdown；给 json 时按小写出网，不能写成 `Json`。
+    #[test]
+    fn export_format_defaults_to_markdown_and_serializes_lowercase() {
+        let params: SessionExportParams = serde_json::from_value(serde_json::json!({
+            "session_id": "s1",
+            "out_path": "E:/tmp/会话.md",
+        }))
+        .unwrap();
+        assert_eq!(params.format, SessionExportFormat::Markdown);
+        assert_eq!(params.format.extension(), "md");
+
+        let json = serde_json::to_value(SessionExportFormat::Json).unwrap();
+        assert_eq!(json, serde_json::json!("json"));
+        let back: SessionExportFormat = serde_json::from_value(json).unwrap();
+        assert_eq!(back, SessionExportFormat::Json);
+    }
+
+    /// fork 的两个可选字段都能缺省；`from_message_id` 是「可截断」而不是必填。
+    #[test]
+    fn fork_params_optional_fields_default_to_none() {
+        let params: SessionForkParams =
+            serde_json::from_value(serde_json::json!({ "session_id": "s1" })).unwrap();
+        assert!(params.from_message_id.is_none());
+        assert!(params.title.is_none());
     }
 }

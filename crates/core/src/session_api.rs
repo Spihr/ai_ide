@@ -1,4 +1,4 @@
-//! 会话与消息的协议处理器（M5 切片二）。
+//! 会话与消息的协议处理器（M5 切片二 / 三）。
 //!
 //! 这一层只做三件事：解析参数、把协议字段折成 [`ai_ide_store`] 的入参、
 //! 把仓储错误翻成错误码。落盘语义（事务、级联删除、`updated_at` 只增不减）全在
@@ -9,16 +9,20 @@
 
 use ai_ide_protocol::dto::{
     MessageView, SessionAppendMessageParams, SessionAppendMessageResult, SessionCreateParams,
-    SessionCreateResult, SessionDeleteParams, SessionDeleteResult, SessionGetParams,
-    SessionGetResult, SessionListParams, SessionListResult, SessionMessagesParams,
-    SessionMessagesResult, SessionUpdateParams, SessionView,
+    SessionCreateResult, SessionDeleteParams, SessionDeleteResult, SessionExportParams,
+    SessionExportResult, SessionForkParams, SessionForkResult, SessionGetParams, SessionGetResult,
+    SessionListParams, SessionListResult, SessionMessagesParams, SessionMessagesResult,
+    SessionUpdateParams, SessionView,
 };
 use ai_ide_protocol::{ErrorCode, ErrorObject, Request};
-use ai_ide_store::{Message, NewMessage, NewSession, Session, SessionQuery, Store, StoreError};
+use ai_ide_store::{
+    Message, NewMessage, NewSession, Session, SessionQuery, Store, StoreError, MAX_FORK_MESSAGES,
+};
 use serde_json::json;
 
 use crate::dispatch::parse_params;
 use crate::peer::Peer;
+use crate::session_export;
 use crate::state::{now_ms, AppState};
 
 /// 客户端不给标题时的兜底，保证列表里永远有话可说。
@@ -369,6 +373,103 @@ pub async fn messages(peer: &Peer, state: &AppState, req: &Request) {
 }
 
 // ---------------------------------------------------------------------------
+// session.export
+// ---------------------------------------------------------------------------
+
+pub async fn export(peer: &Peer, state: &AppState, req: &Request) {
+    let params: SessionExportParams = match parse_params(req.params.as_ref()) {
+        Ok(params) => params,
+        Err(err) => return peer.respond_error(&req.id, &err).await,
+    };
+    let store = match store_of(state) {
+        Ok(store) => store,
+        Err(err) => return peer.respond_error(&req.id, &err).await,
+    };
+
+    // 先确认会话存在：导出空文件比报 5001 更糟——用户会以为会话真没内容。
+    let session = match load_session(store, &params.session_id).await {
+        Ok(session) => session,
+        Err(err) => return peer.respond_error(&req.id, &err).await,
+    };
+
+    let messages = match load_all_messages(store, &session.id).await {
+        Ok(messages) => messages,
+        Err(err) => return peer.respond_error(&req.id, &err).await,
+    };
+
+    let view = to_view(&session);
+    // 路径先解析再渲染：路径非法时没必要白跑一遍序列化。
+    let path = match session_export::resolve_out_path(&params.out_path, params.format, &view) {
+        Ok(path) => path,
+        Err(message) => {
+            let err = ErrorObject::invalid_params(message).with_data(json!({
+                "out_path": params.out_path,
+            }));
+            return peer.respond_error(&req.id, &err).await;
+        }
+    };
+
+    let body = session_export::render(
+        &view,
+        &messages.iter().map(to_message_view).collect::<Vec<_>>(),
+        params.format,
+        now_ms(),
+    );
+
+    match session_export::write(&path, &body) {
+        Ok(bytes) => {
+            let result = SessionExportResult {
+                ok: true,
+                path: path.to_string_lossy().into_owned(),
+                bytes,
+                messages: messages.len() as u64,
+            };
+            peer.respond(&req.id, &result).await;
+        }
+        Err(err) => {
+            let error = ErrorObject::new(ErrorCode::EXPORT_FAILED, format!("导出写盘失败: {err}"))
+                .with_data(json!({ "path": path.to_string_lossy() }));
+            peer.respond_error(&req.id, &error).await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// session.fork
+// ---------------------------------------------------------------------------
+
+pub async fn fork(peer: &Peer, state: &AppState, req: &Request) {
+    let params: SessionForkParams = match parse_params(req.params.as_ref()) {
+        Ok(params) => params,
+        Err(err) => return peer.respond_error(&req.id, &err).await,
+    };
+    let store = match store_of(state) {
+        Ok(store) => store,
+        Err(err) => return peer.respond_error(&req.id, &err).await,
+    };
+
+    // 复制语义全在 store 的事务里（含父子链重映射、截断点校验），这里只翻译结果。
+    match store
+        .fork_session(
+            &params.session_id,
+            params.from_message_id.as_deref(),
+            params.title.as_deref(),
+        )
+        .await
+    {
+        Ok(outcome) => {
+            let result = SessionForkResult {
+                new_session_id: outcome.session.id.clone(),
+                session: to_view(&outcome.session),
+                messages: outcome.messages.len() as u64,
+            };
+            peer.respond(&req.id, &result).await;
+        }
+        Err(err) => peer.respond_error(&req.id, &map_store_error(err)).await,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 辅助
 // ---------------------------------------------------------------------------
 
@@ -411,6 +512,27 @@ fn normalize_title(title: Option<&str>) -> String {
         .to_string()
 }
 
+/// 读取会话的全部消息（导出 / 分叉前用）。
+///
+/// 上限与 fork 一致：超过 10000 条就明确报 5005，不静默截断——导出一半历史
+/// 比导出失败更难发现。
+async fn load_all_messages(store: &Store, session_id: &str) -> Result<Vec<Message>, ErrorObject> {
+    let total = match store.count_messages(session_id).await {
+        Ok(total) => total,
+        Err(err) => return Err(map_store_error(err)),
+    };
+    if total > MAX_FORK_MESSAGES {
+        return Err(session_too_large(total));
+    }
+    if total == 0 {
+        return Ok(Vec::new());
+    }
+    match store.list_messages(session_id, total, 0).await {
+        Ok(rows) => Ok(rows),
+        Err(err) => Err(map_store_error(err)),
+    }
+}
+
 async fn load_session(store: &Store, session_id: &str) -> Result<Session, ErrorObject> {
     match store.get_session(session_id).await {
         Ok(Some(session)) => Ok(session),
@@ -431,8 +553,22 @@ fn session_not_found(session_id: &str) -> ErrorObject {
 fn map_store_error(err: StoreError) -> ErrorObject {
     match err {
         StoreError::SessionNotFound(id) => session_not_found(&id),
+        // 截断点写错属于参数问题（客户端能改），不是库坏了。
+        StoreError::MessageNotFound(id) => {
+            ErrorObject::invalid_params(format!("from_message_id 不存在或不属于该会话: {id}"))
+                .with_data(json!({ "message_id": id }))
+        }
+        StoreError::SessionTooLarge { count, .. } => session_too_large(count),
         other => ErrorObject::new(ErrorCode::STORE_ERROR, format!("会话库读写失败: {other}")),
     }
+}
+
+fn session_too_large(count: i64) -> ErrorObject {
+    ErrorObject::new(
+        ErrorCode::SESSION_TOO_LARGE,
+        format!("消息过多：{count} 条，单次上限 {MAX_FORK_MESSAGES} 条"),
+    )
+    .with_data(json!({ "count": count, "max": MAX_FORK_MESSAGES }))
 }
 
 fn to_view(session: &Session) -> SessionView {

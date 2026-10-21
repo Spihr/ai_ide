@@ -26,6 +26,14 @@ pub enum StoreError {
     /// `message.role` 列存了未知取值。
     #[error("非法的消息角色：{0}")]
     InvalidRole(String),
+
+    /// fork 的截断点消息不存在，或不属于被分叉的会话。
+    #[error("消息不存在或不属于该会话：{0}")]
+    MessageNotFound(String),
+
+    /// 单次导出 / 分叉的消息数超过上限：宁可明确报错，也不静默截断历史。
+    #[error("消息过多：{count} 条，单次上限 {max} 条")]
+    SessionTooLarge { count: i64, max: i64 },
 }
 
 /// 持久化层 `Result` 别名。

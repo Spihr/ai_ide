@@ -54,6 +54,57 @@ impl MessageRow {
     }
 }
 
+/// 事务内全量读取会话消息（按时间正序），供 `fork_session` 使用。
+///
+/// 单独抽出来的理由：fork 必须在**同一个事务**里读源、写新，不能复用
+/// [`Store::list_messages`]——那会自己开一条连接，读到的是另一个快照。
+pub(crate) async fn list_messages_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    session_id: &str,
+) -> Result<Vec<Message>> {
+    let rows = sqlx::query_as::<_, MessageRow>(&format!(
+        "SELECT {MESSAGE_COLUMNS} FROM message WHERE session_id = ? ORDER BY created_at ASC, rowid ASC"
+    ))
+    .bind(session_id)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    rows.into_iter().map(MessageRow::into_message).collect()
+}
+
+/// 事务内插入一条消息；`id` 与 `parent_id` 由调用方给定（fork 要重映射父子链）。
+pub(crate) async fn insert_message_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+    message: &Message,
+    parent_id: Option<&str>,
+) -> Result<()> {
+    let content_json = encode_content(&message.content, &message.attachments)?;
+    let tool_calls_json = serde_json::to_string(&message.tool_calls)?;
+    let model_ref_json = encode_model_ref(&message.model_ref)?;
+    let usage_json = encode_usage(&message.usage)?;
+
+    sqlx::query(
+        "INSERT INTO message (id, session_id, parent_id, role, content_json, tool_calls_json, \
+         tool_call_id, model_ref_json, usage_json, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+    )
+    .bind(id)
+    .bind(&message.session_id)
+    .bind(parent_id)
+    .bind(role_to_str(message.role))
+    .bind(&content_json)
+    .bind(&tool_calls_json)
+    .bind(message.tool_call_id.as_deref())
+    .bind(model_ref_json.as_deref())
+    .bind(usage_json.as_deref())
+    .bind(message.created_at)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
 impl Store {
     /// 追加一条消息；同一事务内把会话 `updated_at` 推进到不早于该消息时间。
     ///

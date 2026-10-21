@@ -344,6 +344,157 @@ async fn file_backed_store_survives_reopen() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test]
+async fn fork_copies_messages_and_remaps_parents() {
+    let store = Store::open_in_memory().await.expect("打开内存库");
+
+    let source = store
+        .create_session(
+            NewSession::new("主线")
+                .with_workspace_path("E:/ai_ide")
+                .with_model_ref(demo_model_ref())
+                .with_created_at(1_700_000_000_000),
+        )
+        .await
+        .unwrap();
+    let first = store
+        .append_message(NewMessage::user(&source.id, "第一问").with_created_at(1_700_000_001_000))
+        .await
+        .unwrap();
+    let second = store
+        .append_message(
+            NewMessage::assistant(&source.id, "第一答")
+                .with_parent(&first.id)
+                .with_created_at(1_700_000_002_000),
+        )
+        .await
+        .unwrap();
+    let third = store
+        .append_message(
+            NewMessage::user(&source.id, "第二问")
+                .with_parent(&second.id)
+                .with_created_at(1_700_000_003_000),
+        )
+        .await
+        .unwrap();
+
+    let outcome = store
+        .fork_session(&source.id, None, None)
+        .await
+        .expect("分叉应成功");
+
+    assert_ne!(outcome.session.id, source.id, "新会话必须换 id");
+    assert_eq!(
+        outcome.session.title, "主线（分支）",
+        "未指定标题时给默认后缀"
+    );
+    assert_eq!(
+        outcome.session.workspace_path.as_deref(),
+        Some("E:/ai_ide"),
+        "工作区要跟着复制"
+    );
+    assert_eq!(outcome.session.model_ref, Some(demo_model_ref()));
+    assert_eq!(outcome.messages.len(), 3);
+
+    // 新会话里的消息 id 必须全部换新，父链在新 id 空间内重新串起来。
+    assert!(outcome.messages.iter().all(|m| m.id != first.id));
+    assert!(outcome
+        .messages
+        .iter()
+        .all(|m| m.session_id == outcome.session.id));
+    assert_eq!(outcome.messages[0].parent_id, None);
+    assert_eq!(
+        outcome.messages[1].parent_id.as_deref(),
+        Some(outcome.messages[0].id.as_str())
+    );
+    assert_eq!(
+        outcome.messages[2].parent_id.as_deref(),
+        Some(outcome.messages[1].id.as_str())
+    );
+    // 历史时间原样保留：fork 是复制不是重写。
+    assert_eq!(outcome.messages[2].created_at, 1_700_000_003_000);
+
+    // 源会话毫发无损，且新会话真的落了盘。
+    let source_messages = store.list_messages(&source.id, 10, 0).await.unwrap();
+    assert_eq!(source_messages.len(), 3);
+    assert_eq!(source_messages[0].id, first.id);
+    assert_eq!(store.count_messages(&outcome.session.id).await.unwrap(), 3);
+    assert_eq!(store.count_sessions(None).await.unwrap(), 2);
+    let _ = third;
+}
+
+#[tokio::test]
+async fn fork_truncates_at_from_message_and_orphans_parent() {
+    let store = Store::open_in_memory().await.expect("打开内存库");
+
+    let source = store.create_session(NewSession::new("主线")).await.unwrap();
+    let first = store
+        .append_message(NewMessage::user(&source.id, "第一问"))
+        .await
+        .unwrap();
+    let second = store
+        .append_message(NewMessage::assistant(&source.id, "第一答").with_parent(&first.id))
+        .await
+        .unwrap();
+    store
+        .append_message(NewMessage::user(&source.id, "第二问").with_parent(&second.id))
+        .await
+        .unwrap();
+
+    // 截断到第一条：父亲的 id 落在本批之外，新会话里不能保留这个悬空引用。
+    let outcome = store
+        .fork_session(&source.id, Some(&first.id), Some("只要第一句"))
+        .await
+        .expect("截断分叉应成功");
+    assert_eq!(outcome.session.title, "只要第一句");
+    assert_eq!(outcome.messages.len(), 1);
+    assert_eq!(outcome.messages[0].content, "第一问");
+    assert_eq!(outcome.messages[0].parent_id, None);
+
+    // 截断到第二条：父链已被复制，应完整重映射。
+    let outcome = store
+        .fork_session(&source.id, Some(&second.id), None)
+        .await
+        .expect("截断分叉应成功");
+    assert_eq!(outcome.messages.len(), 2);
+    assert_eq!(
+        outcome.messages[1].parent_id.as_deref(),
+        Some(outcome.messages[0].id.as_str())
+    );
+}
+
+#[tokio::test]
+async fn fork_rejects_unknown_session_and_foreign_message() {
+    let store = Store::open_in_memory().await.expect("打开内存库");
+
+    let missing = store
+        .fork_session("missing-session", None, None)
+        .await
+        .expect_err("源会话不存在应报错");
+    assert!(matches!(missing, StoreError::SessionNotFound(id) if id == "missing-session"));
+
+    let source = store.create_session(NewSession::new("源")).await.unwrap();
+    store
+        .append_message(NewMessage::user(&source.id, "hi"))
+        .await
+        .unwrap();
+    let other = store.create_session(NewSession::new("别的")).await.unwrap();
+    let foreign = store
+        .append_message(NewMessage::user(&other.id, "别人的消息"))
+        .await
+        .unwrap();
+
+    // 从别的会话借一个消息 id 当截断点：必须是明确错误，不能悄悄复制全部。
+    let err = store
+        .fork_session(&source.id, Some(&foreign.id), None)
+        .await
+        .expect_err("跨会话截断点应被拒绝");
+    assert!(matches!(err, StoreError::MessageNotFound(id) if id == foreign.id));
+
+    // 失败不能留下半截新会话。
+    assert_eq!(store.count_sessions(None).await.unwrap(), 2);
+}
+
 fn ids(sessions: &[ai_ide_store::Session]) -> Vec<String> {
     sessions.iter().map(|session| session.id.clone()).collect()
 }

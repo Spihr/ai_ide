@@ -7,6 +7,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Result, StoreError};
 
+/// 单次导出 / 分叉允许携带的消息条数上限。
+///
+/// 与 [`crate::repo::message`] 里的查询上限同量级：超过这个量的会话已经不是
+/// 「导出一份存档」而是「搬库」，需要流式实现，不能靠一次性读进内存硬扛。
+pub const MAX_FORK_MESSAGES: i64 = 10_000;
+
+/// fork 的结果：新会话 + 已重映射 id 的消息（按时间正序）。
+#[derive(Debug, Clone)]
+pub struct ForkOutcome {
+    pub session: Session,
+    pub messages: Vec<Message>,
+}
+
 /// 全库统一的时间口径：Unix 毫秒。
 pub fn now_millis() -> i64 {
     SystemTime::now()
