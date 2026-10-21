@@ -58,6 +58,9 @@ describe('协议常量', () => {
       llmCancel: Methods.llm.cancel,
       llmListModels: Methods.llm.listModels,
       llmCountTokens: Methods.llm.countTokens,
+      agentStart: Methods.agent.start,
+      agentStop: Methods.agent.stop,
+      agentDecide: Methods.agent.decide,
       wsChanged: Methods.event.workspaceChanged,
       wsIndexed: Methods.event.workspaceIndexed,
       providerChanged: Methods.event.providerChanged,
@@ -67,7 +70,9 @@ describe('协议常量', () => {
       llmToolCall: Methods.event.llmToolCall,
       llmUsage: Methods.event.llmUsage,
       llmFinished: Methods.event.llmFinished,
-      llmError: Methods.event.llmError
+      llmError: Methods.event.llmError,
+      agentApprovalRequired: Methods.event.agentApprovalRequired,
+      agentFinished: Methods.event.agentFinished
     }).toEqual({
       hello: 'core.hello',
       ping: 'core.ping',

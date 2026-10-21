@@ -1534,7 +1534,7 @@ mod tests {
             ok: true,
             steps_done: 2,
         };
-        let json = serde_json::to_value(&stopped).unwrap();
+        let json = serde_json::to_value(stopped).unwrap();
         assert_eq!(json["ok"], true);
         assert_eq!(json["steps_done"], 2);
         assert_eq!(
