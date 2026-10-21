@@ -394,7 +394,12 @@ impl Default for PermissionGate {
 /// 路径类工具：解析目标路径，越界 / 敏感照拒，落在工作区内放行。
 fn ruling_for_path(ctx: &ToolContext<'_>, call: &ToolCall<'_>, for_write: bool) -> Ruling {
     let tool = call.tool_name();
-    let Some(path) = call.path_arg() else {
+    // 空串按「没给路径」算：工具层本来就是这么读参数的（`Args::opt_str` 把空串当缺省，
+    // 必填的 `Args::str` 把空串判成可回灌的「不能为空」）。闸门若照字面把 `""` 递给
+    // `PathGuard::resolve`，会以「路径为空」判成 `1006` 致命拒绝——那本是给「指向文件的
+    // 路径」定的规矩，结果模型一句 `list` 带 `path: ""`（真实模型表达「列一下工作区根」
+    // 的常见写法）就能把整条运行打停，与工具自己声明的「缺省为根目录」也对不上。
+    let Some(path) = call.path_arg().filter(|input| !input.trim().is_empty()) else {
         // 无目标路径：只读工具按工作区根算（放行），写工具缺目标只能问上层。
         return if for_write {
             Ruling::Ask(format!("`{tool}` 没给目标路径，需要上层裁决"))
@@ -580,6 +585,33 @@ mod tests {
             gate.ruling(&ctx, &ToolCall::new("list")),
             Ruling::Allow
         ));
+    }
+
+    #[test]
+    fn blank_path_is_treated_as_no_path() {
+        let sandbox = Sandbox::new("perm-blank");
+        let ctx = sandbox.ctx();
+        let gate = PermissionGate::new();
+
+        // 真实模型表达「列一下工作区根」时常显式写 `path: ""`。空串按「没给路径」算：
+        // 只读工具放行（= 工作区根），写工具照旧要上层裁决——两者都不该被判成致命
+        // `1006`（那会把整条运行打停，而工具层其实把空串当缺省 / 参数错误）。
+        for blank in ["", "   "] {
+            assert!(
+                matches!(
+                    gate.ruling(&ctx, &ToolCall::new("list").path(blank)),
+                    Ruling::Allow
+                ),
+                "只读工具的空路径应放行"
+            );
+            assert!(
+                matches!(
+                    gate.ruling(&ctx, &ToolCall::new("write").path(blank)),
+                    Ruling::Ask(_)
+                ),
+                "写工具的空路径仍要问上层"
+            );
+        }
     }
 
     #[test]
