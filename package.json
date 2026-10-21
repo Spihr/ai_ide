@@ -19,6 +19,7 @@
     "smoke:core": "node scripts/smoke-core.mjs",
     "smoke:m1": "node scripts/smoke-m1.mjs",
     "e2e:m1": "node scripts/e2e-m1.mjs",
+    "e2e:m4": "node scripts/e2e-m4.mjs",
     "bench:m1": "node scripts/bench-m1.mjs",
     "types:gen": "node scripts/gen-types.mjs",
     "lint": "eslint .",
