@@ -70,6 +70,7 @@ describe('协议常量', () => {
       sessionMessages: Methods.session.messages,
       sessionExport: Methods.session.export,
       sessionFork: Methods.session.fork,
+      auditList: Methods.audit.list,
       wsChanged: Methods.event.workspaceChanged,
       wsIndexed: Methods.event.workspaceIndexed,
       providerChanged: Methods.event.providerChanged,
@@ -123,6 +124,7 @@ describe('协议常量', () => {
       sessionMessages: 'session.messages',
       sessionExport: 'session.export',
       sessionFork: 'session.fork',
+      auditList: 'audit.list',
       wsChanged: 'workspace.changed',
       wsIndexed: 'workspace.indexed',
       providerChanged: 'provider.changed',
@@ -178,7 +180,8 @@ describe('协议常量', () => {
       'session.append_message',
       'session.messages',
       'session.export',
-      'session.fork'
+      'session.fork',
+      'audit.list'
     ])
   })
 

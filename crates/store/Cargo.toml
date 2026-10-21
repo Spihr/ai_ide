@@ -25,3 +25,5 @@ sqlx = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+# 审计测试要直接读原始列，确认「库里没有明文密钥」——只在出口脱敏是不够的。
+sqlx = { workspace = true }

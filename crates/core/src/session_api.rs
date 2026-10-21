@@ -16,10 +16,12 @@ use ai_ide_protocol::dto::{
 };
 use ai_ide_protocol::{ErrorCode, ErrorObject, Request};
 use ai_ide_store::{
-    Message, NewMessage, NewSession, Session, SessionQuery, Store, StoreError, MAX_FORK_MESSAGES,
+    audit_kind, Message, NewAuditEvent, NewMessage, NewSession, Session, SessionQuery, Store,
+    StoreError, MAX_FORK_MESSAGES,
 };
 use serde_json::json;
 
+use crate::audit_api;
 use crate::dispatch::parse_params;
 use crate::peer::Peer;
 use crate::session_export;
@@ -62,6 +64,21 @@ pub async fn create(peer: &Peer, state: &AppState, req: &Request) {
 
     match store.create_session(new).await {
         Ok(session) => {
+            // 先记审计再回包：两者都在业务成功之后，顺序不影响成败。
+            audit_api::record(
+                store,
+                NewAuditEvent::core(
+                    audit_kind::SESSION_CREATED,
+                    format!("创建会话「{}」", session.title),
+                )
+                .with_session(&session.id)
+                .with_detail(json!({
+                    "title": session.title,
+                    "workspace_path": session.workspace_path,
+                    "model_ref": session.model_ref,
+                })),
+            )
+            .await;
             let result = SessionCreateResult {
                 session_id: session.id.clone(),
                 session: to_view(&session),
@@ -236,6 +253,9 @@ pub async fn update(peer: &Peer, state: &AppState, req: &Request) {
             Err(err) => return peer.respond_error(&req.id, &map_store_error(err)).await,
         }
     }
+    // 先把「改了什么」记下来：下面 `params.model_ref` 会被移进 `set_session_model`，
+    // 回包时再判断就晚了。
+    let model_changed = params.model_ref.is_some();
     if let Some(model_ref) = params.model_ref {
         match store
             .set_session_model(&params.session_id, &model_ref, now_ms())
@@ -253,7 +273,33 @@ pub async fn update(peer: &Peer, state: &AppState, req: &Request) {
 
     // 回最新快照，客户端不必再补一次 `session.get` 就能刷新列表项。
     match load_session(store, &params.session_id).await {
-        Ok(session) => peer.respond(&req.id, &to_view(&session)).await,
+        Ok(session) => {
+            // 改名的旧标题拿不到了（rename 已覆盖），所以摘要只描述「改成了什么」，
+            // 新旧对照留给客户端自己在本地快照里比对。
+            let mut bits: Vec<String> = Vec::new();
+            if title.is_some() {
+                bits.push(format!("改名为「{}」", session.title));
+            }
+            if model_changed {
+                bits.push("切换默认模型".to_string());
+            }
+            audit_api::record(
+                store,
+                NewAuditEvent::core(
+                    audit_kind::SESSION_UPDATED,
+                    format!("更新会话「{}」：{}", session.title, bits.join("、")),
+                )
+                .with_session(&session.id)
+                .with_detail(json!({
+                    "title": session.title,
+                    "model_ref": session.model_ref,
+                    "renamed": title.is_some(),
+                    "model_changed": model_changed,
+                })),
+            )
+            .await;
+            peer.respond(&req.id, &to_view(&session)).await
+        }
         Err(err) => peer.respond_error(&req.id, &err).await,
     }
 }
@@ -278,8 +324,27 @@ pub async fn delete(peer: &Peer, state: &AppState, req: &Request) {
 
     let mut deleted = 0u64;
     for id in &params.session_ids {
+        // 删之前先抓标题：删完就只剩一个 UUID，审计里读不出「哪个会话没了」。
+        let title = match store.get_session(id).await {
+            Ok(Some(session)) => Some(session.title),
+            Ok(None) => None,
+            Err(err) => return peer.respond_error(&req.id, &map_store_error(err)).await,
+        };
         match store.delete_session(id).await {
-            Ok(true) => deleted += 1,
+            Ok(true) => {
+                deleted += 1;
+                let summary = match &title {
+                    Some(title) => format!("删除会话「{title}」"),
+                    None => format!("删除会话 {id}"),
+                };
+                audit_api::record(
+                    store,
+                    NewAuditEvent::core(audit_kind::SESSION_DELETED, summary)
+                        .with_session(id)
+                        .with_detail(json!({ "session_id": id, "title": title })),
+                )
+                .await;
+            }
             // 不存在的 id 静默跳过：删除是幂等的，客户端重试不该报错。
             Ok(false) => {}
             Err(err) => return peer.respond_error(&req.id, &map_store_error(err)).await,
@@ -418,6 +483,25 @@ pub async fn export(peer: &Peer, state: &AppState, req: &Request) {
 
     match session_export::write(&path, &body) {
         Ok(bytes) => {
+            // 导出把会话内容写到了工作区之外，是审计里最该留痕的一类操作：
+            // 记路径、格式、字节数与消息条数，事后能对上「谁在什么时候导出了什么」。
+            audit_api::record(
+                store,
+                NewAuditEvent::core(
+                    audit_kind::SESSION_EXPORTED,
+                    format!("导出会话「{}」到 {}", view.title, path.to_string_lossy()),
+                )
+                .with_session(&session.id)
+                .with_detail(json!({
+                    "session_id": session.id,
+                    "title": view.title,
+                    "path": path.to_string_lossy(),
+                    "format": params.format,
+                    "bytes": bytes,
+                    "messages": messages.len() as u64,
+                })),
+            )
+            .await;
             let result = SessionExportResult {
                 ok: true,
                 path: path.to_string_lossy().into_owned(),
@@ -458,6 +542,27 @@ pub async fn fork(peer: &Peer, state: &AppState, req: &Request) {
         .await
     {
         Ok(outcome) => {
+            // 分叉同时产生「源会话被读取」和「新会话被创建」两件事，一条事件里
+            // 都写清楚：审计表按时间线性读，拆两条反而要读者自己配对。
+            audit_api::record(
+                store,
+                NewAuditEvent::core(
+                    audit_kind::SESSION_FORKED,
+                    format!(
+                        "从会话「{}」分叉出新会话「{}」",
+                        params.session_id, outcome.session.title
+                    ),
+                )
+                .with_session(&outcome.session.id)
+                .with_detail(json!({
+                    "source_session_id": params.session_id,
+                    "new_session_id": outcome.session.id,
+                    "from_message_id": params.from_message_id,
+                    "title": outcome.session.title,
+                    "messages": outcome.messages.len() as u64,
+                })),
+            )
+            .await;
             let result = SessionForkResult {
                 new_session_id: outcome.session.id.clone(),
                 session: to_view(&outcome.session),
@@ -474,7 +579,7 @@ pub async fn fork(peer: &Peer, state: &AppState, req: &Request) {
 // ---------------------------------------------------------------------------
 
 /// 取会话库；未就绪时返回 5002（内核能跑，只是持久化不可用）。
-fn store_of(state: &AppState) -> Result<&Store, ErrorObject> {
+pub(crate) fn store_of(state: &AppState) -> Result<&Store, ErrorObject> {
     state.store().ok_or_else(|| {
         ErrorObject::new(
             ErrorCode::STORE_UNAVAILABLE,

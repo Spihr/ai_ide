@@ -35,6 +35,7 @@
 //! 主进程侧的行解析就会崩，而且这种 bug 极难定位。
 
 pub mod agent_api;
+pub mod audit_api;
 pub mod context;
 pub mod dispatch;
 pub mod llm_api;

@@ -1661,6 +1661,76 @@ fn default_true() -> bool {
     true
 }
 
+// ---------------------------------------------------------------------------
+// audit.*（M5 切片四）
+// ---------------------------------------------------------------------------
+
+/// 一条审计事件的对外视图。
+///
+/// `summary` 与 `detail` 在存储层写入与读取时各脱敏一次，这里拿到的已经是安全值：
+/// 客户端不必（也无法）自己做脱敏。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AuditEventView {
+    /// 自增主键，也是稳定的翻页锚点。
+    #[ts(type = "number")]
+    pub event_id: i64,
+    /// 事件种类，形如 `session.created`；用字符串而非枚举，新增种类不破坏老客户端。
+    pub kind: String,
+    /// 关联会话；跨会话事件为空。
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// 发起方：`core` / `user` / `agent`。
+    pub actor: String,
+    /// 人可读摘要（已脱敏）。
+    pub summary: String,
+    /// 结构化补充信息（已脱敏）。
+    #[serde(default)]
+    pub detail: serde_json::Value,
+    /// 事件时刻（Unix 毫秒）。
+    #[ts(type = "number")]
+    pub created_at_ms: i64,
+}
+
+/// `audit.list` 请求参数。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AuditListParams {
+    /// 只看某个会话的事件。
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// 只看某种事件（如 `session.deleted`）。
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// 起始时刻（含，Unix 毫秒）。
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub since_ms: Option<i64>,
+    /// 结束时刻（含，Unix 毫秒）。
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub until_ms: Option<i64>,
+    /// 返回条数上限，缺省 50，内部夹到 1..=500。
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub limit: Option<u32>,
+    /// 偏移量，缺省 0。
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub offset: Option<u32>,
+}
+
+/// `audit.list` 响应结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AuditListResult {
+    /// 按 `created_at_ms` 倒序（同刻按 `event_id` 倒序）。
+    pub events: Vec<AuditEventView>,
+    /// 过滤条件下的命中总数（不受 `limit` / `offset` 影响）。
+    #[ts(type = "number")]
+    pub total: u64,
+}
+
 /// 供 TS 侧引用的导出目录常量说明（不参与序列化，仅为文档服务）。
 pub const _TS_EXPORT_DIR: &str = TS_DIR;
 
@@ -1927,5 +1997,56 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "session_id": "s1" })).unwrap();
         assert!(params.from_message_id.is_none());
         assert!(params.title.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // audit.*（M5 切片四）
+    // -----------------------------------------------------------------------
+
+    /// 审计查询参数全部可选：`{}` 就是「最近 50 条」。
+    #[test]
+    fn audit_list_params_are_all_optional() {
+        let params: AuditListParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(params, AuditListParams::default());
+        assert!(params.session_id.is_none());
+        assert!(params.kind.is_none());
+        assert!(params.limit.is_none());
+    }
+
+    /// 时间戳必须出成数字而不是字符串：前端直接比较大小、算时间窗。
+    #[test]
+    fn audit_event_view_keeps_timestamps_numeric() {
+        let view = AuditEventView {
+            event_id: 7,
+            kind: "session.deleted".into(),
+            session_id: Some("s1".into()),
+            actor: "core".into(),
+            summary: "删除会话「旧的」".into(),
+            detail: serde_json::json!({ "title": "旧的" }),
+            created_at_ms: 1_700_000_000_000,
+        };
+        let json = serde_json::to_value(&view).unwrap();
+        assert!(json["created_at_ms"].is_number());
+        assert!(json["event_id"].is_number());
+        assert_eq!(json["detail"]["title"], serde_json::json!("旧的"));
+        assert_eq!(
+            serde_json::from_value::<AuditEventView>(json).unwrap(),
+            view
+        );
+    }
+
+    /// `detail` 与 `session_id` 缺省时要能反序列化：老客户端 / 手写载荷都得容忍。
+    #[test]
+    fn audit_event_view_tolerates_missing_optional_fields() {
+        let view: AuditEventView = serde_json::from_value(serde_json::json!({
+            "event_id": 1,
+            "kind": "session.created",
+            "actor": "core",
+            "summary": "创建会话",
+            "created_at_ms": 1,
+        }))
+        .unwrap();
+        assert!(view.session_id.is_none());
+        assert_eq!(view.detail, serde_json::Value::Null);
     }
 }

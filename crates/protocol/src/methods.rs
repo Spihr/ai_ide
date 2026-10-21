@@ -84,6 +84,14 @@ pub mod session {
     pub const FORK: &str = "session.fork";
 }
 
+/// 审计日志（M5 切片四：落盘在 `crates/store` 的 `audit_event` 表）。
+///
+/// 只有查询入口：写入是内核在关键操作处的**旁路动作**，客户端无权伪造一条
+/// 「某会话被导出到某路径」的记录——审计记录一旦能让外部写，就不再是证据。
+pub mod audit {
+    pub const LIST: &str = "audit.list";
+}
+
 /// Core → Main 的通知（事件）。
 pub mod event {
     /// 内核日志转发，便于 Main 侧统一落盘。
@@ -170,6 +178,8 @@ pub const IMPLEMENTED: &[&str] = &[
     // M5 切片三：导出与分叉（`crates/core` 已有 dispatch 分支）。
     session::EXPORT,
     session::FORK,
+    // M5 切片四：审计查询（写入由内核在会话关键操作处旁路完成）。
+    audit::LIST,
 ];
 
 /// 协议面**已定义、但内核尚未接线**的方法。
@@ -191,7 +201,7 @@ mod tests {
 
     #[test]
     fn implemented_list_covers_core_m1_m2_agent_domains() {
-        assert_eq!(IMPLEMENTED.len(), 39);
+        assert_eq!(IMPLEMENTED.len(), 40);
         assert!(IMPLEMENTED.contains(&"core.ping"));
         assert!(IMPLEMENTED.contains(&"$/cancelRequest"));
         assert!(IMPLEMENTED.contains(&"workspace.read_file"));
@@ -249,7 +259,17 @@ mod tests {
         all.sort_unstable();
         all.dedup();
         assert_eq!(all.len(), total, "两张表不得有重叠");
-        assert_eq!(total, 39, "应恰好覆盖协议里定义的全部 39 个请求方法");
+        assert_eq!(total, 40, "应恰好覆盖协议里定义的全部 40 个请求方法");
+    }
+
+    #[test]
+    fn audit_list_is_the_only_audit_method_and_is_wired() {
+        assert_eq!(audit::LIST, "audit.list");
+        assert!(IMPLEMENTED.contains(&audit::LIST));
+        // 审计写入必须留在内核侧：协议面只暴露一个只读方法。
+        assert!(!IMPLEMENTED
+            .iter()
+            .any(|name| name.starts_with("audit.") && *name != audit::LIST));
     }
 
     #[test]

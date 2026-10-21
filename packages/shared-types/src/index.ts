@@ -164,6 +164,11 @@ export type { SessionExportDocument } from "./generated/SessionExportDocument";
 export type { SessionForkParams } from "./generated/SessionForkParams";
 export type { SessionForkResult } from "./generated/SessionForkResult";
 
+// ---- audit.* 方法（M5）----
+export type { AuditEventView } from "./generated/AuditEventView";
+export type { AuditListParams } from "./generated/AuditListParams";
+export type { AuditListResult } from "./generated/AuditListResult";
+
 // ---- 协议常量（与 Rust 侧保持一致的运行时镜像）----
 
 /** JSON-RPC 版本字面量。对应 Rust `ai_ide_protocol::JSONRPC_VERSION`。 */
@@ -236,6 +241,9 @@ export const Methods = {
     export: "session.export",
     fork: "session.fork",
   },
+  audit: {
+    list: "audit.list",
+  },
   event: {
     log: "core.log",
     workspaceChanged: "workspace.changed",
@@ -258,8 +266,9 @@ export const Methods = {
  *
  * M0 + M1（协议内核 / 工作区 / 检索）+ M2 的 `provider.*` / `model.*` / `llm.*`
  * （Provider 与模型目录，含密钥内存保管与脱敏视图；流式对话、取消与用量统计），
- * 再加 M4 第三切片的 `agent.*` 三项与 M5 的 `session.*` 九项（会话 / 消息落盘，
- * 含导出与分叉），共 39 项，与 Rust `methods::IMPLEMENTED` 逐项对齐。
+ * 再加 M4 第三切片的 `agent.*` 三项、M5 的 `session.*` 九项（会话 / 消息落盘，
+ * 含导出与分叉）与 `audit.list`（审计账本只读查询），共 40 项，与 Rust
+ * `methods::IMPLEMENTED` 逐项对齐。
  */
 export const IMPLEMENTED_METHODS = [
   Methods.core.hello,
@@ -301,6 +310,7 @@ export const IMPLEMENTED_METHODS = [
   Methods.session.messages,
   Methods.session.export,
   Methods.session.fork,
+  Methods.audit.list,
 ] as const;
 
 /**

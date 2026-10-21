@@ -6,6 +6,7 @@
 //! `methods::DECLARED_NOT_IMPLEMENTED` 里，调用会如实返回 `-32601`。
 
 use crate::agent_api;
+use crate::audit_api;
 use crate::llm_api;
 use crate::peer::Peer;
 use crate::provider_api;
@@ -113,6 +114,7 @@ async fn handle_request(peer: &Peer, state: &AppState, req: Request) {
         // M5 切片三：导出与分叉。
         methods::session::EXPORT => session_api::export(peer, state, &req).await,
         methods::session::FORK => session_api::fork(peer, state, &req).await,
+        methods::audit::LIST => audit_api::list(peer, state, &req).await,
 
         other => {
             warn!(method = %other, "未实现的方法");

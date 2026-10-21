@@ -276,6 +276,188 @@ impl NewMessage {
 }
 
 // ---------------------------------------------------------------------------
+// 审计
+// ---------------------------------------------------------------------------
+
+/// 审计事件种类。
+///
+/// 用 `&str` 常量而不是 `enum`：审计表只增不改，新增一种事件不该让老版本
+/// 客户端反序列化失败，也不该逼着老库做一次数据迁移。
+pub mod audit_kind {
+    /// 会话创建。
+    pub const SESSION_CREATED: &str = "session.created";
+    /// 会话改名 / 改默认模型。
+    pub const SESSION_UPDATED: &str = "session.updated";
+    /// 会话删除。
+    pub const SESSION_DELETED: &str = "session.deleted";
+    /// 会话导出。
+    pub const SESSION_EXPORTED: &str = "session.exported";
+    /// 会话分叉。
+    pub const SESSION_FORKED: &str = "session.forked";
+}
+
+/// 审计事件的发起方。
+pub mod audit_actor {
+    /// 内核自身（协议请求驱动）。
+    pub const CORE: &str = "core";
+    /// 用户显式操作。
+    pub const USER: &str = "user";
+    /// Agent / 模型侧发起。
+    pub const AGENT: &str = "agent";
+}
+
+/// 一条已落库的审计事件。
+///
+/// `detail` 在读取时已再次脱敏（见 [`crate::redact`]）：老版本写入的行、被手工
+/// 改过的库，都不能经由查询接口把密钥带出去。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuditEvent {
+    /// 自增主键，也是翻页排序的稳定依据。
+    pub id: i64,
+    /// 事件种类，见 [`audit_kind`]。
+    pub kind: String,
+    /// 关联会话；跨会话事件为空。
+    pub session_id: Option<String>,
+    /// 发起方，见 [`audit_actor`]。
+    pub actor: String,
+    /// 人可读摘要（读取时已脱敏）。
+    pub summary: String,
+    /// 结构化补充信息（读取时已脱敏）。
+    pub detail: serde_json::Value,
+    /// 事件时刻（Unix 毫秒）。
+    pub created_at: i64,
+}
+
+/// 待写入的审计事件。
+///
+/// 构造时**不做**脱敏，脱敏统一在 [`Store::record_audit`] 里做——少一个入口就少
+/// 一处能忘。
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewAuditEvent {
+    pub kind: String,
+    pub session_id: Option<String>,
+    pub actor: String,
+    pub summary: String,
+    pub detail: serde_json::Value,
+    pub created_at: Option<i64>,
+}
+
+impl NewAuditEvent {
+    /// 以「内核」身份构造。
+    pub fn core(kind: impl Into<String>, summary: impl Into<String>) -> Self {
+        Self::by(audit_actor::CORE, kind, summary)
+    }
+
+    /// 以指定身份构造。
+    pub fn by(
+        actor: impl Into<String>,
+        kind: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: kind.into(),
+            session_id: None,
+            actor: actor.into(),
+            summary: summary.into(),
+            detail: serde_json::Value::Null,
+            created_at: None,
+        }
+    }
+
+    /// 关联到某个会话。
+    pub fn with_session(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
+
+    /// 附带结构化明细；必须是 JSON 对象（数组 / 标量在这里就被拍平成对象，
+    /// 免得查询侧还要处理三种形态）。
+    pub fn with_detail(mut self, detail: serde_json::Value) -> Self {
+        self.detail = match detail {
+            serde_json::Value::Object(_) => detail,
+            serde_json::Value::Null => serde_json::Value::Null,
+            other => serde_json::json!({ "value": other }),
+        };
+        self
+    }
+
+    /// 指定事件时刻（Unix 毫秒），缺省取当前时间。
+    pub fn with_created_at(mut self, created_at: i64) -> Self {
+        self.created_at = Some(created_at);
+        self
+    }
+}
+
+/// 审计查询过滤条件（不含分页）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AuditFilter<'a> {
+    /// 只看某个会话的事件。
+    pub session_id: Option<&'a str>,
+    /// 只看某种事件。
+    pub kind: Option<&'a str>,
+    /// 起始时刻（含，Unix 毫秒）。
+    pub since_ms: Option<i64>,
+    /// 结束时刻（含，Unix 毫秒）。
+    pub until_ms: Option<i64>,
+}
+
+/// 审计查询条件（过滤 + 分页）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AuditQuery<'a> {
+    pub filter: AuditFilter<'a>,
+    /// 返回条数上限（内部会夹到 1..=500）。
+    pub limit: i64,
+    pub offset: i64,
+}
+
+impl<'a> AuditQuery<'a> {
+    /// 空条件，默认取最近 50 条。
+    pub fn new() -> Self {
+        Self {
+            filter: AuditFilter::default(),
+            limit: 50,
+            offset: 0,
+        }
+    }
+
+    /// 限定会话。
+    pub fn session(mut self, session_id: &'a str) -> Self {
+        self.filter.session_id = Some(session_id);
+        self
+    }
+
+    /// 限定事件种类。
+    pub fn kind(mut self, kind: &'a str) -> Self {
+        self.filter.kind = Some(kind);
+        self
+    }
+
+    /// 起始时刻（含）。
+    pub fn since(mut self, since_ms: i64) -> Self {
+        self.filter.since_ms = Some(since_ms);
+        self
+    }
+
+    /// 结束时刻（含）。
+    pub fn until(mut self, until_ms: i64) -> Self {
+        self.filter.until_ms = Some(until_ms);
+        self
+    }
+
+    /// 设置返回条数上限。
+    pub fn with_limit(mut self, limit: i64) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    /// 设置偏移量。
+    pub fn with_offset(mut self, offset: i64) -> Self {
+        self.offset = offset;
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 列编解码（`content_json` / `*_json`）
 // ---------------------------------------------------------------------------
 
