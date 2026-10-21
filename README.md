@@ -108,7 +108,7 @@ pnpm dev
 | `pnpm e2e:m1` | Playwright + Electron 真界面端到端 |
 | `pnpm e2e:m4` | 真实模型 Agent 端到端联调（需本机凭据，不入 CI）；凭据默认读 `<仓库根>/.e2e-m4-credentials.json`（已在 `.gitignore` 中忽略），`--check-creds` 只做凭据自检 |
 | `pnpm bench:m1` | 树列举 / 读文件 / 搜索耗时基准 |
-| `pnpm verify:m0` / `pnpm verify:m1` | 对应里程碑的一键复跑 |
+| `pnpm verify:m0` / `pnpm verify:m1` / `pnpm verify:m2` / `pnpm verify:m3` / `pnpm verify:m4` | 对应里程碑的一键复跑（`verify:m3` / `verify:m4` 分别加跑 `cargo test -p ai-ide-llm` / `-p ai-ide-agent`；均不含需真实凭据的 `e2e:m4`） |
 | `pnpm verify:ci` | 本地等价复现 CI 全流程 |
 
 ---
@@ -126,14 +126,14 @@ CI 定义在 [`.github/workflows/ci.yml`](./.github/workflows/ci.yml)，在 `win
 pnpm verify:ci
 ```
 
-> 说明：CI 尚未在仓库远端实际运行过（无 Actions 运行记录），当前以本地等价复跑作为替代验证手段。
+> 说明：远端已有 8 次 Actions 运行记录（截至 2026-10-21），但两个 job 均在启动前失败、0 步执行，CI 尚未真正跑过任何一步；当前以本地等价复跑作为替代验证手段。
 
 ---
 
 ## 已知限制
 
 1. 未接入打包（electron-builder），只有开发态与 `electron-vite build` 产物，无安装包。
-2. CI 定义已就位但未在远端实跑。
+2. CI 定义已就位，但远端 Actions 从未真正执行（两个 job 均在启动前失败、0 步执行），门禁尚未在远端验证。
 3. renderer 首次构建体积较大（Monaco 全量 + 按需语言包），尚未做语言子集裁剪与 worker 异步分块。
 4. `core.log` 通知通道已定义，内核侧尚未主动推送；UI 显示的是子进程 stderr 原始流。
 5. ts-rs 在编译期会输出若干 `failed to parse serde attribute` 宏诊断，不影响生成结果。
@@ -151,7 +151,9 @@ pnpm verify:ci
 | [`docs/03-内核接口协议规范.md`](./docs/03-内核接口协议规范.md) | 协议全文与方法目录 |
 | [`docs/04-AI能力与Agent设计.md`](./docs/04-AI能力与Agent设计.md) | Provider 抽象、上下文组装、Agent 循环、工具与权限 |
 | [`docs/05-里程碑与验证计划.md`](./docs/05-里程碑与验证计划.md) | M0–M8 计划、测试策略、风险、待决问题 |
-| [`docs/06-M0-验收报告.md`](./docs/06-M0-验收报告.md) / [`docs/07-M1-验收报告.md`](./docs/07-M1-验收报告.md) | 里程碑验收实测记录 |
+| [`docs/06-M0-验收报告.md`](./docs/06-M0-验收报告.md) / [`docs/07-M1-验收报告.md`](./docs/07-M1-验收报告.md) | 里程碑验收实测记录（M0 / M1） |
+| [`docs/08-M2-验收报告.md`](./docs/08-M2-验收报告.md) / [`docs/09-M3-验收报告.md`](./docs/09-M3-验收报告.md) | 里程碑验收实测记录（M2 / M3） |
+| [`docs/10-M4-验收报告.md`](./docs/10-M4-验收报告.md) | M4 实测验收：Agent 闭环、权限闸门、真实模型端到端联调与遗留项 |
 
 ---
 

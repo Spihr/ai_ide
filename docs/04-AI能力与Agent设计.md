@@ -13,7 +13,7 @@ AIGC:
 
 > 文档版本：v0.1（待审阅）
 > 依赖：`02-系统架构设计.md`、`03-内核接口协议规范.md`
-> 实现状态：**本文的 Agent / 上下文组装 / 权限审批 / 检查点 / MCP 部分尚未实现**（对应 M3–M7）；其中「模型接入」一节已在内核侧落地（`crates/llm` + `crates/core` 的 `llm.*`：Provider 适配、SSE 流式解析、取消、错误分类、密钥加密、目录存储）。截至 2026-10-19，`crates/agent` / `crates/mcp` / `crates/store` 等模块尚未创建，Provider 配置 UI 与对话面板尚未接入渲染端；本文其余内容是 M2 起的施工图纸，不代表当前实现。
+> 实现状态：**模型接入（M2）、上下文组装与压缩（M3）、Agent 循环与权限审批（M4）已在内核与外壳两侧落地**；**检查点与 MCP 部分尚未实现**（对应 M5/M6/M7）。截至 2026-10-21，`crates/llm`（Provider 适配、SSE 流式解析、取消、错误分类、密钥加密、目录存储）、`crates/agent`（Agent 循环、工具注册表、权限闸门、diff）与 `crates/core/src/{llm_api,context,agent_api}.rs` 均已落地并接线；Provider 配置 UI、对话面板、`@` 引用与 Agent 运行/审批面板均已接入渲染端；`crates/mcp` / `crates/store` 尚未创建。本文其余内容（检查点、MCP 等）是 M5 起的施工图纸，不代表当前实现。
 
 ---
 
