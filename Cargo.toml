@@ -6,6 +6,7 @@ members = [
     "crates/indexer",
     "crates/llm",
     "crates/agent",
+    "crates/store",
     "crates/core",
 ]
 
@@ -65,6 +66,15 @@ encoding_rs = "0.8"
 sha2 = "0.10"
 trash = "3.3"
 
+# 持久化（M5 切片一）：只开 SQLite 驱动 + 迁移宏；libsqlite3 随二进制内嵌编译，
+# 不依赖用户机器上的 sqlite3.dll。查询走运行时校验接口，编译期不需要 DATABASE_URL。
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+    "macros",
+    "migrate",
+] }
+
 # Windows 专用（M4 切片二）：Job Object 保证超时后整棵进程树被回收
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
@@ -79,6 +89,7 @@ ai-ide-workspace = { path = "crates/workspace" }
 ai-ide-indexer = { path = "crates/indexer" }
 ai-ide-llm = { path = "crates/llm" }
 ai-ide-agent = { path = "crates/agent" }
+ai-ide-store = { path = "crates/store" }
 
 [profile.release]
 lto = "thin"

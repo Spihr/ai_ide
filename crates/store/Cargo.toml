@@ -1,0 +1,27 @@
+[package]
+name = "ai-ide-store"
+description = "AI IDE 持久化层（M5 切片一）：sqlx + SQLite 迁移、会话与消息读写"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ai-ide-protocol = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+# sqlx 0.8：只开 SQLite 驱动 + 迁移 + 派生宏。
+# 走运行时校验的 query/query_as（非 query! 宏），因此编译期不需要 DATABASE_URL，
+# 也没有 .sqlx 离线缓存负担。
+sqlx = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
