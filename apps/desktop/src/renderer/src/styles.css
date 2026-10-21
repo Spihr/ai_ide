@@ -869,3 +869,107 @@ button {
 .status__spacer {
   flex: 1;
 }
+
+/* ---------- Agent 运行与审批（M4） ---------- */
+
+.agent-run {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #101318;
+}
+
+.agent-run__head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.agent-run__goal {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-run__status {
+  flex: none;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.agent-approval {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 7px 8px;
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: 6px;
+  background: #101318;
+}
+
+/* 风险等级只靠左边框颜色区分：低=常规，中=提示色，高=告警色。 */
+.agent-approval--low {
+  border-left-color: var(--border);
+}
+
+.agent-approval--medium {
+  border-left-color: var(--accent);
+}
+
+.agent-approval--high {
+  border-left-color: var(--bad);
+}
+
+.agent-approval__head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.agent-approval__risk {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.agent-approval--high .agent-approval__risk {
+  color: var(--bad);
+}
+
+.agent-approval--medium .agent-approval__risk {
+  color: var(--accent);
+}
+
+.agent-approval__tool {
+  color: var(--text);
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12px;
+}
+
+.agent-approval__reason {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.agent-approval__args {
+  max-height: 140px;
+  margin: 0;
+  padding: 5px 7px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: #0c0f13;
+  color: var(--text);
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}

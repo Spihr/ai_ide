@@ -48,7 +48,18 @@ const RENDERER_ALLOWED = new Set<string>([
   Methods.llm.chatStream,
   Methods.llm.cancel,
   Methods.llm.listModels,
-  Methods.llm.countTokens
+  Methods.llm.countTokens,
+
+  // M4：Agent 运行。三条方法都是「用户显式动作」的产物，没有自动发起的路径：
+  // `agent.start` 由按下「启动」触发，`agent.stop` 由按下「停止」触发，
+  // `agent.decide` 只能由用户对某一次 `agent.approval_required` 按下裁决触发。
+  //
+  // 注意这里放行的是**发起**，不是**放行工具**：具体某个工具调用要不要执行，由内核
+  // 的权限闸门按策略判定，闸门要问用户时走 `agent.approval_required` 通知。外壳
+  // 因此不存在「绕过闸门」的入口——`permissions_override` 在 UI 上根本没有控件。
+  Methods.agent.start,
+  Methods.agent.stop,
+  Methods.agent.decide
 ])
 
 export interface PolicyDecision {

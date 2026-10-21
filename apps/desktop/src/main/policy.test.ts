@@ -53,9 +53,18 @@ describe('checkRendererCall', () => {
     }
   })
 
+  it('放行 M4 的 Agent 运行方法', () => {
+    const methods = [Methods.agent.start, Methods.agent.stop, Methods.agent.decide]
+
+    for (const method of methods) {
+      expect(checkRendererCall(method).allowed, `${method} 应被放行`).toBe(true)
+    }
+  })
+
   it('拦截白名单之外的方法，并给出原因', () => {
     // core.hello / core.shutdown 是主进程自用的握手与退出；workspace.chmod、agent.run
-    // 之类内核根本没实现，也不该被 UI 调用
+    // 之类内核根本没实现（M4 的三条是 agent.start / stop / decide，没有 agent.run），
+    // 也不该被 UI 调用
     const methods = [
       Methods.core.hello,
       Methods.core.shutdown,
@@ -84,6 +93,9 @@ describe('checkRendererCall', () => {
 
   it('白名单保持在最小集', () => {
     expect([...allowedRendererMethods()].sort()).toEqual([
+      'agent.decide',
+      'agent.start',
+      'agent.stop',
       'core.ping',
       'core.stats',
       'llm.cancel',

@@ -29,6 +29,7 @@ import {
 
 import type { AiEvent, CredentialStatus } from '../../shared/ipc'
 import { aiApi } from './ai-api'
+import { handleAgentEvent } from './agent-store'
 import {
   buildChatContext,
   chipEstimateText,
@@ -812,6 +813,14 @@ export function handleAiEvent(event: AiEvent): void {
 
   if (method === Methods.event.providerChanged) {
     void refreshProviders()
+    return
+  }
+
+  // M4：`agent.*` 全家交给 agent 状态那一侧（运行表 + 待裁决队列）。放在这里分流的
+  // 理由是**订阅只有一条**——`initAi()` 在进程启动时订阅一次并常驻，Agent 面板
+  // 与对话面板各自订阅会得到两倍的 `window.aiide` 监听器，事件也就发两份。
+  if (method.startsWith('agent.')) {
+    handleAgentEvent(event)
     return
   }
 

@@ -39,7 +39,7 @@ export const IpcChannels = {
   credentialsForget: 'credentials:forget',
   /** 主进程 → 渲染进程：密钥托管状态变更 */
   credentialsStatusChanged: 'credentials:status-changed',
-  /** 主进程 → 渲染进程：M2 事件（`provider.changed` / `llm.*`） */
+  /** 主进程 → 渲染进程：M2/M4 事件（`provider.changed` / `llm.*` / `agent.*`） */
   aiEvent: 'ai:event'
 } as const
 
@@ -96,9 +96,9 @@ export interface CredentialStatus {
   lastError: string | null
 }
 
-/** M2 事件向渲染进程的转发载荷：`provider.changed` 与 `llm.*`。 */
+/** 内核 → 渲染进程的转发载荷：`provider.changed`、`llm.*` 与 `agent.*`。 */
 export interface AiEvent {
-  /** 内核通知的方法名，如 `llm.delta`。 */
+  /** 内核通知的方法名，如 `llm.delta`、`agent.approval_required`。 */
   method: string
   /** 通知载荷（形状与 Rust 协议一致，字段为 snake_case）。 */
   params: unknown
@@ -122,7 +122,7 @@ export interface AiIdeApi {
   getCredentialStatus: () => Promise<CredentialStatus>
   /** 撤销某个 Provider 的密钥托管，返回更新后的状态。 */
   forgetCredential: (providerId: string) => Promise<CredentialStatus>
-  /** 订阅 M2 事件（`provider.changed` / `llm.*`），返回取消订阅函数。 */
+  /** 订阅 M2/M4 事件（`provider.changed` / `llm.*` / `agent.*`），返回取消订阅函数。 */
   onAiEvent: (listener: (event: AiEvent) => void) => () => void
   /** 订阅密钥托管状态变更，返回取消订阅函数。 */
   onCredentialStatus: (listener: (status: CredentialStatus) => void) => () => void

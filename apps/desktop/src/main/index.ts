@@ -182,8 +182,8 @@ async function startCore(): Promise<CoreStatus> {
 
   instance.on('stderr', (chunk) => pushLog(chunk))
   instance.on('notification', (method, params) => {
-    // 工作区事件走各自专用通道，M2 的 `provider.changed` / `llm.*` 走统一 AI 事件通道；
-    // 其余通知只留在内核日志里。
+    // 工作区事件走各自专用通道，M2 的 `provider.changed` / `llm.*` 与 M4 的
+    // `agent.*` 走统一 AI 事件通道；其余通知只留在内核日志里。
     const channel =
       method === Methods.event.workspaceChanged
         ? IpcChannels.workspaceChanged
