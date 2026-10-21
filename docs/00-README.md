@@ -14,7 +14,7 @@ AIGC:
 模型可插拔的 AI 原生代码编辑器。技术栈：**Electron + React + TypeScript（外壳/UI） + Rust（内核）**。
 
 > 文档状态：v0.1（设计基线，待审阅）
-> 实现状态：**M0 / M1 / M2 已完成并通过实测验收；M3 已完成（上下文引用注入与预算裁剪、`@` 引用外壳链路、编辑器侧引用、`llm.count_tokens` 精确计数、`compress.strategy` 分流），M4 起尚未开工**（截至 2026-10-20）。本套文档撰写于编码之前，部分表述已与实现不符，凡有冲突以本文「实现状态」章节为准。
+> 实现状态：**M0 / M1 / M2 / M3 已完成并通过实测验收；M4（Agent 闭环）内核与外壳主线已完成**（Agent 循环与 8 个工具、权限闸门四动作、`agent.*` 协议与 `crates/core` 接线、外壳运行面板与审批 UI），遗留端到端脚本化基线与真实上游实跑，详见 [10-M4-验收报告.md](./10-M4-验收报告.md)；**M5 起尚未开工**（截至 2026-10-21）。本套文档撰写于编码之前，部分表述已与实现不符，凡有冲突以本文「实现状态」章节为准。
 
 ---
 
@@ -42,7 +42,8 @@ AIGC:
 | M1 | 编辑器壳 | 已完成，实测见 [07-M1-验收报告.md](./07-M1-验收报告.md) |
 | M2 | 模型接入 | 已完成（内核 + 外壳）：`provider.*` / `model.*` / `llm.*` 共新增 11 个请求方法，能力清单方法数 16 → 27；Provider 设置面板、密钥 `safeStorage` 托管、流式对话 / 取消 / 错误分类全链路可跑，实测见 [08-M2-验收报告.md](./08-M2-验收报告.md)。遗留：真实厂商接口与首 token 时延未实测 |
 | M3 | 上下文引用 | 已完成：`context.refs` 注入与预算裁剪、`truncate` / 离线 `summarize` 分流、tiktoken 按模型族精确计数，实测见 [09-M3-验收报告.md](./09-M3-验收报告.md)。遗留：tree-sitter 符号表、模型摘要、真实上游未验证 |
-| M4–M8 | Agent 闭环 / 持久化 / 终端与 Git / MCP / 打包 | 未开工 |
+| M4 | Agent 闭环 | 已完成（内核 + 外壳主线）：`crates/agent` 循环调度与 8 个工具、权限闸门四动作、`agent.start` / `stop` / `decide` 协议与 `crates/core` 接线、外壳运行面板与审批卡片，实测见 [10-M4-验收报告.md](./10-M4-验收报告.md)。遗留：端到端脚本化基线、真实上游模型实跑 |
+| M5–M8 | 持久化 / 终端与 Git / MCP / 打包 | 未开工 |
 
 ### 已落地的技术栈（实测）
 
@@ -52,7 +53,7 @@ AIGC:
 | UI | React 19 + TypeScript 5.6 + Monaco 0.57 | 状态管理为手写 store（`useSyncExternalStore` 订阅），未引入第三方状态库 |
 | 样式 | 手写 CSS | 未引入 Tailwind / Radix 等 UI 框架 |
 | 测试 | Vitest 3 + playwright-core | 前端单测 + Electron 真界面 E2E |
-| 内核 | Rust 2021（rust-version 1.79）+ tokio | 五个 crate：`protocol` / `workspace` / `indexer` / `llm` / `core` |
+| 内核 | Rust 2021（rust-version 1.79）+ tokio | 六个 crate：`protocol` / `workspace` / `indexer` / `llm` / `agent` / `core` |
 | 通信 | JSON-RPC 2.0 over stdio（NDJSON） | 帧与 DTO 定义在 `crates/protocol`，TS 类型由 ts-rs 生成 |
 
 > `02-系统架构设计.md` 中的技术栈清单（React 18、Zustand、Tailwind、Radix、features 分层等）与实测**存在偏差**，属待拍板事项，未擅自改写。
@@ -69,9 +70,9 @@ AIGC:
 
 ### 尚未实现（设计图纸状态）
 
-- 协议面：`session.*` / `agent.*` / `terminal.*` / `git.*` / `mcp.*` / `permission.*` / `search.symbols` / `workspace.indexed` / `core.log` 主动推送（`DECLARED_NOT_IMPLEMENTED` 目前为空表，这些方法尚未进协议常量表）
-- 模块：`crates/agent` / `mcp` / `terminal` / `store` / `parser`（`crates/llm` 已创建，见上）
-- 界面：M2 的 Provider 配置 / 对话面板与 M3 的 `@` 补全、引用 chip 已接入渲染端；Inline Edit（Ctrl+K）、Tab 补全、LSP、会话历史 UI 未开工
+- 协议面：`session.*` / `terminal.*` / `git.*` / `mcp.*` / `permission.*` / `search.symbols` / `workspace.indexed` / `core.log` 主动推送（`DECLARED_NOT_IMPLEMENTED` 目前为空表，这些方法尚未进协议常量表；M4 的 `agent.*` 已接线并进入 `IMPLEMENTED`）
+- 模块：`mcp` / `terminal` / `store` / `parser`（`crates/agent` 已创建，见上）
+- 界面：M2 的 Provider 配置 / 对话面板与 M3 的 `@` 补全、引用 chip、M4 的 Agent 运行面板与审批卡片均已接入渲染端；Inline Edit（Ctrl+K）、Tab 补全、LSP、会话历史 UI 未开工
 
 ### 质量门禁实测（2026-10-20，M3 收尾）
 

@@ -62,7 +62,7 @@ pub mod llm {
     pub const COUNT_TOKENS: &str = "llm.count_tokens";
 }
 
-/// Agent 运行时（M4 第三切片：协议面先行定义，`crates/core` 的接线在下一轮）。
+/// Agent 运行时（M4：协议面先定稿，`crates/core` 的接线随后落地）。
 pub mod agent {
     pub const START: &str = "agent.start";
     pub const STOP: &str = "agent.stop";
@@ -108,10 +108,10 @@ pub mod event {
 /// 调用不会返回 `-32601`。协议里**定义了但还没接线**的方法见
 /// [`DECLARED_NOT_IMPLEMENTED`]。
 ///
-/// M4 第三切片的例外：`agent.*` 三个方法按里程碑安排**先登记、后接线**——协议与
-/// DTO 已定稿，`crates/core` 的 dispatch 分支在下一轮落地。在这之前 `core.hello`
-/// 会把这三项一并报成能力，外壳若照单调进会拿到 `-32601`；接线那轮必须把这段
-/// 说明删掉。
+/// M4 第三切片的 `agent.*` 曾按「先登记、后接线」暂时留在这里：协议与 DTO 先行
+/// 定稿，`crates/core` 的 dispatch 分支随后落地（见 `crates/core/src/dispatch.rs`
+/// 的三处 `methods::agent::*` 分支与 `crates/core/src/agent_api.rs`）。接线已完成，
+/// 这三项与其余方法同等——报成能力就能真路由。
 pub const IMPLEMENTED: &[&str] = &[
     core::HELLO,
     core::PING,
@@ -140,7 +140,7 @@ pub const IMPLEMENTED: &[&str] = &[
     llm::CANCEL,
     llm::LIST_MODELS,
     llm::COUNT_TOKENS,
-    // M4 第三切片：协议面先行定义（接线在下一轮，见上方说明）。
+    // M4 第三切片：agent 运行时（协议面与 core 接线均已落地）。
     agent::START,
     agent::STOP,
     agent::DECIDE,
@@ -149,9 +149,10 @@ pub const IMPLEMENTED: &[&str] = &[
 /// 协议面**已定义、但内核尚未接线**的方法。
 ///
 /// **M2 收尾后本表为空**：`provider.*` / `model.*` / `llm.*` 都已接进
-/// `crates/core` 的 `dispatch.rs`。空表不是「这个机制没用」——它是给后续里程碑
-/// （M3 会话、M4 Agent、M5 终端…）留的位置：协议先行定义、实现后补，谁没接线
-/// 谁就待在这里。
+/// `crates/core` 的 `dispatch.rs`（M4 的 `agent.*` 也已接线，直接进
+/// [`IMPLEMENTED`]）。空表不是「这个机制没用」——它是给后续里程碑
+/// （M5 持久化、M6 终端与 Git、M7 MCP…）留的位置：协议先行定义、实现后补，
+/// 谁没接线谁就待在这里。
 ///
 /// 它们**不能**出现在 [`IMPLEMENTED`] 里：`IMPLEMENTED` 会经 `core.hello`
 /// 回报给 Main 作为能力清单，一旦虚报，Main 会照单调用、然后拿到一片 `-32601`。
@@ -176,7 +177,7 @@ mod tests {
         assert!(IMPLEMENTED.contains(&llm::CANCEL));
         assert!(IMPLEMENTED.contains(&llm::LIST_MODELS));
         assert!(IMPLEMENTED.contains(&llm::COUNT_TOKENS));
-        // M4 第三切片：`agent.*` 三个方法进清单（协议面先行，`core` 接线下一轮）。
+        // M4 第三切片：`agent.*` 三个方法进清单（协议面与 core 接线均已落地）。
         assert!(IMPLEMENTED.contains(&agent::START));
         assert!(IMPLEMENTED.contains(&agent::STOP));
         assert!(IMPLEMENTED.contains(&agent::DECIDE));
