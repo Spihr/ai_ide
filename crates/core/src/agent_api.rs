@@ -321,8 +321,7 @@ pub async fn start(peer: &Peer, state: &AppState, req: &Request) {
                 }
                 Ok(Err(err)) => return peer.respond_error(&req.id, &workspace_error(&err)).await,
                 Err(join_err) => {
-                    let err =
-                        ErrorObject::internal(format!("上下文引用任务异常退出：{join_err}"));
+                    let err = ErrorObject::internal(format!("上下文引用任务异常退出：{join_err}"));
                     return peer.respond_error(&req.id, &err).await;
                 }
             }
@@ -350,8 +349,13 @@ pub async fn start(peer: &Peer, state: &AppState, req: &Request) {
     }
 
     // 7) 先回结果，再开跑：`{run_id}` 是「已受理」的回执，内容是后续事件的事。
-    peer.respond(&req.id, &AgentStartResult { run_id: run_id.clone() })
-        .await;
+    peer.respond(
+        &req.id,
+        &AgentStartResult {
+            run_id: run_id.clone(),
+        },
+    )
+    .await;
 
     let ctx = RunCtx {
         peer: run_peer,
@@ -468,7 +472,8 @@ pub async fn decide(peer: &Peer, state: &AppState, req: &Request) {
                 approval_id = %params.approval_id,
                 "裁决未命中待决询问，按幂等返回 ok:false"
             );
-            peer.respond(&req.id, &AgentDecideResult { ok: false }).await;
+            peer.respond(&req.id, &AgentDecideResult { ok: false })
+                .await;
         }
         DecideOutcome::Mismatch => {
             let err = ErrorObject::new(
@@ -645,10 +650,9 @@ async fn run_loop(
                 AgentRunStatus::Cancelled,
                 last_assistant_text(&outcome.messages),
             ),
-            StopReason::MaxRounds { .. } | StopReason::MaxSteps { .. } => (
-                AgentRunStatus::Failed,
-                Some(exhausted_summary(&outcome)),
-            ),
+            StopReason::MaxRounds { .. } | StopReason::MaxSteps { .. } => {
+                (AgentRunStatus::Failed, Some(exhausted_summary(&outcome)))
+            }
         },
         Err(err) => (AgentRunStatus::Failed, Some(err.to_string())),
     }
@@ -704,7 +708,11 @@ impl ModelTurn for ProviderTurn {
         let chat = ChatRequest {
             model: self.model_ref.clone(),
             messages: request.messages,
-            tools: if self.tools { request.tools } else { Vec::new() },
+            tools: if self.tools {
+                request.tools
+            } else {
+                Vec::new()
+            },
             tool_choice: if self.tools {
                 Some(ToolChoice::Auto)
             } else {
@@ -837,7 +845,11 @@ impl Decider for PeerDecider {
             return Some(ApprovalReply::new(ApprovalDecision::AllowOnce));
         }
 
-        let approval_id = format!("{}-{}", self.run_id, self.seq.fetch_add(1, Ordering::Relaxed));
+        let approval_id = format!(
+            "{}-{}",
+            self.run_id,
+            self.seq.fetch_add(1, Ordering::Relaxed)
+        );
         let (tx, mut rx) = oneshot::channel::<ApprovalReply>();
         if !self.hub.register_approval(&approval_id, &self.run_id, tx) {
             warn!(approval_id = %approval_id, "审批 id 冲突，按拒绝处理");
@@ -1052,7 +1064,10 @@ mod tests {
             reason: "写入工作区文件".into(),
         };
 
-        let denied = decider.decide(&request("run_command")).await.expect("要有答复");
+        let denied = decider
+            .decide(&request("run_command"))
+            .await
+            .expect("要有答复");
         assert_eq!(denied.decision, ApprovalDecision::DenyWithReason);
         assert!(denied.reason.is_some(), "拒绝理由要能回灌给模型");
 
@@ -1060,7 +1075,10 @@ mod tests {
         assert_eq!(allowed.decision, ApprovalDecision::AllowOnce);
 
         // 两条都命中覆盖表：拒绝优先，与协议注释一致。
-        let both = decider.decide(&request("run_command")).await.expect("要有答复");
+        let both = decider
+            .decide(&request("run_command"))
+            .await
+            .expect("要有答复");
         assert_eq!(both.decision, ApprovalDecision::DenyWithReason);
 
         // 覆盖表放行 / 判拒都不该产生待决询问（没打扰用户）。
@@ -1083,7 +1101,10 @@ mod tests {
     fn pending_call_drops_nameless_remnants() {
         let mut call = PendingCall::default();
         call.apply(None, None, "{}".into());
-        assert!(call.finish().is_none(), "没有名字的残块派发不出去，必须丢掉");
+        assert!(
+            call.finish().is_none(),
+            "没有名字的残块派发不出去，必须丢掉"
+        );
     }
 
     #[test]
@@ -1091,7 +1112,10 @@ mod tests {
         let mut call = PendingCall::default();
         call.apply(None, Some("read".into()), "{}".into());
         let done = call.finish().expect("有名即可派发");
-        assert!(!done.id.is_empty(), "缺 id 时要兜一个，否则工具结果配不上对");
+        assert!(
+            !done.id.is_empty(),
+            "缺 id 时要兜一个，否则工具结果配不上对"
+        );
     }
 
     #[test]
@@ -1161,7 +1185,10 @@ mod tests {
         };
         let note = exhausted_summary(&outcome);
         assert!(note.contains("64"), "要交代撞的是哪个上限：{note}");
-        assert!(note.contains("好了，已改完"), "也别把模型最后的话丢掉：{note}");
+        assert!(
+            note.contains("好了，已改完"),
+            "也别把模型最后的话丢掉：{note}"
+        );
     }
 
     #[test]

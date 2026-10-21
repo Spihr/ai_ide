@@ -908,11 +908,13 @@ mod tests {
         let sandbox = Sandbox::new("loop-progress-off");
         sandbox.write("a.txt", "hello\n");
 
-        let model = Scripted::new(vec![Ok(TurnReply::with_tool_calls(
-            "",
-            vec![call("c1", "read", r#"{"path":"a.txt"}"#)],
-        )),
-            Ok(TurnReply::text_only("done"))]);
+        let model = Scripted::new(vec![
+            Ok(TurnReply::with_tool_calls(
+                "",
+                vec![call("c1", "read", r#"{"path":"a.txt"}"#)],
+            )),
+            Ok(TurnReply::text_only("done")),
+        ]);
         let registry = ToolRegistry::core();
 
         let outcome = AgentLoop::new(&model, &registry)
