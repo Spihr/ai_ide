@@ -1,0 +1,67 @@
+# AI IDE 桌面应用打包配置（electron-builder）
+#
+# 关键约束（详见 docs 打包方案）：
+#   1. Rust 内核二进制**绝不能进 asar**——asar 内条目无法被 spawn，
+#      且 existsSync 通过、执行失败，错误更隐蔽。故走 extraResources 落到
+#      <安装目录>/resources/core/，与主进程 resolveCoreBinary() 的打包态分支对齐。
+#   2. `files` 取白名单语义：asar 内只放三段式 bundle 与 package.json。
+#      main/preload 已把 workspace 内部包（@ai-ide/shared-types）内联进 bundle，
+#      renderer 依赖已全部打进产物，运行期只依赖 electron 自身与 Node 内建模块。
+appId: com.aiide.desktop
+productName: AI IDE
+copyright: Copyright © 2026 AI IDE
+
+directories:
+  output: release
+  buildResources: build
+
+files:
+  - out/**
+  - package.json
+  # pnpm 软链的 node_modules 会被打包器误当作生产依赖全量收集（实测含 eslint/vitest 等
+  # devDependencies，体积 +107MB），而运行期并不需要任何外部包：main/preload 已内联
+  # workspace 内部包，renderer 依赖已打进 bundle。故显式排除。
+  - '!node_modules/**/*'
+  - '!node_modules'
+
+# 内核二进制由 `pnpm prepack:core` 预先复制到 build/core/，此处只做目录映射。
+extraResources:
+  - from: build/core
+    to: core
+
+asar: true
+
+# 无原生模块需要重编译；pnpm workspace 下也不走打包器的依赖重装链路。
+npmRebuild: false
+nodeGypRebuild: false
+buildDependenciesFromSource: false
+
+win:
+  icon: build/icon.ico
+  target:
+    - target: nsis
+      arch:
+        - x64
+  artifactName: AI-IDE-${version}-win-x64.${ext}
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: AI IDE
+  # 用户数据（userData：会话 / 密钥 / 索引）不在安装目录，卸载时保留，
+  # 具体保留策略待产品口径确认后调整（见打包方案 §6 风险 12）。
+  deleteAppDataOnUninstall: false
+  runAfterFinish: false
+
+linux:
+  icon: build/icons
+  target:
+    - AppImage
+
+mac:
+  icon: build/icon.png
+  target:
+    - dmg

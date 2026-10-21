@@ -21,6 +21,12 @@ release/
 *.msi
 *.nsis
 
+# 打包图标资源需入库（apps/desktop/electron-builder.yml 的 buildResources 指向它）：
+# 由 scripts/gen-icons.mjs 生成，勿手工编辑。其中 build/core/ 是 prepack:core 产出的
+# 内核二进制与 manifest（平台相关、体积大），仍不入库。
+!apps/desktop/build/
+apps/desktop/build/core/
+
 # ---- 日志与运行时数据 ----
 *.log
 logs/
