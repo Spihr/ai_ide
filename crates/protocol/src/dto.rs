@@ -1349,6 +1349,219 @@ pub struct AgentFinishedEvent {
     pub summary: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// session.* —— 会话与消息（M5）
+// ---------------------------------------------------------------------------
+
+/// 一条会话的对外视图。
+///
+/// 只回 `workspace_path` 而不回 `workspace_id`：工作区 id 是运行期句柄，重启后
+/// 由 Main 重新打开才存在；落盘的是绝对路径，它才是跨进程稳定的身份。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SessionView {
+    pub session_id: String,
+    pub title: String,
+    /// 会话绑定的工作区绝对路径；跨工作区会话为空。
+    #[serde(default)]
+    pub workspace_path: Option<String>,
+    /// 会话默认模型。
+    #[serde(default)]
+    pub model_ref: Option<ModelRef>,
+    /// 创建时刻（Unix 毫秒）。
+    #[ts(type = "number")]
+    pub created_at_ms: i64,
+    /// 最后活动时刻（Unix 毫秒）：追加消息与改名都会推进。
+    #[ts(type = "number")]
+    pub updated_at_ms: i64,
+}
+
+/// 一条消息的对外视图：在 [`ChatMessage`] 之上补消息 id、所属会话与时间。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct MessageView {
+    pub message_id: String,
+    pub session_id: String,
+    /// 父消息 id（编辑重发 / 分支链）。
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    pub role: ChatRole,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub attachments: Vec<ChatAttachment>,
+    #[serde(default)]
+    pub tool_calls: Vec<ChatToolCall>,
+    /// `role = tool` 时指向被回应的调用 id。
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    /// 产生该消息时使用的模型。
+    #[serde(default)]
+    pub model_ref: Option<ModelRef>,
+    /// 上游用量（`llm.usage` 事件体，原样保存）。
+    #[serde(default)]
+    pub usage: Option<serde_json::Value>,
+    /// 创建时刻（Unix 毫秒）。
+    #[ts(type = "number")]
+    pub created_at_ms: i64,
+}
+
+/// `session.create` 请求参数。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SessionCreateParams {
+    /// 会话标题；缺省由内核生成（`新会话`）。
+    #[serde(default)]
+    pub title: Option<String>,
+    /// 绑定到已打开的工作区；不给则是跨工作区会话。
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    /// 会话默认模型。
+    #[serde(default)]
+    pub model_ref: Option<ModelRef>,
+}
+
+/// `session.create` 响应结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SessionCreateResult {
+    pub session_id: String,
+    pub session: SessionView,
+}
+
+/// `session.list` 请求参数。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SessionListParams {
+    /// 只看某个工作区的会话。
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    /// 标题关键词（大小写不敏感的子串匹配）。
+    #[serde(default)]
+    pub query: Option<String>,
+    /// 返回条数上限，缺省 50，内部夹到 1..=500。
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub limit: Option<u32>,
+    /// 偏移量，缺省 0。
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub offset: Option<u32>,
+}
+
+/// `session.list` 响应结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SessionListResult {
+    /// 按 `updated_at_ms` 倒序。
+    pub sessions: Vec<SessionView>,
+    /// 过滤条件下的命中总数（不受 `limit` / `offset` 影响）。
+    #[ts(type = "number")]
+    pub total: u64,
+}
+
+/// `session.get` 请求参数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SessionGetParams {
+    pub session_id: String,
+    /// 是否一并返回消息；缺省 `true`（新会话只有零条消息，代价可忽略）。
+    #[serde(default = "default_true")]
+    pub include_messages: bool,
+}
+
+/// `session.get` 响应结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SessionGetResult {
+    pub session: SessionView,
+    /// `include_messages=false` 时为空数组。
+    #[serde(default)]
+    pub messages: Vec<MessageView>,
+}
+
+/// `session.update` 请求参数：改名 / 换默认模型，两者至少给一个。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SessionUpdateParams {
+    pub session_id: String,
+    /// 新标题。
+    #[serde(default)]
+    pub title: Option<String>,
+    /// 新的会话默认模型。
+    #[serde(default)]
+    pub model_ref: Option<ModelRef>,
+}
+
+/// `session.delete` 请求参数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SessionDeleteParams {
+    /// 待删除的会话 id；不存在的 id 会被忽略（幂等）。
+    pub session_ids: Vec<String>,
+}
+
+/// `session.delete` 响应结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SessionDeleteResult {
+    pub ok: bool,
+    /// 实际删掉的会话数（消息随会话级联删除）。
+    #[ts(type = "number")]
+    pub deleted: u64,
+}
+
+/// `session.append_message` 请求参数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SessionAppendMessageParams {
+    pub session_id: String,
+    /// 消息本体（角色、文本、附件、工具调用）。
+    pub message: ChatMessage,
+    /// 父消息 id（编辑重发 / 分支链）。
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    /// 产生该消息时使用的模型。
+    #[serde(default)]
+    pub model_ref: Option<ModelRef>,
+    /// 上游用量 JSON。
+    #[serde(default)]
+    pub usage: Option<serde_json::Value>,
+}
+
+/// `session.append_message` 响应结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SessionAppendMessageResult {
+    pub message: MessageView,
+}
+
+/// `session.messages` 请求参数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SessionMessagesParams {
+    pub session_id: String,
+    /// 返回条数上限，缺省 200，内部夹到 1..=10000。
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub limit: Option<u32>,
+    /// 偏移量，缺省 0。
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub offset: Option<u32>,
+}
+
+/// `session.messages` 响应结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SessionMessagesResult {
+    /// 按 `created_at_ms` 正序（同毫秒按写入顺序）。
+    pub messages: Vec<MessageView>,
+    /// 该会话的消息总数（不受 `limit` / `offset` 影响）。
+    #[ts(type = "number")]
+    pub total: u64,
+}
+
 /// 布尔字段的 serde 默认值：`true`。
 fn default_true() -> bool {
     true
@@ -1541,5 +1754,58 @@ mod tests {
             serde_json::from_value::<AgentStopResult>(json).unwrap(),
             stopped
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // session.*（M5）
+    // -----------------------------------------------------------------------
+
+    /// `session.create` 参数全部可选：`{}` 就该能建一个默认标题的会话。
+    #[test]
+    fn session_create_params_are_all_optional() {
+        let params: SessionCreateParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(params, SessionCreateParams::default());
+        assert!(params.title.is_none());
+        assert!(params.workspace_id.is_none());
+    }
+
+    /// `include_messages` 缺省为 `true`——客户端只给 `session_id` 也应拿到历史。
+    #[test]
+    fn session_get_defaults_to_include_messages() {
+        let params: SessionGetParams =
+            serde_json::from_value(serde_json::json!({ "session_id": "s1" })).unwrap();
+        assert!(params.include_messages);
+    }
+
+    /// 追加消息的参数要能直接吃下 [`ChatMessage`] 的形状。
+    #[test]
+    fn session_append_message_accepts_chat_message_shape() {
+        let params: SessionAppendMessageParams = serde_json::from_value(serde_json::json!({
+            "session_id": "s1",
+            "message": { "role": "user", "content": "读取 dispatch.rs" },
+            "parent_id": null,
+        }))
+        .unwrap();
+        assert_eq!(params.session_id, "s1");
+        assert_eq!(params.message.role, ChatRole::User);
+        assert_eq!(params.message.content, "读取 dispatch.rs");
+        assert!(params.usage.is_none());
+    }
+
+    /// 毫秒时间戳必须以 number 出网，不能被当成字符串。
+    #[test]
+    fn session_view_keeps_timestamps_as_numbers() {
+        let view = SessionView {
+            session_id: "s1".into(),
+            title: "轮次一".into(),
+            workspace_path: Some("E:/ai_ide".into()),
+            model_ref: None,
+            created_at_ms: 1_700_000_000_000,
+            updated_at_ms: 1_700_000_000_500,
+        };
+        let json = serde_json::to_value(&view).unwrap();
+        assert!(json["created_at_ms"].is_number());
+        assert!(json["updated_at_ms"].is_number());
+        assert_eq!(serde_json::from_value::<SessionView>(json).unwrap(), view);
     }
 }

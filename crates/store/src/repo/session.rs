@@ -134,6 +134,29 @@ impl Store {
         Ok(result.rows_affected() > 0)
     }
 
+    /// 更新会话默认模型；`updated_at` 同样只增不减。返回是否命中一行。
+    ///
+    /// 没有「清空模型」分支：`model_ref` 传值一律解释为「改成它」，调用方真要清空
+    /// 得走新的显式字段——静默把模型抹掉会让会话突然失去默认模型，比多一条协议
+    /// 字段更贵。
+    pub async fn set_session_model(
+        &self,
+        id: &str,
+        model_ref: &ai_ide_protocol::ModelRef,
+        updated_at: i64,
+    ) -> Result<bool> {
+        let model_ref_json = encode_model_ref(&Some(model_ref.clone()))?;
+        let result = sqlx::query(
+            "UPDATE session SET model_ref_json = ?1, updated_at = MAX(updated_at, ?2) WHERE id = ?3",
+        )
+        .bind(model_ref_json)
+        .bind(updated_at)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// 删除会话及其全部消息（同一事务内先删消息再删会话）。返回会话是否原本存在。
     ///
     /// 说明：SQLite 默认不开 `ON DELETE CASCADE`，这里显式删子表，删除语义不依赖外键配置。

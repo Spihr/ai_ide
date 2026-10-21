@@ -96,6 +96,23 @@ async fn session_crud_round_trip() {
         vec![created.id.clone(), other.id.clone()]
     );
 
+    // 会话默认模型可改；`updated_at` 与改名同口径（只增不减）。
+    let switched = ModelRef {
+        provider_id: "provider-2".to_string(),
+        model_id: "model-2".to_string(),
+    };
+    assert!(store
+        .set_session_model(&created.id, &switched, 1_700_000_004_000)
+        .await
+        .unwrap());
+    let re_modelled = store.get_session(&created.id).await.unwrap().unwrap();
+    assert_eq!(re_modelled.model_ref, Some(switched));
+    assert_eq!(re_modelled.updated_at, 1_700_000_004_000);
+    assert!(!store
+        .set_session_model("missing", &demo_model_ref(), 1_700_000_005_000)
+        .await
+        .unwrap());
+
     // 工作区过滤 + 计数 + 分页
     assert_eq!(store.count_sessions(None).await.unwrap(), 2);
     assert_eq!(store.count_sessions(Some("E:/ai_ide")).await.unwrap(), 1);

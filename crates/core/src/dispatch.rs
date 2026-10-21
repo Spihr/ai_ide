@@ -9,6 +9,7 @@ use crate::agent_api;
 use crate::llm_api;
 use crate::peer::Peer;
 use crate::provider_api;
+use crate::session_api;
 use crate::state::{now_ms, AppState};
 use crate::sysinfo;
 use crate::version::CORE_VERSION;
@@ -100,6 +101,15 @@ async fn handle_request(peer: &Peer, state: &AppState, req: Request) {
         methods::agent::START => agent_api::start(peer, state, &req).await,
         methods::agent::STOP => agent_api::stop(peer, state, &req).await,
         methods::agent::DECIDE => agent_api::decide(peer, state, &req).await,
+
+        // 会话与消息（M5）：落盘在 crates/store，这里只做协议翻译
+        methods::session::CREATE => session_api::create(peer, state, &req).await,
+        methods::session::LIST => session_api::list(peer, state, &req).await,
+        methods::session::GET => session_api::get(peer, state, &req).await,
+        methods::session::UPDATE => session_api::update(peer, state, &req).await,
+        methods::session::DELETE => session_api::delete(peer, state, &req).await,
+        methods::session::APPEND_MESSAGE => session_api::append_message(peer, state, &req).await,
+        methods::session::MESSAGES => session_api::messages(peer, state, &req).await,
 
         other => {
             warn!(method = %other, "未实现的方法");

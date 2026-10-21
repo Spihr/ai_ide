@@ -8,9 +8,10 @@ use crate::llm_api::StreamHub;
 use crate::llm_runtime::{default_store_path, LlmRuntime};
 use crate::peer::Peer;
 use ai_ide_indexer::FileIndex;
+use ai_ide_store::Store;
 use ai_ide_workspace::{Workspace, WorkspaceError, WorkspaceManager};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// 全局状态。
@@ -37,6 +38,11 @@ pub struct AppState {
     /// 在途 agent 运行的登记表（M4）。与 `streams` 同理：`agent.stop` / `agent.decide`
     /// 都是独立报文，需要按 `run_id` / `approval_id` 找到那条运行或那条待决询问。
     agents: Arc<AgentHub>,
+    /// 会话与消息库（M5）。进程启动时连一次，此后只读句柄。
+    ///
+    /// 用 `OnceLock` 而不是 `Mutex<Option<..>>`：它只写一次，写入发生在开始读 stdin
+    /// 之前；读侧因此不必上锁，`session.*` 也就不会因为拿锁而排在同一条队列里。
+    store: OnceLock<Store>,
 }
 
 impl Default for AppState {
@@ -58,6 +64,7 @@ impl AppState {
             llm: LlmRuntime::new(default_store_path()),
             streams: Arc::new(StreamHub::new()),
             agents: Arc::new(AgentHub::new()),
+            store: OnceLock::new(),
         }
     }
 
@@ -79,6 +86,18 @@ impl AppState {
     /// 在途 agent 运行的登记表（M4）。
     pub fn agent(&self) -> Arc<AgentHub> {
         Arc::clone(&self.agents)
+    }
+
+    /// 装上会话库（M5）。重复调用保留第一次装上的那份——库句柄是进程级资源，
+    /// 换掉它只会让已建立的连接泄漏。
+    pub fn install_store(&self, store: Store) {
+        let _ = self.store.set(store);
+    }
+
+    /// 会话库；启动时未能连接（目录不可写 / 迁移失败）则为 `None`，
+    /// 此时 `session.*` 如实返回 5002 而不是假装成功。
+    pub fn store(&self) -> Option<&Store> {
+        self.store.get()
     }
 
     /// 换上一个现成的模型接入运行时。
@@ -236,5 +255,12 @@ mod tests {
         let ts = now_ms();
         assert!(ts > 1_577_836_800_000, "时间戳看起来不对: {ts}");
         assert!(ts < 4_102_444_800_000, "时间戳看起来不对: {ts}");
+    }
+
+    /// 没装库的状态必须自曝其短：`session.*` 靠这个 `None` 报 5002。
+    #[test]
+    fn store_is_absent_until_installed() {
+        let state = AppState::new();
+        assert!(state.store().is_none());
     }
 }

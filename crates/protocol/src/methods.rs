@@ -69,6 +69,17 @@ pub mod agent {
     pub const DECIDE: &str = "agent.decide";
 }
 
+/// 会话与消息（M5：落盘在 `crates/store`，`crates/core` 只做协议翻译）。
+pub mod session {
+    pub const CREATE: &str = "session.create";
+    pub const LIST: &str = "session.list";
+    pub const GET: &str = "session.get";
+    pub const UPDATE: &str = "session.update";
+    pub const DELETE: &str = "session.delete";
+    pub const APPEND_MESSAGE: &str = "session.append_message";
+    pub const MESSAGES: &str = "session.messages";
+}
+
 /// Core → Main 的通知（事件）。
 pub mod event {
     /// 内核日志转发，便于 Main 侧统一落盘。
@@ -144,6 +155,14 @@ pub const IMPLEMENTED: &[&str] = &[
     agent::START,
     agent::STOP,
     agent::DECIDE,
+    // M5 切片二：会话与消息（crates/store 之上的协议接线）。
+    session::CREATE,
+    session::LIST,
+    session::GET,
+    session::UPDATE,
+    session::DELETE,
+    session::APPEND_MESSAGE,
+    session::MESSAGES,
 ];
 
 /// 协议面**已定义、但内核尚未接线**的方法。
@@ -165,7 +184,7 @@ mod tests {
 
     #[test]
     fn implemented_list_covers_core_m1_m2_agent_domains() {
-        assert_eq!(IMPLEMENTED.len(), 30);
+        assert_eq!(IMPLEMENTED.len(), 37);
         assert!(IMPLEMENTED.contains(&"core.ping"));
         assert!(IMPLEMENTED.contains(&"$/cancelRequest"));
         assert!(IMPLEMENTED.contains(&"workspace.read_file"));
@@ -181,6 +200,14 @@ mod tests {
         assert!(IMPLEMENTED.contains(&agent::START));
         assert!(IMPLEMENTED.contains(&agent::STOP));
         assert!(IMPLEMENTED.contains(&agent::DECIDE));
+        // M5 切片二：`session.*` 七个方法进清单（`crates/store` 之上已接线）。
+        assert!(IMPLEMENTED.contains(&session::CREATE));
+        assert!(IMPLEMENTED.contains(&session::LIST));
+        assert!(IMPLEMENTED.contains(&session::GET));
+        assert!(IMPLEMENTED.contains(&session::UPDATE));
+        assert!(IMPLEMENTED.contains(&session::DELETE));
+        assert!(IMPLEMENTED.contains(&session::APPEND_MESSAGE));
+        assert!(IMPLEMENTED.contains(&session::MESSAGES));
     }
 
     #[test]
@@ -210,7 +237,7 @@ mod tests {
         all.sort_unstable();
         all.dedup();
         assert_eq!(all.len(), total, "两张表不得有重叠");
-        assert_eq!(total, 30, "应恰好覆盖协议里定义的全部 30 个请求方法");
+        assert_eq!(total, 37, "应恰好覆盖协议里定义的全部 37 个请求方法");
     }
 
     #[test]

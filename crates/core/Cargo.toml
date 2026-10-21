@@ -17,6 +17,8 @@ ai-ide-indexer = { workspace = true }
 ai-ide-llm = { workspace = true }
 # M4 第四切片：内核接线 agent crate（协议面 `agent.*` 在上一切片已定，这里把它跑起来）。
 ai-ide-agent = { workspace = true }
+# M5 切片二：内核接线会话持久化（协议面 `session.*` 与 store 同切片落地）。
+ai-ide-store = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

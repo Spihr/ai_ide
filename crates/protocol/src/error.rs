@@ -9,6 +9,7 @@
 //! | `2xxx` | Provider / 模型 |
 //! | `3xxx` | 工具与 Agent 执行 |
 //! | `4xxx` | 运行时（取消等） |
+//! | `5xxx` | 会话持久化 |
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -52,6 +53,14 @@ impl ErrorCode {
     // ---------- 4xxx 运行时 ----------
     pub const CANCELLED: Self = Self(4001);
     pub const PROTOCOL_VERSION_MISMATCH: Self = Self(4002);
+
+    // ---------- 5xxx 会话持久化 ----------
+    /// 会话不存在：读取 / 追加消息 / 改名 / 删除都可能命中。
+    pub const SESSION_NOT_FOUND: Self = Self(5001);
+    /// 会话库未就绪：迁移失败或落盘目录不可写。
+    pub const STORE_UNAVAILABLE: Self = Self(5002);
+    /// 会话库读写失败（SQLite 或 JSON 序列化报错）。
+    pub const STORE_ERROR: Self = Self(5003);
 
     pub const fn as_i32(self) -> i32 {
         self.0
@@ -164,5 +173,14 @@ mod tests {
     fn standard_code_detection() {
         assert!(ErrorCode::PARSE_ERROR.is_standard());
         assert!(!ErrorCode::CANCELLED.is_standard());
+    }
+
+    /// 5xxx 是业务码，不能被误判成 JSON-RPC 标准错误（否则客户端会按规范错误处理）。
+    #[test]
+    fn session_error_codes_are_not_standard() {
+        assert!(!ErrorCode::SESSION_NOT_FOUND.is_standard());
+        assert!(!ErrorCode::STORE_UNAVAILABLE.is_standard());
+        assert!(!ErrorCode::STORE_ERROR.is_standard());
+        assert_eq!(ErrorCode::SESSION_NOT_FOUND.as_i32(), 5001);
     }
 }

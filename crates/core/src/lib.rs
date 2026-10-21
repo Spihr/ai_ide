@@ -41,6 +41,7 @@ pub mod llm_api;
 pub mod llm_runtime;
 pub mod peer;
 pub mod provider_api;
+pub mod session_api;
 pub mod state;
 pub mod sysinfo;
 pub mod version;
@@ -55,6 +56,11 @@ use tracing::{info, warn};
 use crate::peer::Peer;
 use crate::state::AppState;
 
+/// 会话库文件路径：与 `providers.json` 同目录（`AI_IDE_DATA_DIR` 优先）。
+fn session_store_path() -> std::path::PathBuf {
+    llm_runtime::default_data_dir().join("sessions.db")
+}
+
 /// 内核主循环：读 stdin → 分发 → 写 stdout。
 ///
 /// 每条到达的报文都会被 spawn 成一个独立任务，避免慢请求阻塞后续报文的读取；
@@ -67,6 +73,21 @@ pub async fn run() -> Result<()> {
 
     // 启动即装载落盘目录：进程重启后 Provider 列表不丢（密钥需主进程重新注入）。
     llm_runtime::report_bootstrap(state.llm().bootstrap());
+
+    // 会话库：与 `providers.json` 同目录。连不上不致命——工作区 / 模型 / Agent 能力
+    // 照常可用，`session.*` 会如实返回 5002，而不是把消息悄悄丢掉。
+    let session_db = session_store_path();
+    match ai_ide_store::Store::connect(&session_db).await {
+        Ok(store) => {
+            info!(path = %session_db.display(), "会话库已就绪");
+            state.install_store(store);
+        }
+        Err(err) => warn!(
+            path = %session_db.display(),
+            error = %err,
+            "会话库打开失败，session.* 将返回 5002"
+        ),
+    }
 
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
