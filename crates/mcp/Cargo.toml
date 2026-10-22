@@ -1,0 +1,24 @@
+[package]
+name = "ai-ide-mcp"
+description = "MCP 客户端（M7 切片一）：JSON-RPC 2.0 编解码 / stdio 与 HTTP(SSE) 传输 / 握手协商 / 工具发现与调用 / mcp.json 配置解析"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+futures-util = { workspace = true }
+
+# 集成测试要驱动一个真正的 MCP Server 子进程，用它做 stdio 端到端验证。
+# 该二进制只服务于本 crate 的测试（见 src/bin/mcp_mock_server.rs 的模块注释）。
+[[bin]]
+name = "mcp-mock-server"
+path = "src/bin/mcp_mock_server.rs"

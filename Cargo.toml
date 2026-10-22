@@ -9,6 +9,7 @@ members = [
     "crates/store",
     "crates/terminal",
     "crates/git",
+    "crates/mcp",
     "crates/core",
 ]
 
@@ -37,6 +38,10 @@ tokio = { version = "1.40", features = [
     "sync",
     "time",
     "signal",
+    # M7 切片一：stdio 传输要起 MCP Server 子进程（process），HTTP 传输要连本地/远端
+    # （net 由 reqwest 提供，测试里的内置 HTTP 桩用 tokio::net 起监听）。
+    "process",
+    "net",
 ] }
 tokio-util = { version = "0.7", features = ["rt"] }
 
@@ -102,6 +107,8 @@ ai-ide-agent = { path = "crates/agent" }
 ai-ide-store = { path = "crates/store" }
 ai-ide-terminal = { path = "crates/terminal" }
 ai-ide-git = { path = "crates/git" }
+# M7 切片一：MCP 客户端（stdio / HTTP(SSE) 传输、握手、工具发现与调用）
+ai-ide-mcp = { path = "crates/mcp" }
 
 [profile.release]
 lto = "thin"
