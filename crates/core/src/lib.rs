@@ -27,7 +27,19 @@
 //! 精确计数（`exact:true`），其余回落估算（`exact:false`），字段含义不变。
 //! 引用预算裁剪仍走估算口径，不因精确计数而改变。
 //!
-//! 后续里程碑在此骨架上继续挂载：agent / terminal / mcp / store 等模块。
+//! **`terminal.*` 已接线（M6 切片一）**：`terminal.create` / `terminal.write` /
+//! `terminal.resize` / `terminal.kill` / `terminal.list` 五个方法在 [`terminal_api`]，
+//! PTY 本体在 `crates/terminal`（Windows 走 ConPTY、Unix 走 openpty）。终端输出不走
+//! 请求-响应，而是由 [`terminal_api::pump`] 把管理器的事件通道抬成 `terminal.data` /
+//! `terminal.exit` 两条单向通知——一次 `ls` 不必等到进程退出才有回执。
+//!
+//! **`git.*` 已接线（M6 切片三）**：`git.status` / `git.diff` / `git.stage` /
+//! `git.commit` / `git.branches` 五个方法在 [`git_api`]，仓库操作在 `crates/git`
+//! （系统 git 子进程，`AI_IDE_GIT` 可覆盖可执行文件路径）。这些方法都带
+//! `workspace_id` 可选参数，缺省作用于活动工作区；同步的子进程调用统一搬进
+//! 阻塞线程池，不占 tokio worker。Git 不新增事件：索引变化已有 `workspace.changed`。
+//!
+//! 后续里程碑在此骨架上继续挂载：mcp 等模块。
 //!
 //! ## 绝对约定：stdout 只跑协议
 //!
@@ -40,6 +52,7 @@ pub mod checkpoint;
 pub mod checkpoint_api;
 pub mod context;
 pub mod dispatch;
+pub mod git_api;
 pub mod llm_api;
 pub mod llm_runtime;
 /// 结构化日志（M5 任务 4）：JSONL 按天滚动 + 出口脱敏。
@@ -51,6 +64,7 @@ pub mod session_api;
 pub mod session_export;
 pub mod state;
 pub mod sysinfo;
+pub mod terminal_api;
 pub mod version;
 pub mod ws;
 
@@ -77,6 +91,16 @@ pub async fn run() -> Result<()> {
     let peer = Arc::new(Peer::new());
     // 把对端句柄交给状态：`workspace.changed` 这类事件需要主动推送。
     state.attach_peer(Arc::clone(&peer));
+
+    // 终端事件泵：`take_events` 只能取一次，必须在任何 `terminal.create` 之前取走，
+    // 否则首个会话建立时的横向输出（shell 提示符 / banner）会随通道一起丢。
+    // 通道的生命周期与进程一致，泵任务不需要 join——进程退出时一起收走。
+    match state.terminal().take_events() {
+        Some(events) => {
+            tokio::spawn(terminal_api::pump(Arc::clone(&peer), events));
+        }
+        None => warn!("终端事件通道已被取走，terminal.data 将无法推送"),
+    }
 
     // 启动即装载落盘目录：进程重启后 Provider 列表不丢（密钥需主进程重新注入）。
     llm_runtime::report_bootstrap(state.llm().bootstrap());
@@ -144,6 +168,10 @@ pub async fn run() -> Result<()> {
     if runs > 0 {
         info!(runs, "退出：已阻断在途 agent 运行");
     }
+
+    // 终端子进程必须显式收掉：ConPTY 里的 shell 已经和内核的 stdin 脱钩，
+    // 内核一退它就成了任务管理器里谁也管不了的孤儿进程。
+    terminal_api::shutdown_all(&state);
 
     drain_inflight(&mut inflight).await;
 

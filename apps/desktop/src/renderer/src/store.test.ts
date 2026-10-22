@@ -134,7 +134,9 @@ function installHarness(): Harness {
       lastError: null
     }),
     onAiEvent: () => () => undefined,
-    onCredentialStatus: () => () => undefined
+    onCredentialStatus: () => () => undefined,
+    onTerminalData: () => () => undefined,
+    onTerminalExit: () => () => undefined
   }
 
   const confirm = vi.fn(() => true)

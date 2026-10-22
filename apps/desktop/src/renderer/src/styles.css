@@ -973,3 +973,360 @@ button {
   white-space: pre-wrap;
   word-break: break-all;
 }
+
+/* ---------- M6：底部终端面板 ---------- */
+
+.activity__item--terminal {
+  position: relative;
+  margin-top: auto;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12px;
+}
+
+.activity__badge {
+  position: absolute;
+  top: 2px;
+  right: 4px;
+  min-width: 13px;
+  padding: 0 3px;
+  border-radius: 7px;
+  background: var(--accent);
+  color: #08121d;
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 13px;
+}
+
+.terminal {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  height: 260px;
+  min-height: 120px;
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.terminal__tabs {
+  display: flex;
+  flex: none;
+  align-items: stretch;
+  gap: 2px;
+  height: 28px;
+  padding: 0 6px;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.terminal__tab {
+  display: flex;
+  flex: none;
+  align-items: center;
+  border: 1px solid transparent;
+  border-bottom: 0;
+  border-radius: 5px 5px 0 0;
+}
+
+.terminal__tab.is-active {
+  border-color: var(--border);
+  background: var(--bg);
+}
+
+.terminal__tab-label,
+.terminal__tab-close,
+.terminal__action {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.terminal__tab-label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 180px;
+  padding: 0 4px 0 8px;
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.terminal__tab.is-active .terminal__tab-label {
+  color: var(--text);
+}
+
+.terminal__tab.is-exited .terminal__tab-label {
+  color: var(--muted);
+  text-decoration: line-through;
+}
+
+.terminal__dot {
+  font-size: 8px;
+  color: var(--ok);
+}
+
+.terminal__tab.is-exited .terminal__dot {
+  color: var(--muted);
+}
+
+.terminal__tab-close {
+  width: 18px;
+  height: 18px;
+  margin-right: 3px;
+  border-radius: 4px;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.terminal__tab-close:hover,
+.terminal__action:hover:not(:disabled) {
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.terminal__action {
+  flex: none;
+  width: 24px;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.terminal__action:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.terminal__spacer {
+  flex: 1;
+}
+
+.terminal__error {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(255, 107, 107, 0.12);
+  color: var(--bad);
+  font-size: 12px;
+}
+
+.terminal__body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  padding: 4px 0 0 6px;
+}
+
+.terminal__pane {
+  position: absolute;
+  inset: 0;
+  padding: 4px 0 0 6px;
+}
+
+.terminal__host {
+  width: 100%;
+  height: 100%;
+}
+
+/* xterm 自带的 viewport 背景与外壳一致，避免边上留一圈白 */
+.terminal__host .xterm .xterm-viewport {
+  background: transparent !important;
+}
+
+.terminal__exit {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 12px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+}
+
+
+/* ---------------------------------------------------------------------------
+   M6：Git 面板
+   ---------------------------------------------------------------------------
+   两个约束决定了这里的写法：
+   1. 侧栏很窄（默认 260px），所以 diff 用等宽字体 + 横向滚动，而不是折行——折行会让
+      「- 旧行 / + 新行」在视觉上连成一片，反而看不出改了什么。
+   2. 只读展示要有稳定的行高：diff 用 grid 两列行号 + 一列正文，行号列固定宽度，
+      正文 white-space: pre 保留缩进（代码缩进是语义的一部分）。
+*/
+
+.git-branch {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.git-branch__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.git-entry-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.git-entry {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 4px;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.git-entry:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.git-entry.is-active {
+  background: rgba(90, 160, 255, 0.18);
+}
+
+.git-entry__flag {
+  flex: none;
+  width: 12px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.git-entry__flag--new {
+  color: #6cc07a;
+}
+
+.git-entry__flag--gone {
+  color: var(--bad);
+}
+
+.git-entry__flag--conflict {
+  color: #e0a44a;
+}
+
+.git-entry__flag--moved {
+  color: #7fb8ff;
+}
+
+.git-entry__path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.git-entry__orig {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.git-check {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+/* diff 区：独立滚动，避免把侧栏整体撑长后「提交框」被推到看不见的地方 */
+.git-diff {
+  margin-top: 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.git-diff__head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.git-diff__path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.git-diff__body {
+  max-height: 320px;
+  overflow: auto;
+  background: #0d1015;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.git-diff__line {
+  display: grid;
+  grid-template-columns: 34px 34px 1fr;
+  gap: 6px;
+  padding: 0 6px 0 0;
+  white-space: pre;
+}
+
+.git-diff__no {
+  color: #4b525c;
+  text-align: right;
+  user-select: none;
+}
+
+.git-diff__text {
+  white-space: pre;
+}
+
+/* hunk 头单独一行灰底：它是「跳到哪里」的路标，不该和增删行混在一起 */
+.git-diff__line--hunk {
+  background: rgba(90, 160, 255, 0.1);
+  color: #8fb6e8;
+}
+
+.git-diff__line--add {
+  background: rgba(60, 160, 90, 0.16);
+}
+
+.git-diff__line--del {
+  background: rgba(200, 70, 70, 0.16);
+}
+
+.git-diff__line--meta {
+  color: #6b737f;
+}

@@ -124,7 +124,9 @@ function installHarness(): Harness {
         listener = null
       }
     },
-    onCredentialStatus: () => () => undefined
+    onCredentialStatus: () => () => undefined,
+    onTerminalData: () => () => undefined,
+    onTerminalExit: () => () => undefined
   }
 
   vi.stubGlobal('window', { aiide: api })

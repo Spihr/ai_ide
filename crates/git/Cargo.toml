@@ -1,0 +1,12 @@
+[package]
+name = "ai-ide-git"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AI IDE 的 Git 工作区能力（M6 切片三）：状态 / diff / 暂存 / 提交 / 分支"
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true

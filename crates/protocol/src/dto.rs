@@ -2010,6 +2010,385 @@ pub struct PermissionRevokeResult {
 /// 供 TS 侧引用的导出目录常量说明（不参与序列化，仅为文档服务）。
 pub const _TS_EXPORT_DIR: &str = TS_DIR;
 
+// ---------------------------------------------------------------------------
+// terminal.*（M6 切片一：终端会话）
+// ---------------------------------------------------------------------------
+
+/// 一个终端会话的只读视图。
+///
+/// `cwd` 用字符串而非路径类型：客户端只做展示与「复制路径」，不需要内核替它
+/// 校验路径合法性。`pid` 在平台拿不到时为 `null`（例如某些沙箱里）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TerminalView {
+    /// 会话 id（UUID v4）。
+    pub id: String,
+    /// 实际启动的可执行文件路径。
+    pub shell: String,
+    /// 起始工作目录；缺省表示继承内核进程的当前目录。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub cwd: Option<String>,
+    /// 子进程 pid。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub pid: Option<u32>,
+    /// 当前列数（`terminal.resize` 会更新这里）。
+    pub cols: u16,
+    /// 当前行数。
+    pub rows: u16,
+    /// 建会话时刻（Unix 毫秒）。
+    #[ts(type = "number")]
+    pub created_at_ms: i64,
+}
+
+/// `terminal.create` 请求参数。
+///
+/// 全部可选：`{}` 就是「按平台缺省 shell、缺省尺寸、继承内核 cwd」开一个终端。
+/// 尺寸会在内核侧夹到合法区间，客户端量到 0 不会建出 1×1 的废终端。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TerminalCreateParams {
+    /// shell 可执行文件；缺省取 `%COMSPEC%`（Windows）/ `$SHELL`（Unix）。
+    #[serde(default)]
+    #[ts(optional)]
+    pub shell: Option<String>,
+    /// 传给 shell 的参数。
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// 起始工作目录。
+    #[serde(default)]
+    #[ts(optional)]
+    pub cwd: Option<String>,
+    /// 追加 / 覆盖的环境变量（在继承来的环境之上）。
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// 初始列数，缺省 80。
+    #[serde(default)]
+    #[ts(optional)]
+    pub cols: Option<u16>,
+    /// 初始行数，缺省 24。
+    #[serde(default)]
+    #[ts(optional)]
+    pub rows: Option<u16>,
+}
+
+/// `terminal.create` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TerminalCreateResult {
+    /// 新建的会话。
+    pub terminal: TerminalView,
+}
+
+/// `terminal.write` 请求参数。
+///
+/// `data` 是**原始字节的 base64**：终端里要发的不只是正文，还有 `\r`、
+/// `Ctrl-C`（`0x03`）、方向键（`ESC [ A`）这类任意字节。用字符串传会让
+/// 控制字符在 JSON 转义里丢一层。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TerminalWriteParams {
+    /// 目标会话 id。
+    pub terminal_id: String,
+    /// 原始字节的 base64（标准字母表，带 `=` 填充）。
+    pub data: String,
+}
+
+/// `terminal.write` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TerminalWriteResult {
+    /// 实际写入的字节数（base64 解码之后）。
+    #[ts(type = "number")]
+    pub bytes: u64,
+}
+
+/// `terminal.resize` 请求参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TerminalResizeParams {
+    /// 目标会话 id。
+    pub terminal_id: String,
+    /// 新列数（内核夹到 2..=500）。
+    pub cols: u16,
+    /// 新行数（内核夹到 1..=200）。
+    pub rows: u16,
+}
+
+/// `terminal.resize` 响应结果：回夹取后的真实尺寸，客户端据此校正本地视图。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TerminalResizeResult {
+    /// 调整后的会话视图。
+    pub terminal: TerminalView,
+}
+
+/// `terminal.kill` 请求参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TerminalKillParams {
+    /// 目标会话 id。
+    pub terminal_id: String,
+}
+
+/// `terminal.list` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TerminalListResult {
+    /// 存活的会话，按创建时间升序（与前端标签页顺序一致）。
+    pub terminals: Vec<TerminalView>,
+    /// 会话总数（就是 `terminals.len()`，回给 UI 免得它自己数）。
+    #[ts(type = "number")]
+    pub total: u64,
+}
+
+/// `terminal.data` 事件：一段输出。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TerminalDataEvent {
+    /// 会话 id。
+    pub terminal_id: String,
+    /// 原始字节的 base64。
+    pub data: String,
+    /// 解码后的字节数，便于客户端做背压统计而不必先解码。
+    #[ts(type = "number")]
+    pub bytes: u64,
+}
+
+/// `terminal.exit` 事件：子进程退出。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TerminalExitEvent {
+    /// 会话 id。
+    pub terminal_id: String,
+    /// 退出码；拿不到时为 `null`。
+    pub code: Option<i32>,
+    /// 终止信号名（Unix）；Windows 恒为 `null`。
+    pub signal: Option<String>,
+    /// 退出时刻（Unix 毫秒）。
+    #[ts(type = "number")]
+    pub at_ms: i64,
+}
+
+// ---------------------------------------------------------------------------
+// git.*（M6 切片三：工作区 Git 能力）
+// ---------------------------------------------------------------------------
+
+/// `git.status` 请求参数。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitStatusParams {
+    /// 工作区 id；缺省作用于活动工作区。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub workspace_id: Option<String>,
+}
+
+/// 工作区里的一个变更条目。
+///
+/// `index` / `worktree` 是 git 的两列状态字母，未变更的一侧为 `"."`；直接透出字母
+/// 而不翻译成布尔量，是因为 UI 要区分「已暂存的新增（`A`）」与「未暂存的新增（`?`）」，
+/// 这两者合并成一个 `is_new` 就再也分不开了。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitStatusEntry {
+    /// 相对工作区根的文件路径（正斜杠）。
+    pub path: String,
+    /// 重命名 / 复制前的原路径；其它情况为 `null`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub original_path: Option<String>,
+    /// 索引区（暂存区）状态：`M` / `A` / `D` / `R` / `C` / `T` / `U`，无变更为 `.`。
+    pub index: String,
+    /// 工作区状态，无变更为 `.`。
+    pub worktree: String,
+    /// 条目类别：`changed` / `renamed` / `unmerged` / `untracked` / `ignored`。
+    pub kind: String,
+}
+
+/// `git.status` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitStatusResult {
+    /// 工作区 id。
+    pub workspace_id: String,
+    /// 当前分支名；分离头指针时为 `null`。
+    pub branch: Option<String>,
+    /// 是否处于分离头指针状态。
+    pub detached: bool,
+    /// HEAD 指向的提交；仓库还没有任何提交时为 `null`。
+    pub head_oid: Option<String>,
+    /// 上游分支（`origin/main` 这类）；未设置时为 `null`。
+    pub upstream: Option<String>,
+    /// 相对上游领先的提交数；无上游时为 0。
+    #[ts(type = "number")]
+    pub ahead: u64,
+    /// 相对上游落后的提交数；无上游时为 0。
+    #[ts(type = "number")]
+    pub behind: u64,
+    /// 工作区是否干净（`entries` 为空）。
+    pub clean: bool,
+    /// 变更清单，按 git 输出顺序（路径升序）。
+    pub entries: Vec<GitStatusEntry>,
+}
+
+/// `git.diff` 请求参数。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitDiffParams {
+    /// 工作区 id；缺省作用于活动工作区。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub workspace_id: Option<String>,
+    /// 只取该路径的 diff（相对工作区根）；缺省为全量 diff。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub path: Option<String>,
+    /// 是否看暂存区（`git diff --cached`）。`false` 为「工作区相对暂存区」。
+    #[serde(default)]
+    pub staged: bool,
+    /// 上下文行数；缺省 3（与 git 缺省一致），上限 100。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[ts(type = "number")]
+    pub context_lines: Option<u32>,
+}
+
+/// `git.diff` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitDiffResult {
+    /// 请求里的路径；全量 diff 时为 `null`。
+    pub path: Option<String>,
+    /// 是否是暂存区 diff（回显请求参数）。
+    pub staged: bool,
+    /// unified diff 文本（未着色，`\n` 换行）。无差异时为空串。
+    pub diff: String,
+    /// diff 文本的字节数（UTF-8 编码后）。
+    #[ts(type = "number")]
+    pub bytes: u64,
+    /// 是否因超过 1 MiB 上限被截断。截断只切尾部，头部始终完整。
+    pub truncated: bool,
+}
+
+/// `git.stage` 请求参数。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitStageParams {
+    /// 工作区 id；缺省作用于活动工作区。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub workspace_id: Option<String>,
+    /// 要暂存 / 取消暂存的路径；与 `all` 二选一（都给了按 `all` 处理）。
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// 暂存全部变更（含删除），等价 `git add -A`。
+    #[serde(default)]
+    pub all: bool,
+    /// `true` 为取消暂存（`git reset`），`false` 为暂存（`git add`）。
+    #[serde(default)]
+    pub unstage: bool,
+}
+
+/// `git.stage` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitStageResult {
+    /// 实际操作的路径（回显，已归一化为正斜杠）；全量操作为空表。
+    pub paths: Vec<String>,
+    /// 是否为全量操作。
+    pub all: bool,
+    /// 是否为取消暂存。
+    pub unstage: bool,
+    /// 操作后仍在暂存区的条目数，便于 UI 立刻刷新角标而不必再发一次 `git.status`。
+    #[ts(type = "number")]
+    pub staged_total: u64,
+}
+
+/// `git.commit` 请求参数。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitCommitParams {
+    /// 工作区 id；缺省作用于活动工作区。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub workspace_id: Option<String>,
+    /// 提交信息（首行为摘要）。
+    pub message: String,
+    /// 只提交这些路径；缺省提交整个暂存区。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub paths: Option<Vec<String>>,
+    /// 追加到上一次提交（`--amend`）。
+    #[serde(default)]
+    pub amend: bool,
+    /// 允许空提交（`--allow-empty`）。
+    #[serde(default)]
+    pub allow_empty: bool,
+}
+
+/// `git.commit` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitCommitResult {
+    /// 新提交的完整 SHA-1。
+    pub oid: String,
+    /// 短哈希（至少 7 位）。
+    pub short_oid: String,
+    /// 提交信息首行。
+    pub summary: String,
+    /// 提交后的分支名；分离头指针时为 `null`。
+    pub branch: Option<String>,
+    /// 本次提交涉及的文件数。
+    #[ts(type = "number")]
+    pub files: u64,
+    /// 作者（`Name <email>`）。仓库未配置身份时由内核填入临时身份，见协议文档。
+    pub author: String,
+}
+
+/// `git.branches` 请求参数。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitBranchesParams {
+    /// 工作区 id；缺省作用于活动工作区。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub workspace_id: Option<String>,
+}
+
+/// 一个分支（本地或远端）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitBranch {
+    /// 分支名；远端的形如 `origin/main`。
+    pub name: String,
+    /// 分支指向的完整提交哈希。
+    pub oid: String,
+    /// 短哈希。
+    pub short_oid: String,
+    /// 是否为当前分支。
+    pub is_current: bool,
+    /// 是否为远端跟踪分支。
+    pub is_remote: bool,
+    /// 上游分支名；未设置为 `null`。
+    pub upstream: Option<String>,
+}
+
+/// `git.branches` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitBranchesResult {
+    /// 工作区 id。
+    pub workspace_id: String,
+    /// 当前分支名；分离头指针时为 `null`。
+    pub current: Option<String>,
+    /// 是否处于分离头指针状态。
+    pub detached: bool,
+    /// 本地分支在前、远端分支在后，各自按名字升序。
+    pub branches: Vec<GitBranch>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2324,5 +2703,85 @@ mod tests {
         .unwrap();
         assert!(view.session_id.is_none());
         assert_eq!(view.detail, serde_json::Value::Null);
+    }
+
+    // -----------------------------------------------------------------------
+    // terminal.*（M6 切片一）
+    // -----------------------------------------------------------------------
+
+    /// `{}` 就是一个可用的建会话请求：缺省 shell、缺省 80×24、继承 cwd。
+    #[test]
+    fn terminal_create_params_are_all_optional() {
+        let params: TerminalCreateParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(params, TerminalCreateParams::default());
+        assert!(params.shell.is_none() && params.cwd.is_none());
+        assert!(params.cols.is_none() && params.rows.is_none());
+        assert!(params.args.is_empty() && params.env.is_empty());
+    }
+
+    /// 会话视图的 `pid` 可缺省；`cols` / `rows` 必须是数字（前端要做算术）。
+    #[test]
+    fn terminal_view_keeps_size_numeric_and_pid_optional() {
+        let view = TerminalView {
+            id: "t1".into(),
+            shell: r"C:\Windows\System32\cmd.exe".into(),
+            cwd: Some(r"E:\ai_ide".into()),
+            pid: None,
+            cols: 120,
+            rows: 30,
+            created_at_ms: 1_700_000_000_000,
+        };
+        let json = serde_json::to_value(&view).unwrap();
+        assert!(json["cols"].is_number());
+        assert!(json["rows"].is_number());
+        assert!(json["created_at_ms"].is_number());
+        assert!(json.get("pid").is_none(), "None 的 pid 不该出现：{json}");
+        assert_eq!(
+            serde_json::from_value::<TerminalView>(serde_json::json!({
+                "id": "t1",
+                "shell": "cmd.exe",
+                "cols": 80,
+                "rows": 24,
+                "created_at_ms": 1,
+            }))
+            .unwrap()
+            .pid,
+            None
+        );
+    }
+
+    /// 退出事件的 `code` / `signal` 可以是 `null`（被信号终止 / Windows 无信号），
+    /// 但字段必须在——前端按字段存在与否判断「是否已退出」会踩坑。
+    #[test]
+    fn terminal_exit_event_keeps_null_fields() {
+        let event = TerminalExitEvent {
+            terminal_id: "t1".into(),
+            code: None,
+            signal: Some("SIGKILL".into()),
+            at_ms: 1,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert!(json.get("code").is_some(), "code 字段必须在：{json}");
+        assert!(json["code"].is_null());
+        assert_eq!(json["signal"], serde_json::json!("SIGKILL"));
+        assert_eq!(
+            serde_json::from_value::<TerminalExitEvent>(json).unwrap(),
+            event
+        );
+    }
+
+    /// 写操作按字节算：`bytes` 是解码后的长度，不是 base64 字符串长度。
+    #[test]
+    fn terminal_write_dto_carries_base64_payload() {
+        let params: TerminalWriteParams = serde_json::from_value(
+            serde_json::json!({ "terminal_id": "t1", "data": "ZWNobyBoaQ0K" }),
+        )
+        .unwrap();
+        assert_eq!(params.data, "ZWNobyBoaQ0K");
+        let result = TerminalWriteResult { bytes: 11 };
+        assert_eq!(
+            serde_json::to_value(&result).unwrap()["bytes"],
+            serde_json::json!(11)
+        );
     }
 }

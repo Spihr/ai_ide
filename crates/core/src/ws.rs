@@ -131,11 +131,22 @@ pub async fn close(peer: &Peer, state: &AppState, req: &Request) {
         Err(err) => return peer.respond_error(&req.id, &err).await,
     };
 
+    // 关之前先记下根：Git 缓存按根路径存，关完就拿不到 `Workspace` 了。
+    let root = state
+        .workspaces()
+        .get(&params.workspace_id)
+        .ok()
+        .map(|workspace| workspace.root.clone());
     if let Err(err) = state.workspaces().close(&params.workspace_id) {
         return peer.respond_error(&req.id, &ws_error(&err)).await;
     }
     // 索引是「工作区的派生物」，工作区没了就没有留存意义——留着只会占内存。
     state.drop_index(&params.workspace_id);
+    // Git 缓存同理：同一路径关掉后可能被 `git init` 成另一个仓库，
+    // 留着旧句柄会让 `git.status` 回报上一个仓库的状态。
+    if let Some(root) = root {
+        state.git().forget(&root);
+    }
     state.clear_active(&params.workspace_id);
 
     info!(workspace_id = %params.workspace_id, "工作区已关闭");

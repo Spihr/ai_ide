@@ -8,6 +8,7 @@
 use crate::agent_api;
 use crate::audit_api;
 use crate::checkpoint_api;
+use crate::git_api;
 use crate::llm_api;
 use crate::peer::Peer;
 use crate::permission_api;
@@ -15,6 +16,7 @@ use crate::provider_api;
 use crate::session_api;
 use crate::state::{now_ms, AppState};
 use crate::sysinfo;
+use crate::terminal_api;
 use crate::version::CORE_VERSION;
 use crate::ws;
 use ai_ide_protocol::dto::{
@@ -127,6 +129,20 @@ async fn handle_request(peer: &Peer, state: &AppState, req: Request) {
         // 权限免问规则（M5 切片六）：只读列表与撤销。授予只能走 `agent.decide`。
         methods::permission::LIST => permission_api::list(peer, state, &req).await,
         methods::permission::REVOKE => permission_api::revoke(peer, state, &req).await,
+
+        // 终端会话（M6 切片一）：PTY 在 crates/terminal，输出走 terminal.data 事件
+        methods::terminal::CREATE => terminal_api::create(peer, state, &req).await,
+        methods::terminal::WRITE => terminal_api::write(peer, state, &req).await,
+        methods::terminal::RESIZE => terminal_api::resize(peer, state, &req).await,
+        methods::terminal::KILL => terminal_api::kill(peer, state, &req).await,
+        methods::terminal::LIST => terminal_api::list(peer, state, &req).await,
+
+        // 工作区 Git（M6 切片三）：子进程在 crates/git，这里只做协议翻译与阻塞搬运
+        methods::git::STATUS => git_api::status(peer, state, &req).await,
+        methods::git::DIFF => git_api::diff(peer, state, &req).await,
+        methods::git::STAGE => git_api::stage(peer, state, &req).await,
+        methods::git::COMMIT => git_api::commit(peer, state, &req).await,
+        methods::git::BRANCHES => git_api::branches(peer, state, &req).await,
 
         other => {
             warn!(method = %other, "未实现的方法");

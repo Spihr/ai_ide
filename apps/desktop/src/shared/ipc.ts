@@ -7,11 +7,13 @@
 
 import type {
   HelloResult,
+  TerminalDataEvent,
+  TerminalExitEvent,
   WorkspaceChangedEvent,
   WorkspaceIndexedEvent
 } from '@ai-ide/shared-types'
 
-export type { WorkspaceChangedEvent, WorkspaceIndexedEvent }
+export type { TerminalDataEvent, TerminalExitEvent, WorkspaceChangedEvent, WorkspaceIndexedEvent }
 
 /** IPC 通道名。集中定义，避免两侧字符串写歪。 */
 export const IpcChannels = {
@@ -47,7 +49,16 @@ export const IpcChannels = {
   /** 主进程 → 渲染进程：密钥托管状态变更 */
   credentialsStatusChanged: 'credentials:status-changed',
   /** 主进程 → 渲染进程：M2/M4 事件（`provider.changed` / `llm.*` / `agent.*`） */
-  aiEvent: 'ai:event'
+  aiEvent: 'ai:event',
+  /**
+   * 主进程 → 渲染进程：终端输出增量（`terminal.data`）。
+   *
+   * 单独开一条通道而不是塞进 `ai:event`：终端输出是**高频字节流**（一次命令
+   * 刷出几十条很常见），混进 AI 事件会让对话面板的监听函数被无谓唤醒上千次。
+   */
+  terminalData: 'terminal:data',
+  /** 主进程 → 渲染进程：终端子进程退出（`terminal.exit`） */
+  terminalExit: 'terminal:exit'
 } as const
 
 export type CoreState = 'idle' | 'starting' | 'ready' | 'failed' | 'stopped'
@@ -140,4 +151,12 @@ export interface AiIdeApi {
   onAiEvent: (listener: (event: AiEvent) => void) => () => void
   /** 订阅密钥托管状态变更，返回取消订阅函数。 */
   onCredentialStatus: (listener: (status: CredentialStatus) => void) => () => void
+  /**
+   * 订阅终端输出增量（`terminal.data`），返回取消订阅函数。
+   *
+   * 载荷里的 `data` 是原始字节的 base64，渲染侧解码后再交给 xterm。
+   */
+  onTerminalData: (listener: (event: TerminalDataEvent) => void) => () => void
+  /** 订阅终端子进程退出（`terminal.exit`），返回取消订阅函数。 */
+  onTerminalExit: (listener: (event: TerminalExitEvent) => void) => () => void
 }

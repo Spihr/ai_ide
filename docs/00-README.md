@@ -14,7 +14,7 @@ AIGC:
 模型可插拔的 AI 原生代码编辑器。技术栈：**Electron + React + TypeScript（外壳/UI） + Rust（内核）**。
 
 > 文档状态：v0.1（设计基线，待审阅）
-> 实现状态：**M0 / M1 / M2 / M3 已完成并通过实测验收；M4（Agent 闭环）内核与外壳主线已完成**（Agent 循环与 8 个工具、权限闸门四动作、`agent.*` 协议与 `crates/core` 接线、外壳运行面板与审批 UI），遗留工具调用独立卡片组件、协议文档一致性巡检与多模型复测，详见 [10-M4-验收报告.md](./10-M4-验收报告.md)；**M5（持久化与治理）已完成**：会话 / 消息持久化层 `crates/store`、`session.*` 九个方法与只读 `audit.list` 已在内核接线并通过端到端测试（含杀进程重启后会话与消息完整恢复、审计留痕在会话删除后仍存活）；同一轮补齐三项 M5 缺口——检查点回滚（`checkpoint.create` / `list` / `restore` / `delete`，快照按 SHA-256 逐文件复核）、JSONL 结构化日志（按天滚动、出口脱敏、32 MiB 滚动上限，并在 CI 加密钥扫描门禁）、权限表持久化（`permission.list` / `revoke`，`allow_always` 落 `permission_rule` 表），能力清单 30 → 46，外壳会话面板、检查点面板与权限面板均已接进渲染端（详见 [11-M5-验收报告.md](./11-M5-验收报告.md)）；剩余未做仅消息级分叉入口与列表 / 审计的「加载更多」；M6–M7 未开工，M8 仅打包链路先行落地、验收未做（截至 2026-10-22）。本套文档撰写于编码之前，部分表述已与实现不符，凡有冲突以本文「实现状态」章节为准。
+> 实现状态：**M0 / M1 / M2 / M3 已完成并通过实测验收；M4（Agent 闭环）内核与外壳主线已完成**（Agent 循环与 8 个工具、权限闸门四动作、`agent.*` 协议与 `crates/core` 接线、外壳运行面板与审批 UI），遗留工具调用独立卡片组件、协议文档一致性巡检与多模型复测，详见 [10-M4-验收报告.md](./10-M4-验收报告.md)；**M5（持久化与治理）已完成**：会话 / 消息持久化层 `crates/store`、`session.*` 九个方法与只读 `audit.list` 已在内核接线并通过端到端测试（含杀进程重启后会话与消息完整恢复、审计留痕在会话删除后仍存活）；同一轮补齐三项 M5 缺口——检查点回滚（`checkpoint.create` / `list` / `restore` / `delete`，快照按 SHA-256 逐文件复核）、JSONL 结构化日志（按天滚动、出口脱敏、32 MiB 滚动上限，并在 CI 加密钥扫描门禁）、权限表持久化（`permission.list` / `revoke`，`allow_always` 落 `permission_rule` 表），能力清单 30 → 46，外壳会话面板、检查点面板与权限面板均已接进渲染端（详见 [11-M5-验收报告.md](./11-M5-验收报告.md)）；剩余未做仅消息级分叉入口与列表 / 审计的「加载更多」；**M6（终端 + Git）四个切片已完成**：`crates/terminal`（`portable-pty` 之上的 `TerminalManager`，多会话 / resize 夹取 / 子进程退出清理 / 单一事件通道）、`terminal.create` / `write` / `resize` / `kill` / `list` 五方法与 `terminal.data` / `terminal.exit` 两事件已进协议 `IMPLEMENTED` 并由 `crates/core/src/terminal_api.rs` 挂进 dispatch，能力清单 46 → **51**，单测 13 项 + 端到端 8 项（`crates/core/tests/terminal_flow.rs`）；外壳侧 `apps/desktop` 三层接通 xterm.js（main 事件路由与策略放行、preload 两个订阅方法、renderer 的 `terminal-api.ts` / `terminal-store.ts` / `TerminalPanel.tsx`，多标签 + FitAddon 尺寸同步 + 退出态重启，入口在活动栏与会话数角标、``Ctrl+` `` 开关），前端单测 23 项；切片三在 `crates/git` 落地内核 Git（驱动系统 `git` 子进程而非链接 `git2`，`status` / `diff` / `stage` / `commit` / `branches` 五方法 + 7001–7005 错误码，能力清单 51 → **56**，单测 36 项 + 端到端 6 项），切片四在 `apps/desktop` 接通外壳 Git 面板（`policy.ts` 放行五个 `git.*`、`git-api.ts` 解析 unified diff、`git-store.ts` 分组与暂存 / 提交状态机、`GitPanel.tsx` 变更列表 + diff 视图 + 提交框 + 分支条，入口挂活动栏「源代码管理」，前端 Git 测试 41 项、全量 248 项）；真实 Electron 窗口的人工点击验收与卡顿 / resize 主观体感实测未做（详见 [12-M6-验收报告.md](./12-M6-验收报告.md)），M7 未开工，M8 仅打包链路先行落地、验收未做（截至 2026-10-22）。本套文档撰写于编码之前，部分表述已与实现不符，凡有冲突以本文「实现状态」章节为准。
 
 ---
 
@@ -33,7 +33,11 @@ AIGC:
 | [09-M3-验收报告.md](./09-M3-验收报告.md) | M3 实测验收：引用注入与预算裁剪、精确计数与压缩分流、硬指标对照、缺陷复盘、三处限制 |
 | [10-M4-验收报告.md](./10-M4-验收报告.md) | M4 实测验收：Agent 循环与 8 个工具、权限闸门四动作、真实模型联调、缺陷复盘、八处限制 |
 | [11-M5-验收报告.md](./11-M5-验收报告.md) | M5 实测验收：会话 / 消息持久化、导出与分叉、审计与脱敏、检查点回滚、JSONL 日志与密钥扫描门禁、权限表持久化、外壳会话面板、验收标准对照、缺陷复盘、限制清单 |
+<<<<<<< HEAD
 | [12-插件系统设计.md](./12-插件系统设计.md) | 插件系统设计（**未接线**）：子进程 + stdio 形态选型、包规范与清单校验、`plugin.*` 网关与 6xxx 错误码、宿主 API 能力矩阵、四道闸门与配额、Agent 工具注入、接线清单、P0–P5 里程碑；配套可运行原型 `demo-plugin-system/`（12/12 场景通过） |
+=======
+| [12-M6-验收报告.md](./12-M6-验收报告.md) | M6 实测验收：内核终端与 Git、外壳终端面板与 Git 面板、门禁实测、两条验收指标对照、缺陷复盘、七条限制清单 |
+>>>>>>> b248cbb1561335cbdbc4aa40c44362d80131da5f
 
 ## 实现状态（截至 2026-10-22）
 
@@ -47,7 +51,8 @@ AIGC:
 | M3 | 上下文引用 | 已完成：`context.refs` 注入与预算裁剪、`truncate` / 离线 `summarize` 分流、tiktoken 按模型族精确计数，实测见 [09-M3-验收报告.md](./09-M3-验收报告.md)。遗留：tree-sitter 符号表、模型摘要；tiktoken 本地计数与上游 `usage` 未做端到端比对 |
 | M4 | Agent 闭环 | 已完成（内核 + 外壳主线）：`crates/agent` 循环调度与 8 个工具、权限闸门四动作、`agent.start` / `stop` / `decide` 协议与 `crates/core` 接线、外壳运行面板与审批卡片，实测见 [10-M4-验收报告.md](./10-M4-验收报告.md)。遗留：工具调用独立卡片组件、协议文档一致性巡检、多模型复测与多次采样 |
 | M5 | 持久化与治理 | 已完成：`crates/store`（sqlx + SQLite 会话 / 消息 / 审计 / 权限规则仓储，含事务内 `fork_session` 与审计脱敏留存）、`crates/protocol` 九个 `session.*` + 只读 `audit.list` + 四个 `checkpoint.*` + 两个 `permission.*` 及 DTO（能力清单 30 → 46）、`crates/core` 的 `session_api.rs` / `session_export.rs` / `audit_api.rs` / `checkpoint_api.rs` / `permission_api.rs` 接线、JSONL 结构化日志（`logging.rs`）、外壳 `session-store.ts` + `session-bridge.ts` + `SessionPanel.tsx` / `CheckpointPanel.tsx` / 权限面板，对话侧首条消息自动建会话、流结束按用量落 `assistant`；实测见 [11-M5-验收报告.md](./11-M5-验收报告.md)。未做：消息级分叉入口、列表与审计的「加载更多」 |
-| M6–M7 | 终端与 Git / MCP | 未开工 |
+| M6 | 终端与 Git | 已完成：`crates/terminal` + `terminal.*` 五方法与两事件、`crates/git` + `git.*` 五方法（能力清单 46 → 56）、外壳多标签终端与 Git 面板（活动栏入口 + 变更角标），实测见 [12-M6-验收报告.md](./12-M6-验收报告.md)；未做真实窗口人工验收与 M6 e2e 脚本 |
+| M7 | MCP | 未开工 |
 | M8 | 打包 | 打包链路（electron-builder + 打包脚本）已落地，产出 `AI-IDE-0.1.0-win-x64.exe`（core 二进制在 asar 外），干净环境安装验收未做 |
 
 ### 已落地的技术栈（实测）

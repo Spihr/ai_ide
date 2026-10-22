@@ -195,6 +195,38 @@ export type { AuditEventView } from "./generated/AuditEventView";
 export type { AuditListParams } from "./generated/AuditListParams";
 export type { AuditListResult } from "./generated/AuditListResult";
 
+// ---- terminal.* 方法（M6）----
+// 终端输出走 `terminal.data` 的单向推送，`data` 是**原始字节的 base64**：
+// 控制字符（`\r`、`Ctrl-C`、方向键的 `ESC [ A`）过字符串会在 JSON 转义里丢层，
+// 因此协议两侧都以 base64 承载，由渲染侧解码成 `Uint8Array` 再喂给 xterm。
+export type { TerminalView } from "./generated/TerminalView";
+export type { TerminalCreateParams } from "./generated/TerminalCreateParams";
+export type { TerminalCreateResult } from "./generated/TerminalCreateResult";
+export type { TerminalWriteParams } from "./generated/TerminalWriteParams";
+export type { TerminalWriteResult } from "./generated/TerminalWriteResult";
+export type { TerminalResizeParams } from "./generated/TerminalResizeParams";
+export type { TerminalResizeResult } from "./generated/TerminalResizeResult";
+export type { TerminalKillParams } from "./generated/TerminalKillParams";
+export type { TerminalListResult } from "./generated/TerminalListResult";
+export type { TerminalDataEvent } from "./generated/TerminalDataEvent";
+export type { TerminalExitEvent } from "./generated/TerminalExitEvent";
+
+// ---- git.* 方法（M6 切片三）----
+// 变更清单的每一侧都用 git 的两列状态字母（`index` / `worktree`），不合成布尔量：
+// 「已暂存的新增 A」与「未暂存的新增 ?」必须分得开，否则 UI 没法决定要不要显示「取消暂存」。
+export type { GitStatusParams } from "./generated/GitStatusParams";
+export type { GitStatusResult } from "./generated/GitStatusResult";
+export type { GitStatusEntry } from "./generated/GitStatusEntry";
+export type { GitDiffParams } from "./generated/GitDiffParams";
+export type { GitDiffResult } from "./generated/GitDiffResult";
+export type { GitStageParams } from "./generated/GitStageParams";
+export type { GitStageResult } from "./generated/GitStageResult";
+export type { GitCommitParams } from "./generated/GitCommitParams";
+export type { GitCommitResult } from "./generated/GitCommitResult";
+export type { GitBranchesParams } from "./generated/GitBranchesParams";
+export type { GitBranchesResult } from "./generated/GitBranchesResult";
+export type { GitBranch } from "./generated/GitBranch";
+
 // ---- 协议常量（与 Rust 侧保持一致的运行时镜像）----
 
 /** JSON-RPC 版本字面量。对应 Rust `ai_ide_protocol::JSONRPC_VERSION`。 */
@@ -280,6 +312,20 @@ export const Methods = {
   audit: {
     list: "audit.list",
   },
+  terminal: {
+    create: "terminal.create",
+    write: "terminal.write",
+    resize: "terminal.resize",
+    kill: "terminal.kill",
+    list: "terminal.list",
+  },
+  git: {
+    status: "git.status",
+    diff: "git.diff",
+    stage: "git.stage",
+    commit: "git.commit",
+    branches: "git.branches",
+  },
   event: {
     log: "core.log",
     workspaceChanged: "workspace.changed",
@@ -294,6 +340,8 @@ export const Methods = {
     llmError: "llm.error",
     agentApprovalRequired: "agent.approval_required",
     agentFinished: "agent.finished",
+    terminalData: "terminal.data",
+    terminalExit: "terminal.exit",
   },
 } as const;
 
@@ -305,7 +353,8 @@ export const Methods = {
  * 再加 M4 第三切片的 `agent.*` 三项、M5 的 `session.*` 九项（会话 / 消息落盘，
  * 含导出与分叉）、`checkpoint.*` 四项（快照 / 列表 / 回滚 / 删除）、
  * `permission.*` 两项（免问规则列表 / 撤销）与 `audit.list`（审计账本只读查询），
- * 共 46 项，与 Rust `methods::IMPLEMENTED` 逐项对齐。
+ * 再加 M6 切片一的 `terminal.*` 五项（PTY 会话的建 / 写 / 改尺寸 / 杀 / 列），
+ * 共 56 项，与 Rust `methods::IMPLEMENTED` 逐项对齐。
  */
 export const IMPLEMENTED_METHODS = [
   Methods.core.hello,
@@ -354,6 +403,16 @@ export const IMPLEMENTED_METHODS = [
   Methods.permission.list,
   Methods.permission.revoke,
   Methods.audit.list,
+  Methods.terminal.create,
+  Methods.terminal.write,
+  Methods.terminal.resize,
+  Methods.terminal.kill,
+  Methods.terminal.list,
+  Methods.git.status,
+  Methods.git.diff,
+  Methods.git.stage,
+  Methods.git.commit,
+  Methods.git.branches,
 ] as const;
 
 /**
