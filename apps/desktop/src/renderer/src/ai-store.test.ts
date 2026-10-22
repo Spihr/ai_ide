@@ -18,6 +18,7 @@ import {
   type LlmCountTokensParams,
   type ModelView,
   type ProviderView,
+  type SessionAppendMessageParams,
   type TreeEntry
 } from '@ai-ide/shared-types'
 
@@ -44,6 +45,7 @@ import {
   sendMessage,
   testProvider
 } from './ai-store'
+import { getActiveSessionId, setActiveSessionId } from './session-bridge'
 import { closeWorkspace, getEditorState, openFile, openWorkspace, setEditorSelection } from './store'
 
 interface Call {
@@ -140,6 +142,8 @@ function installHarness(): Harness {
   let models: ModelView[] = [modelView()]
   let failure: { message: string; method: string | null } | null = null
   let countTokens = 42
+  // 假内核的会话创建时刻：只用来生成互不相同的 id / 时间戳。
+  let createdAt = 0
   let listener: ((event: AiEvent) => void) | null = null
 
   const api: AiIdeApi = {
@@ -152,6 +156,8 @@ function installHarness(): Harness {
     ping: async () => {
       throw new Error('测试未使用 ping')
     },
+    // M5：导出会话的落点由主进程的系统对话框决定，渲染侧只拿返回的路径。
+    pickSavePath: async () => null,
     pickWorkspaceDirectory: async () => null,
     request: async (method: string, params?: unknown) => {
       calls.push({ method, params: params as Record<string, unknown> | undefined })
@@ -183,6 +189,39 @@ function installHarness(): Harness {
           return { stream_id: (params as LlmChatStreamParams | undefined)?.stream_id ?? 'srv-side' }
         case Methods.llm.cancel:
           return { ok: true }
+        // M5：发送链路会先把消息落盘（第一条消息还会顺手建会话）。这里给最小可用的
+        // 快照，用来断言「什么时候建、建了几个、正文有没有写进去」。
+        case Methods.session.create: {
+          createdAt += 1
+          const sessionId = `s-${createdAt}`
+          return {
+            session_id: sessionId,
+            session: {
+              session_id: sessionId,
+              title: '新会话',
+              workspace_path: null,
+              model_ref: null,
+              created_at_ms: createdAt,
+              updated_at_ms: createdAt
+            }
+          }
+        }
+        case Methods.session.appendMessage:
+          return {
+            message: {
+              message_id: `m-${calls.length}`,
+              session_id: (params as SessionAppendMessageParams).session_id,
+              parent_id: null,
+              role: (params as SessionAppendMessageParams).message.role,
+              content: (params as SessionAppendMessageParams).message.content,
+              attachments: [],
+              tool_calls: [],
+              tool_call_id: null,
+              model_ref: (params as SessionAppendMessageParams).model_ref,
+              usage: (params as SessionAppendMessageParams).usage,
+              created_at_ms: calls.length
+            }
+          }
         case Methods.llm.countTokens:
           return { tokens: countTokens, exact: false, note: null }
         case Methods.workspace.open:
@@ -278,6 +317,9 @@ async function flush(): Promise<void> {
 
 beforeEach(async () => {
   resetAiState()
+  // 活动会话 id 是模块级状态：不清的话上一个用例建的会话会被下一个用例当成「已有会话」，
+  // 「新建会话」的断言就会莫名其妙少一次。
+  setActiveSessionId(null)
   h = installHarness()
   initAi()
   await flush()
@@ -488,6 +530,82 @@ describe('对话', () => {
     expect(state.bubbles).toHaveLength(0)
     expect(state.streaming).toBe(false)
     expect(state.usage).toBeNull()
+  })
+})
+
+describe('会话落盘（M5）', () => {
+  it('第一条消息先建会话再开流：这轮对话在库里有归属', async () => {
+    await sendMessage('第一句')
+
+    expect(callsOf(Methods.session.create)).toHaveLength(1)
+    const created = getActiveSessionId()
+    expect(created).toBeTruthy()
+
+    // 建的会话要带上此刻选中的模型：历史回放时才知道「这条是谁答的」。
+    expect(callsOf(Methods.session.create)[0]?.params?.model_ref).toEqual({
+      provider_id: PROVIDER_ID,
+      model_id: 'fake-mini'
+    })
+
+    // 落盘必须发生在开流之前：反过来的话 chat_stream 只能带 null 的会话 id。
+    const append = callsOf(Methods.session.appendMessage)[0]
+    expect(append?.params?.session_id).toBe(created)
+    expect((append?.params?.message as { content?: string } | undefined)?.content).toBe('第一句')
+
+    const stream = callsOf(Methods.llm.chatStream)[0]?.params as LlmChatStreamParams
+    expect(stream.session_id).toBe(created)
+  })
+
+  it('同一会话的第二条消息不再新建，回答收口后按用量落盘', async () => {
+    await sendMessage('第一句')
+    const sessionId = getActiveSessionId()
+    const streamId = getAiState().streamId as string
+
+    h.emit(Methods.event.llmDelta, { stream_id: streamId, text: '回答' })
+    h.emit(Methods.event.llmUsage, {
+      stream_id: streamId,
+      prompt_tokens: 11,
+      completion_tokens: 4,
+      cached_tokens: null
+    })
+    h.emit(Methods.event.llmFinished, { stream_id: streamId, finish_reason: 'stop', message_id: null })
+    await flush()
+
+    expect(callsOf(Methods.session.create)).toHaveLength(1)
+
+    const appends = callsOf(Methods.session.appendMessage)
+    expect(appends).toHaveLength(2)
+    expect(appends[1]?.params?.session_id).toBe(sessionId)
+    expect((appends[1]?.params?.message as { role?: string; content?: string } | undefined)?.role).toBe(
+      'assistant'
+    )
+    expect((appends[1]?.params?.message as { content?: string } | undefined)?.content).toBe('回答')
+    // 用量原样存下来：将来算账不用重放。
+    expect(appends[1]?.params?.usage).toEqual({ prompt_tokens: 11, completion_tokens: 4 })
+  })
+
+  it('一个字都没产出时不写 assistant：历史里不该多一个空气泡', async () => {
+    await sendMessage('空回复')
+    const streamId = getAiState().streamId as string
+    h.emit(Methods.event.llmFinished, { stream_id: streamId, finish_reason: 'stop', message_id: null })
+    await flush()
+
+    const appends = callsOf(Methods.session.appendMessage)
+    expect(appends).toHaveLength(1)
+    expect((appends[0]?.params?.message as { role?: string } | undefined)?.role).toBe('user')
+  })
+
+  it('清空对话只解除绑定：下一条消息开的是新会话，旧会话不动', async () => {
+    await sendMessage('第一句')
+    const first = getActiveSessionId()
+
+    clearChat()
+    expect(getActiveSessionId()).toBeNull()
+    expect(callsOf(Methods.session.delete)).toHaveLength(0)
+
+    await sendMessage('换个话题')
+    expect(callsOf(Methods.session.create)).toHaveLength(2)
+    expect(getActiveSessionId()).not.toBe(first)
   })
 })
 

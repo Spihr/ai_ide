@@ -33,6 +33,13 @@ export const IpcChannels = {
   workspaceIndexed: 'workspace:indexed',
   /** 弹出系统目录选择框（invoke，返回绝对路径或 null） */
   pickWorkspace: 'dialog:pick-workspace',
+  /**
+   * 弹出系统保存对话框（invoke，返回绝对路径或 null）。
+   *
+   * M5 的 `session.export` 会往磁盘写文件，导出的落点必须由用户亲手选：渲染进程
+   * 拿不到「自己拼一个路径就写」的能力，只能提交默认文件名与扩展名。
+   */
+  pickSavePath: 'dialog:pick-save-path',
   /** 查询密钥托管状态 */
   credentialsStatus: 'credentials:status',
   /** 撤销某个 Provider 的密钥托管 */
@@ -112,6 +119,13 @@ export interface AiIdeApi {
   request: (method: string, params?: unknown) => Promise<unknown>
   /** 弹出系统目录选择框；用户取消时返回 `null`。 */
   pickWorkspaceDirectory: () => Promise<string | null>
+  /**
+   * 弹出系统保存对话框；用户取消时返回 `null`。
+   *
+   * @param defaultName 默认文件名（如 `会话标题.md`）
+   * @param extensions  允许的扩展名（不含点，如 `['md']`）
+   */
+  pickSavePath: (defaultName: string, extensions: string[]) => Promise<string | null>
   onCoreStatus: (listener: (status: CoreStatus) => void) => () => void
   onCoreLog: (listener: (chunk: CoreLogChunk) => void) => () => void
   /** 订阅工作区外部改动事件，返回取消订阅函数。 */

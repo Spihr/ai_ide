@@ -47,6 +47,9 @@ import {
   type LineRange,
   type TokenEstimate
 } from './context-completion'
+// M5：对话流与会话落盘之间的桥。方向是单向的（ai-store → bridge），
+// 反向由 bridge 的回调通知 session-store，不走 import，避免两个 store 成环。
+import { getActiveSessionId, persistChatMessage, releaseActiveSession } from './session-bridge'
 import { getEditorState } from './store'
 import { workspaceApi } from './workspace-api'
 
@@ -79,6 +82,13 @@ export interface ChatBubble {
   status: 'done' | 'streaming' | 'error'
   /** 错误或附加说明（如「已取消」）。 */
   note: string | null
+  /**
+   * 这条气泡在库里的消息 id（M5）。
+   *
+   * 两个来源：历史回放时由 `MessageView` 带上；本轮实时对话则由落盘回执回填。
+   * 为 null 表示「还没落盘 / 落盘失败」——此时不能作为分叉截断点，UI 要隐藏入口。
+   */
+  messageId?: string | null
 }
 
 export interface ProviderFormInput {
@@ -732,13 +742,21 @@ export async function sendMessage(text: string): Promise<boolean> {
   })
 
   // 发送前估一次：超限时提前说一声，别等上游用 2004 把整轮对话打回来。
+  //
+  // M5：先落盘再发流。顺序不能反——`llm.chat_stream` 要带上 `session_id`，而会话是
+  // 「第一条消息」落盘时由桥自动建的；先发流就会带一个 null 的会话 id，这轮对话在
+  // 库里就没有归属。落盘失败（返回 false）不挡发送：屏幕上已经有这条消息了，
+  // 让它发出去比为了历史完整而拦住用户更合理。
+  const persisted = await persistChatMessage('user', content, state.selectedModel)
+  if (persisted.messageId !== null) attachMessageId('user', content, persisted.messageId)
+
   const estimate = await estimateTokens(messages, chips)
   if (estimate) setState({ tokenEstimate: estimate })
 
   try {
     const ack = await aiApi.chatStream({
       stream_id: streamId,
-      session_id: null,
+      session_id: getActiveSessionId(),
       model_ref: state.selectedModel,
       messages,
       tools: [],
@@ -782,6 +800,9 @@ export async function cancelStream(): Promise<boolean> {
         note: bubble.text.trim().length > 0 ? '已取消' : '已取消（未产出内容）'
       }))
     })
+    // M5：取消前已经生成出来的正文仍然要落盘——那是用户真实拿到的内容，
+    // 只因为中途按了停止就丢掉，历史里这一段会变成一个空洞。
+    persistLastAssistant()
     return true
   } catch (error) {
     setState({ hint: describe(error) })
@@ -801,11 +822,70 @@ export function clearChat(): void {
     // 想换个话题，不是想丢掉刚挑好的文件。
     tokenEstimate: null
   })
+  // M5：「清空对话」= 开一段新对话，不是删历史。解除与会话的绑定，下一条消息落盘时
+  // 由桥自动建新会话；已落盘的历史留在库里，随时能在会话列表里翻回来。
+  releaseActiveSession()
+}
+
+/**
+ * 用一段已落盘的历史替换对话面板里的气泡（M5 打开历史会话 / 分叉后回放）。
+ *
+ * 这里必须把流状态一并归零：回放历史时如果还挂着一个 `streamId`，那条旧流的
+ * `llm.delta` 会继续往这条历史会话的最后一个气泡里灌字。
+ */
+export function loadBubbles(bubbles: ChatBubble[]): void {
+  setState({
+    bubbles,
+    streaming: false,
+    streamId: null,
+    usage: null,
+    finishReason: null,
+    hint: null,
+    error: null,
+    tokenEstimate: null
+  })
 }
 
 // ---------------------------------------------------------------------------
 // 事件接入
 // ---------------------------------------------------------------------------
+
+/**
+ * 把刚收口的那条 assistant 正文落盘（M5）。
+ *
+ * 取「最后一条 assistant 气泡」而不是攒一个流缓冲区：气泡就是用户看到的东西，
+ * 落盘的内容必须与屏幕一致，多一条通路就会出现「历史里有、屏幕上没有」。
+ */
+function persistLastAssistant(): void {
+  const last = [...state.bubbles].reverse().find((bubble) => bubble.role === 'assistant')
+  if (!last) return
+  const usage = state.usage
+    ? { prompt_tokens: state.usage.promptTokens, completion_tokens: state.usage.completionTokens }
+    : null
+  void persistChatMessage('assistant', last.text, state.selectedModel, usage).then((outcome) => {
+    if (outcome.messageId !== null) attachMessageId('assistant', last.text, outcome.messageId)
+  })
+}
+
+/**
+ * 把落盘回执里的 message id 贴回气泡（M5 消息级分叉的锚点）。
+ *
+ * 匹配方式：从尾部往前找「同角色且还没有 id」的第一条。不能按下标定位——落盘是
+ * 异步的，这期间用户可能已经发了下一轮，下标早就漂了；文本也参与匹配是最后一道
+ * 保险（同角色连续两条时不会贴错）。
+ */
+function attachMessageId(role: 'user' | 'assistant', text: string, messageId: string): void {
+  const bubbles = [...state.bubbles]
+  for (let index = bubbles.length - 1; index >= 0; index -= 1) {
+    const bubble = bubbles[index]
+    if (bubble === undefined) continue
+    if (bubble.role !== role || (bubble.messageId ?? null) !== null) continue
+    if (bubble.text !== text) continue
+    bubbles[index] = { ...bubble, messageId }
+    setState({ bubbles })
+    return
+  }
+}
 
 /** 处理一条主进程转发的 M2 事件。导出以便单测直接驱动。 */
 export function handleAiEvent(event: AiEvent): void {
@@ -860,6 +940,9 @@ export function handleAiEvent(event: AiEvent): void {
         finishReason: finished.finish_reason,
         bubbles: patchLastAssistant((bubble) => ({ ...bubble, status: 'done' }))
       })
+      // M5：这一轮收口了，把正文落盘（含上游用量）。空正文不写——纯空回复入库
+      // 只会让历史里多一个空气泡。
+      persistLastAssistant()
       return
     }
     case Methods.event.llmError: {

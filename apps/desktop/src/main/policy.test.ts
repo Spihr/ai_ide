@@ -61,6 +61,31 @@ describe('checkRendererCall', () => {
     }
   })
 
+  it('放行 M5 的会话与审计方法', () => {
+    const methods = [
+      Methods.session.create,
+      Methods.session.list,
+      Methods.session.get,
+      Methods.session.update,
+      Methods.session.delete,
+      Methods.session.appendMessage,
+      Methods.session.messages,
+      Methods.session.export,
+      Methods.session.fork,
+      Methods.checkpoint.create,
+      Methods.checkpoint.list,
+      Methods.checkpoint.restore,
+      Methods.checkpoint.delete,
+      Methods.permission.list,
+      Methods.permission.revoke,
+      Methods.audit.list
+    ]
+
+    for (const method of methods) {
+      expect(checkRendererCall(method).allowed, `${method} 应被放行`).toBe(true)
+    }
+  })
+
   it('拦截白名单之外的方法，并给出原因', () => {
     // core.hello / core.shutdown 是主进程自用的握手与退出；workspace.chmod、agent.run
     // 之类内核根本没实现（M4 的三条是 agent.start / stop / decide，没有 agent.run），
@@ -96,6 +121,11 @@ describe('checkRendererCall', () => {
       'agent.decide',
       'agent.start',
       'agent.stop',
+      'audit.list',
+      'checkpoint.create',
+      'checkpoint.delete',
+      'checkpoint.list',
+      'checkpoint.restore',
       'core.ping',
       'core.stats',
       'llm.cancel',
@@ -105,12 +135,23 @@ describe('checkRendererCall', () => {
       'model.delete',
       'model.list',
       'model.upsert',
+      'permission.list',
+      'permission.revoke',
       'provider.delete',
       'provider.list',
       'provider.test',
       'provider.upsert',
       'search.content',
       'search.files',
+      'session.append_message',
+      'session.create',
+      'session.delete',
+      'session.export',
+      'session.fork',
+      'session.get',
+      'session.list',
+      'session.messages',
+      'session.update',
       'workspace.close',
       'workspace.create',
       'workspace.delete',

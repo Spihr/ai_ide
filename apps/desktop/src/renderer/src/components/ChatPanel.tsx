@@ -36,6 +36,7 @@ import {
   toRelativePath,
   type ContextChip
 } from '../context-completion'
+import { forkSession, useSessions } from '../session-store'
 import { getEditorState, useEditorReference } from '../store'
 
 /** chip 前缀图标：文件夹 `▸`、选区 `≡`、其余一律 `#`。 */
@@ -56,6 +57,8 @@ function chipTitle(chip: ContextChip): string {
 
 export function ChatPanel(): React.JSX.Element {
   const state = useAi()
+  // 只取「有没有打开历史会话 + 是否忙」这两点：气泡上的分叉按钮要知道往哪个会话分。
+  const session = useSessions()
   // 只订阅「活动文件 + 选区」这一小块编辑器状态：打字不会让对话面板跟着重渲染。
   const reference = useEditorReference()
   const [draft, setDraft] = useState('')
@@ -195,17 +198,44 @@ export function ChatPanel(): React.JSX.Element {
         {state.bubbles.length === 0 ? (
           <div className="ai-note">还没有消息。选好模型后输入内容发送。</div>
         ) : (
-          state.bubbles.map((bubble, index) => (
-            <div
-              key={`${bubble.role}-${index}`}
-              className={`ai-bubble ai-bubble--${bubble.role}${bubble.status === 'error' ? ' ai-bubble--error' : ''}`}
-            >
-              <div className="ai-bubble__role">{bubble.role === 'user' ? '我' : '模型'}</div>
-              <div className="ai-bubble__text">{bubble.text}</div>
-              {bubble.status === 'streaming' ? <div className="ai-bubble__meta">生成中…</div> : null}
-              {bubble.note ? <div className="ai-bubble__meta">{bubble.note}</div> : null}
-            </div>
-          ))
+          state.bubbles.map((bubble, index) => {
+            // 分叉入口只在「这条气泡确实落在库里、且当前正看着它所属的会话」时出现：
+            // 没有 message_id 就没有截断点，会话 id 对不上就会分叉到别的会话上去。
+            const canFork =
+              session.currentId !== null &&
+              (bubble.messageId ?? null) !== null &&
+              bubble.status === 'done'
+            return (
+              <div
+                key={`${bubble.role}-${bubble.messageId ?? index}`}
+                className={`ai-bubble ai-bubble--${bubble.role}${bubble.status === 'error' ? ' ai-bubble--error' : ''}`}
+                data-testid="chat-bubble"
+              >
+                <div className="ai-bubble__role">{bubble.role === 'user' ? '我' : '模型'}</div>
+                <div className="ai-bubble__text">{bubble.text}</div>
+                {bubble.status === 'streaming' ? (
+                  <div className="ai-bubble__meta">生成中…</div>
+                ) : null}
+                {bubble.note ? <div className="ai-bubble__meta">{bubble.note}</div> : null}
+                {canFork ? (
+                  <button
+                    className="ai-button ai-button--tiny"
+                    type="button"
+                    data-testid="chat-fork-here"
+                    disabled={session.busy || state.streaming}
+                    title="以这条消息为结尾，复制出一个新会话继续聊（原会话不动）"
+                    onClick={() => {
+                      const target = session.currentId
+                      if (target === null) return
+                      void forkSession(target, bubble.messageId ?? null)
+                    }}
+                  >
+                    从此分叉
+                  </button>
+                ) : null}
+              </div>
+            )
+          })
         )}
       </div>
 

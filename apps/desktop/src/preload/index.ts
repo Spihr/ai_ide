@@ -49,6 +49,10 @@ const api: AiIdeApi = {
   pickWorkspaceDirectory: (): Promise<string | null> =>
     ipcRenderer.invoke(IpcChannels.pickWorkspace),
 
+  // M5：只提交默认名与扩展名，最终路径由系统对话框决定（渲染进程无法自选落点）。
+  pickSavePath: (defaultName: string, extensions: string[]): Promise<string | null> =>
+    ipcRenderer.invoke(IpcChannels.pickSavePath, defaultName, extensions),
+
   onWorkspaceChanged: (listener: (event: WorkspaceChangedEvent) => void): (() => void) => {
     const handler = (_event: IpcRendererEvent, payload: WorkspaceChangedEvent): void =>
       listener(payload)

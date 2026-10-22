@@ -6,11 +6,15 @@ import type { CoreStatus } from '../../shared/ipc'
 import { disposeAi, initAi } from './ai-store'
 import { ActivityBar } from './components/ActivityBar'
 import { AiPanel } from './components/AiPanel'
+import { CheckpointPanel } from './components/CheckpointPanel'
 import { CodeEditor } from './components/CodeEditor'
 import { EditorTabs } from './components/EditorTabs'
 import { FileTree } from './components/FileTree'
+import { PermissionPanel } from './components/PermissionPanel'
 import { SearchPanel } from './components/SearchPanel'
 import { StatusBar } from './components/StatusBar'
+import { initCheckpoints } from './checkpoint-store'
+import { initSessions } from './session-store'
 import {
   closeWorkspace,
   dismissNotice,
@@ -36,6 +40,11 @@ export function App() {
     const offWorkspace = initWorkspaceEvents()
     // AI 事件订阅常驻进程级：只在「AI」视图打开时才订阅会漏掉流式事件。
     initAi()
+    // M5：会话桥的回调与列表初值也在这里绑一次。必须早于任何一次发送——桥负责
+    // 在「第一条消息」落盘前自动建会话，晚绑一帧就会让这一轮对话丢归属。
+    initSessions()
+    // 检查点列表同理：有工作区就先拉一次，切到「检查点」视图时看到的就是最新的。
+    initCheckpoints()
     return () => {
       alive = false
       offStatus()
@@ -114,15 +123,30 @@ export function App() {
 
         <aside className="sidebar">
           <div className="sidebar__header">
-            {state.activity === 'explorer' ? '资源管理器' : state.activity === 'search' ? '搜索' : 'AI'}
+            {state.activity === 'explorer'
+              ? '资源管理器'
+              : state.activity === 'search'
+                ? '搜索'
+                : state.activity === 'checkpoints'
+                  ? '检查点'
+                  : state.activity === 'permissions'
+                    ? '权限'
+                    : 'AI'}
           </div>
-          {state.workspaceError && state.activity !== 'ai' && (
-            <p className="panel__error">{state.workspaceError}</p>
-          )}
+          {state.workspaceError &&
+            state.activity !== 'ai' &&
+            state.activity !== 'checkpoints' &&
+            state.activity !== 'permissions' && (
+              <p className="panel__error">{state.workspaceError}</p>
+            )}
           {state.activity === 'explorer' ? (
             hasWorkspace ? <FileTree /> : <p className="panel__hint">尚未打开工作区</p>
           ) : state.activity === 'search' ? (
             <SearchPanel />
+          ) : state.activity === 'checkpoints' ? (
+            <CheckpointPanel />
+          ) : state.activity === 'permissions' ? (
+            <PermissionPanel />
           ) : (
             <AiPanel />
           )}

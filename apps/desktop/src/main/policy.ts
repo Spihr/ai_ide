@@ -59,7 +59,46 @@ const RENDERER_ALLOWED = new Set<string>([
   // 因此不存在「绕过闸门」的入口——`permissions_override` 在 UI 上根本没有控件。
   Methods.agent.start,
   Methods.agent.stop,
-  Methods.agent.decide
+  Methods.agent.decide,
+
+  // M5：会话与审计。九条 `session.*` 全部是「用户显式动作」的直接后果：
+  // 新建 / 切换 / 改名 / 删除 / 导出 / 从某条消息分叉，以及对话面板发消息时
+  // 落盘的那一条（用户按了「发送」）。没有任何自动重试或后台批量改写的路径。
+  //
+  // `session.export` 会写盘，所以它不能拿到任意路径：`out_path` 一律由主进程的
+  // 系统保存对话框（`dialog:pick-save-path`）产生，渲染进程没有自行拼路径的入口。
+  // `audit.list` 是只读查询，且返回内容已在存储层脱敏（不含密钥、不含完整消息体）。
+  Methods.session.create,
+  Methods.session.list,
+  Methods.session.get,
+  Methods.session.update,
+  Methods.session.delete,
+  Methods.session.appendMessage,
+  Methods.session.messages,
+  Methods.session.export,
+  Methods.session.fork,
+
+  // M5：检查点。四条同样是「用户显式动作」：手动拍快照、打开面板看列表、
+  // 点「回滚」、删掉某个检查点。没有定时拍快照或自动回滚的路径
+  // （Agent 运行前后的自动检查点由内核自己建，不经渲染进程）。
+  //
+  // 其中 `checkpoint.restore` 会**覆盖工作区文件**：它是本白名单里破坏性最强的一条。
+  // 因此外壳侧强制「先列清单、再二次确认」——`CheckpointPanel` 在调用前必须让用户
+  // 敲一次确认，且回滚是内核按快照逐字节校验的（`verified` 如实回报），
+  // 不存在「点了就悄悄改一堆文件、用户不知道改了什么」的余地。
+  Methods.checkpoint.create,
+  Methods.checkpoint.list,
+  Methods.checkpoint.restore,
+  Methods.checkpoint.delete,
+
+  Methods.audit.list,
+
+  // M5：权限表（免问范围）。这两条回的是「用户自己点过的『总是允许』」的清单，
+  // 以及把它撤销掉——**都是显式动作的产物，且只有收窄权限的方向**：
+  // 协议里没有 `permission.allow`（授免问只能经 `agent.decide` 的 `allow_always`），
+  // 所以外壳不存在「悄悄给自己开权限」的入口，`revoke` 只会让闸门更严。
+  Methods.permission.list,
+  Methods.permission.revoke
 ])
 
 export interface PolicyDecision {

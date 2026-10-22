@@ -25,7 +25,7 @@ import type {
 
 import { workspaceApi, type ContentSearchOptions } from './workspace-api'
 
-export type ActivityView = 'explorer' | 'search' | 'ai'
+export type ActivityView = 'explorer' | 'search' | 'ai' | 'checkpoints' | 'permissions'
 
 /** 一个打开的编辑器标签。 */
 export interface Tab {

@@ -376,6 +376,36 @@ function registerIpc(): void {
     if (result.canceled || result.filePaths.length === 0) return null
     return result.filePaths[0] ?? null
   })
+
+  // M5：会话导出要落盘，落点只能来自用户亲手点的保存对话框。
+  ipcMain.handle(
+    IpcChannels.pickSavePath,
+    async (_event, defaultName: unknown, extensions: unknown): Promise<string | null> => {
+      const name =
+        typeof defaultName === 'string' && defaultName.trim().length > 0
+          ? defaultName.trim().slice(0, 200)
+          : 'export.md'
+      // 只接受「纯扩展名」：带路径分隔符或点号的输入一律丢弃，避免伪造过滤器。
+      const exts = (Array.isArray(extensions) ? extensions : [])
+        .filter((item): item is string => typeof item === 'string')
+        .map((item) => item.replace(/^\./, '').trim())
+        .filter((item) => /^[a-z0-9]{1,12}$/i.test(item))
+        .slice(0, 5)
+      const options: Electron.SaveDialogOptions = {
+        title: '导出会话',
+        buttonLabel: '导出',
+        defaultPath: name,
+        filters: exts.length > 0 ? [{ name: '导出文件', extensions: exts }] : undefined
+      }
+      const result =
+        mainWindow && !mainWindow.isDestroyed()
+          ? await dialog.showSaveDialog(mainWindow, options)
+          : await dialog.showSaveDialog(options)
+
+      if (result.canceled || !result.filePath) return null
+      return result.filePath
+    }
+  )
 }
 
 // ---------------------------------------------------------------------------

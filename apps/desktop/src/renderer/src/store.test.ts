@@ -87,6 +87,8 @@ function installHarness(): Harness {
     ping: async () => {
       throw new Error('测试未使用 ping')
     },
+    // M5：导出会话的落点由主进程的系统对话框决定，渲染侧只拿返回的路径。
+    pickSavePath: async () => null,
     pickWorkspaceDirectory: async () => ROOT,
     request: async (method: string, params?: unknown) => {
       calls.push({ method, params: params as Record<string, unknown> | undefined })

@@ -10,11 +10,13 @@
 import { AgentPanel } from './AgentPanel'
 import { ChatPanel } from './ChatPanel'
 import { ProviderSettings } from './ProviderSettings'
+import { SessionPanel } from './SessionPanel'
 
 export function AiPanel(): React.JSX.Element {
   return (
     <div className="ai" data-testid="ai-panel">
       <ProviderSettings />
+      <SessionPanel />
       <ChatPanel />
       <AgentPanel />
     </div>
