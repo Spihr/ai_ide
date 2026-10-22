@@ -28,11 +28,12 @@ AIGC:
 | M3 | 上下文引用 | 已完成，验收见 [`docs/09-M3-验收报告.md`](./docs/09-M3-验收报告.md) |
 | M4 | Agent 闭环 | 内核与外壳主线已完成（Agent 循环与 8 个工具、权限闸门四动作、`agent.*` 协议与 core 接线、外壳运行面板与审批 UI），验收见 [`docs/10-M4-验收报告.md`](./docs/10-M4-验收报告.md)；端到端基线任务与真实上游实跑已完成（基线 4/4、`edit_file` 非唯一匹配 20/20），联调凭据默认读仓库根 `.e2e-m4-credentials.json`（已在 `.gitignore` 中忽略） |
 | M5 | 持久化与治理 | 已完成（内核 + 外壳主线 + 收口）：`crates/store` 会话 / 消息 / 审计仓储（事务内分叉、审计脱敏留存）、九个 `session.*` 与只读 `audit.list`、检查点回滚（`checkpoint.create` / `list` / `restore` / `delete`，快照 SHA-256 逐文件复核）、JSONL 结构化日志（按天滚动 + 脱敏开关 + 32 MiB 滚动上限）、权限表持久化（`permission.list` / `revoke`，落 `permission_rule` 表），能力清单 30 → 46，验收见 [`docs/11-M5-验收报告.md`](./docs/11-M5-验收报告.md) |
-| M6–M8 | 终端与 Git / MCP / 打包 | 未开工；M8 仅打包链路先行落地（产出 `AI-IDE-0.1.0-win-x64.exe`，core 二进制在 asar 外），干净环境安装验收未做 |
+| M6 | 终端 + Git | **切片一（内核终端）已完成**：`crates/terminal`（`portable-pty` 之上的 `TerminalManager`，多会话 / resize 夹取 / 退出清理 / 单一事件通道）、`terminal.create` / `write` / `resize` / `kill` / `list` 五方法与 `terminal.data` / `terminal.exit` 两事件已进协议 `IMPLEMENTED` 并挂进 `crates/core` dispatch（`terminal_api.rs`），能力清单 46 → **51**；测试：`crates/terminal` 单测 13 项 + `crates/core/tests/terminal_flow.rs` 端到端 8 项（能力清单、多会话不串台、resize 夹取、shell 自行退出与 kill 两条清理路径、base64 / 启动失败错误码）。Git（`git.*`）与外壳终端面板未做 |
+| M7–M8 | MCP / 打包 | 未开工；M8 仅打包链路先行落地（产出 `AI-IDE-0.1.0-win-x64.exe`，core 二进制在 asar 外），干净环境安装验收未做 |
 
-**已可运行的能力**：打开工作区与文件树（懒加载、忽略规则）、Monaco 多标签编辑与保存（乐观锁 hash + CRLF 往返还原）、文件名模糊检索与内容检索、外部改动监听与通知、Main 侧策略闸门、内核进程监管与优雅退出、Rust 协议类型自动生成到 TS、Provider / 模型目录（落盘 `providers.json`、密钥加密存储）、OpenAI 兼容流式对话（`llm.chat_stream` / `cancel` / `list_models` / `count_tokens`，含 `llm.error` 错误分类）、Agent 闭环（8 个工具、权限闸门四动作、diff 预览与审批）、会话持久化（首条消息自动建会话、流结束按用量落 `assistant`，杀进程重启后历史完整）、会话导出（Markdown / JSON，落点只经系统保存对话框）、会话分叉、只读审计（会话创建 / 更新 / 删除 / 导出 / 分叉留痕，存储层脱敏）、检查点与回滚（手动 / Agent 自动留痕，回滚后逐文件 SHA-256 复核）、JSONL 结构化日志（`<data_dir>/logs/core-YYYY-MM-DD.jsonl`，按天滚动、出口脱敏）、权限表持久化（`allow_always` 落库，重启后仍生效，可在面板撤销）。
+**已可运行的能力**：打开工作区与文件树（懒加载、忽略规则）、Monaco 多标签编辑与保存（乐观锁 hash + CRLF 往返还原）、文件名模糊检索与内容检索、外部改动监听与通知、Main 侧策略闸门、内核进程监管与优雅退出、Rust 协议类型自动生成到 TS、Provider / 模型目录（落盘 `providers.json`、密钥加密存储）、OpenAI 兼容流式对话（`llm.chat_stream` / `cancel` / `list_models` / `count_tokens`，含 `llm.error` 错误分类）、Agent 闭环（8 个工具、权限闸门四动作、diff 预览与审批）、会话持久化（首条消息自动建会话、流结束按用量落 `assistant`，杀进程重启后历史完整）、会话导出（Markdown / JSON，落点只经系统保存对话框）、会话分叉、只读审计（会话创建 / 更新 / 删除 / 导出 / 分叉留痕，存储层脱敏）、检查点与回滚（手动 / Agent 自动留痕，回滚后逐文件 SHA-256 复核）、JSONL 结构化日志（`<data_dir>/logs/core-YYYY-MM-DD.jsonl`，按天滚动、出口脱敏）、权限表持久化（`allow_always` 落库，重启后仍生效，可在面板撤销）、内核终端会话（`terminal.create` / `write` / `resize` / `kill` / `list`，PTY 原始字节经 `terminal.data` 推送，子进程退出（含自行 `exit`）统一走 `terminal.exit` 并自动从列表摘除）。
 
-**尚未实现**：内置终端、Git UI、MCP、安装包的干净环境验收、Inline Edit（Ctrl+K）、Tab 补全、LSP、会话与审计列表的「加载更多」、消息内容检索与消息级分叉入口；M4 遗留：工具调用独立卡片组件、多模型复测（`scripts/e2e-m4.mjs` 已落地，跑 `pnpm e2e:m4` 即可，凭据默认读 `<仓库根>/.e2e-m4-credentials.json`，该文件已在 `.gitignore` 中忽略、也可用 `--creds` 覆盖）。
+**尚未实现**：终端面板（内核能力已就绪、外壳未接）、Git UI、MCP、安装包的干净环境验收、Inline Edit（Ctrl+K）、Tab 补全、LSP、会话与审计列表的「加载更多」、消息内容检索与消息级分叉入口；M4 遗留：工具调用独立卡片组件、多模型复测（`scripts/e2e-m4.mjs` 已落地，跑 `pnpm e2e:m4` 即可，凭据默认读 `<仓库根>/.e2e-m4-credentials.json`，该文件已在 `.gitignore` 中忽略、也可用 `--creds` 覆盖）。
 
 ---
 

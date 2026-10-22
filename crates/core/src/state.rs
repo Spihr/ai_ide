@@ -9,6 +9,7 @@ use crate::llm_runtime::{default_store_path, LlmRuntime};
 use crate::peer::Peer;
 use ai_ide_indexer::FileIndex;
 use ai_ide_store::Store;
+use ai_ide_terminal::TerminalManager;
 use ai_ide_workspace::{Workspace, WorkspaceError, WorkspaceManager};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -38,6 +39,10 @@ pub struct AppState {
     /// 在途 agent 运行的登记表（M4）。与 `streams` 同理：`agent.stop` / `agent.decide`
     /// 都是独立报文，需要按 `run_id` / `approval_id` 找到那条运行或那条待决询问。
     agents: Arc<AgentHub>,
+    /// 终端会话表（M6 切片一）。PTY 子进程与读线程都在 `crates/terminal` 里，
+    /// 状态里只留管理器句柄：`terminal.*` 是独立报文，和 agent / stream 一样要按
+    /// 会话 id 找到对应实例。
+    terminals: Arc<TerminalManager>,
     /// 会话与消息库（M5）。进程启动时连一次，此后只读句柄。
     ///
     /// 用 `OnceLock` 而不是 `Mutex<Option<..>>`：它只写一次，写入发生在开始读 stdin
@@ -64,6 +69,7 @@ impl AppState {
             llm: LlmRuntime::new(default_store_path()),
             streams: Arc::new(StreamHub::new()),
             agents: Arc::new(AgentHub::new()),
+            terminals: Arc::new(TerminalManager::new()),
             store: OnceLock::new(),
         }
     }
@@ -86,6 +92,11 @@ impl AppState {
     /// 在途 agent 运行的登记表（M4）。
     pub fn agent(&self) -> Arc<AgentHub> {
         Arc::clone(&self.agents)
+    }
+
+    /// 终端会话管理器（M6 切片一）。事件通道由 `run()` 取走后统一转发。
+    pub fn terminal(&self) -> Arc<TerminalManager> {
+        Arc::clone(&self.terminals)
     }
 
     /// 装上会话库（M5）。重复调用保留第一次装上的那份——库句柄是进程级资源，
@@ -255,6 +266,19 @@ mod tests {
         let ts = now_ms();
         assert!(ts > 1_577_836_800_000, "时间戳看起来不对: {ts}");
         assert!(ts < 4_102_444_800_000, "时间戳看起来不对: {ts}");
+    }
+
+    /// 终端管理器随状态一起建好，且初始没有任何会话：
+    /// `terminal.list` 在没人建过会话时必须回空表，而不是报「管理器缺失」。
+    #[test]
+    fn terminal_manager_starts_empty() {
+        let state = AppState::new();
+        assert_eq!(state.terminal().count(), 0);
+        assert!(state.terminal().list().is_empty());
+        // 两个句柄指向同一份会话表。
+        let first = state.terminal();
+        let second = state.terminal();
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
     }
 
     /// 没装库的状态必须自曝其短：`session.*` 靠这个 `None` 报 5002。

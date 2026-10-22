@@ -10,6 +10,7 @@
 //! | `3xxx` | 工具与 Agent 执行 |
 //! | `4xxx` | 运行时（取消等） |
 //! | `5xxx` | 会话持久化 |
+//! | `6xxx` | 终端会话 |
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -69,6 +70,16 @@ impl ErrorCode {
     pub const CHECKPOINT_NOT_FOUND: Self = Self(5006);
     /// 检查点元数据损坏或回滚后回读校验不一致。
     pub const CHECKPOINT_CORRUPT: Self = Self(5007);
+
+    // ---------- 6xxx 终端 ----------
+    /// 终端会话不存在：已经退出、或被 `terminal.kill` 收掉了。
+    pub const TERMINAL_NOT_FOUND: Self = Self(6001);
+    /// PTY 起不来：shell 不存在、cwd 不可用、ConPTY 建不出来。
+    pub const TERMINAL_SPAWN_FAILED: Self = Self(6002);
+    /// 会话在但这次操作失败：写管道被对端关闭、resize 被拒。
+    pub const TERMINAL_IO_ERROR: Self = Self(6003);
+    /// 参数不可用：`data` 不是合法 base64、尺寸无法夹取等。
+    pub const TERMINAL_INVALID: Self = Self(6004);
 
     pub const fn as_i32(self) -> i32 {
         self.0

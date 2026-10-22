@@ -1,0 +1,18 @@
+[package]
+name = "ai-ide-terminal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AI IDE 的伪终端会话内核（M6 切片一）：多会话、resize、输出事件流"
+
+[dependencies]
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+# Windows 走 ConPTY、Unix 走 openpty，统一在一层 trait 后面
+portable-pty.workspace = true
+# 终端输出不保证是合法 UTF-8，事件载荷按 base64 传
+base64.workspace = true

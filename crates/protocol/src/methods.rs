@@ -124,6 +124,25 @@ pub mod permission {
     pub const REVOKE: &str = "permission.revoke";
 }
 
+/// 终端会话（M6 切片一：PTY 在 `crates/terminal`，`crates/core` 只做协议翻译）。
+///
+/// 五个动作覆盖一个终端的完整生命周期：`create` 建、`write` 喂输入、`resize`
+/// 跟着窗口走、`kill` 主动收、`list` 自查（客户端掉线重连后靠它捡回会话）。
+/// 输出不经请求-响应，而是走 [`event::TERMINAL_DATA`] 的单向推送——终端的输出
+/// 是持续的字节流，用请求去「拉」只会让谁先谁后全乱。
+pub mod terminal {
+    /// 新建一个终端会话（返回会话视图）。
+    pub const CREATE: &str = "terminal.create";
+    /// 往终端写输入（`data` 为 base64 原始字节，客户端据此可发任意控制序列）。
+    pub const WRITE: &str = "terminal.write";
+    /// 改终端尺寸（列 × 行）。
+    pub const RESIZE: &str = "terminal.resize";
+    /// 杀掉终端会话（先礼后兵：先请求进程退出，超时再强杀）。
+    pub const KILL: &str = "terminal.kill";
+    /// 列出当前存活的终端会话。
+    pub const LIST: &str = "terminal.list";
+}
+
 /// Core → Main 的通知（事件）。
 pub mod event {
     /// 内核日志转发，便于 Main 侧统一落盘。
@@ -153,6 +172,11 @@ pub mod event {
     pub const AGENT_APPROVAL_REQUIRED: &str = "agent.approval_required";
     /// Agent 一次运行结束（M4），成功 / 失败 / 被取消都走它。
     pub const AGENT_FINISHED: &str = "agent.finished";
+
+    /// 终端有输出可读（M6），`data` 为 base64 原始字节。
+    pub const TERMINAL_DATA: &str = "terminal.data";
+    /// 终端子进程退出（M6）：自然结束、崩溃、被 `terminal.kill` 杀掉都走它。
+    pub const TERMINAL_EXIT: &str = "terminal.exit";
 }
 
 /// 内核**真正接线并可路由**的方法全集，用于单测与能力声明。
@@ -220,6 +244,12 @@ pub const IMPLEMENTED: &[&str] = &[
     // M5 切片六：权限免问规则（读取与撤销由 `crates/core` 接线）。
     permission::LIST,
     permission::REVOKE,
+    // M6 切片一：终端会话（PTY 在 `crates/terminal`，dispatch 已接线）。
+    terminal::CREATE,
+    terminal::WRITE,
+    terminal::RESIZE,
+    terminal::KILL,
+    terminal::LIST,
 ];
 
 /// 协议面**已定义、但内核尚未接线**的方法。
@@ -241,7 +271,7 @@ mod tests {
 
     #[test]
     fn implemented_list_covers_core_m1_m2_agent_domains() {
-        assert_eq!(IMPLEMENTED.len(), 46);
+        assert_eq!(IMPLEMENTED.len(), 51);
         assert!(IMPLEMENTED.contains(&"core.ping"));
         assert!(IMPLEMENTED.contains(&"$/cancelRequest"));
         assert!(IMPLEMENTED.contains(&"workspace.read_file"));
@@ -276,6 +306,18 @@ mod tests {
         assert!(IMPLEMENTED.contains(&checkpoint::RESTORE));
         assert!(IMPLEMENTED.contains(&checkpoint::DELETE));
         assert_eq!(checkpoint::RESTORE, "checkpoint.restore");
+        // M6 切片一：终端五个方法进清单，事件不进。
+        for name in [
+            terminal::CREATE,
+            terminal::WRITE,
+            terminal::RESIZE,
+            terminal::KILL,
+            terminal::LIST,
+        ] {
+            assert!(IMPLEMENTED.contains(&name), "{name} 应已接线");
+        }
+        assert_eq!(terminal::CREATE, "terminal.create");
+        assert_eq!(terminal::RESIZE, "terminal.resize");
     }
 
     #[test]
@@ -305,7 +347,7 @@ mod tests {
         all.sort_unstable();
         all.dedup();
         assert_eq!(all.len(), total, "两张表不得有重叠");
-        assert_eq!(total, 46, "应恰好覆盖协议里定义的全部 46 个请求方法");
+        assert_eq!(total, 51, "应恰好覆盖协议里定义的全部 51 个请求方法");
     }
 
     #[test]
@@ -334,6 +376,8 @@ mod tests {
             event::PROVIDER_CHANGED,
             event::AGENT_APPROVAL_REQUIRED,
             event::AGENT_FINISHED,
+            event::TERMINAL_DATA,
+            event::TERMINAL_EXIT,
         ] {
             assert!(!IMPLEMENTED.contains(&event), "事件不该进能力清单: {event}");
             assert!(

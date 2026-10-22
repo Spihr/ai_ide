@@ -19,6 +19,10 @@ ai-ide-llm = { workspace = true }
 ai-ide-agent = { workspace = true }
 # M5 切片二：内核接线会话持久化（协议面 `session.*` 与 store 同切片落地）。
 ai-ide-store = { workspace = true }
+# M6 切片一：内核接线终端（PTY 在 crates/terminal，core 只做协议翻译与事件转发）。
+ai-ide-terminal = { workspace = true }
+# `terminal.write` / `terminal.data` 的载荷是原始字节的 base64，core 侧负责编解码。
+base64 = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -33,3 +37,5 @@ async-trait = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+# 终端端到端测试要断言 `terminal.data` 里的输出内容，得把 base64 解回来
+base64 = { workspace = true }
