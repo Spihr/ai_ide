@@ -61,3 +61,7 @@ Desktop.ini
 desktop.ini
 $RECYCLE.BIN/
 .DS_Store
+
+# ---- 插件系统 demo 的运行时产物 ----
+demo-plugin-system/.tmp-workspace/
+demo-plugin-system/fixtures/workspace/.git/

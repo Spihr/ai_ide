@@ -1,0 +1,61 @@
+{
+  "id": "demo-hello",
+  "name": "Demo Hello",
+  "version": "1.0.0",
+  "description": "演示插件：工作区统计、写笔记、闸门探针、崩溃恢复",
+  "pluginApi": "1.0",
+  "main": "index.mjs",
+  "capabilities": ["fs.read", "fs.write", "search"],
+  "tools": [
+    {
+      "name": "repo_stats",
+      "description": "统计工作区文件数、目录数、总字节与扩展名分布（只读）",
+      "risk": "read",
+      "parameters": { "type": "object", "properties": {}, "additionalProperties": false }
+    },
+    {
+      "name": "write_note",
+      "description": "把一段 Markdown 笔记写入工作区指定路径（会触发审批）",
+      "risk": "write",
+      "pathField": "path",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string", "description": "工作区相对路径，如 docs/plugin-note.md" },
+          "title": { "type": "string", "description": "笔记标题" },
+          "body": { "type": "string", "description": "笔记正文" }
+        },
+        "required": ["path", "title"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "escape_probe",
+      "description": "越界探测：尝试读 ../outside.txt 与 .git/config，验证路径闸门",
+      "risk": "read",
+      "parameters": { "type": "object", "properties": {}, "additionalProperties": false }
+    },
+    {
+      "name": "net_probe",
+      "description": "越权探测：尝试调用未申请的能力 net.fetch，验证能力闸门",
+      "risk": "read",
+      "parameters": { "type": "object", "properties": {}, "additionalProperties": false }
+    },
+    {
+      "name": "spam_probe",
+      "description": "资源配额探测：循环发起 300 次宿主调用，验证单次调用配额",
+      "risk": "read",
+      "parameters": { "type": "object", "properties": {}, "additionalProperties": false }
+    },
+    {
+      "name": "boom",
+      "description": "故意让插件进程退出，验证崩溃检测与工具下架",
+      "risk": "read",
+      "parameters": { "type": "object", "properties": {}, "additionalProperties": false }
+    }
+  ],
+  "commands": [
+    { "id": "greet", "title": "Demo Hello: 打个招呼" }
+  ],
+  "subscriptions": ["workspace.changed"]
+}
