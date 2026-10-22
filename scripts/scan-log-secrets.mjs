@@ -9,13 +9,22 @@
  * 用法：
  *   node scripts/scan-log-secrets.mjs <日志目录> [--require-files]
  *   node scripts/scan-log-secrets.mjs --self-test
+ *   node scripts/scan-log-secrets.mjs --probe [内核可执行文件路径]
  *
  * `--require-files`：目录里没有任何日志行就判失败，避免「扫了个空目录」蒙混过关。
  * `--self-test`：先自证检测器有效（正样本必中、脱敏后的形态必不中），再退出。
+ * `--probe`：CI 门禁入口。先自检检测器，再拉起内核（`AI_IDE_LOG_PROBE=1`）写一批
+ *   含**假**密钥的真实日志，随后按 `--require-files` 口径扫描这批日志——这样门禁
+ *   既验证了「脱敏真的生效」，也验证了「检测器真的能命中明文」，不是空目录过关。
  */
 
-import { readdirSync, readFileSync, statSync } from 'node:fs'
-import { extname, join } from 'node:path'
+import { spawn } from 'node:child_process'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, extname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
 /** 会被当作密钥的特征模式。刻意比脱敏侧宽：宁可误报，不可漏报。 */
 const PATTERNS = [
@@ -141,20 +150,8 @@ function selfTest() {
   )
 }
 
-function main() {
-  const args = process.argv.slice(2)
-  if (args.includes('--self-test')) {
-    selfTest()
-    return
-  }
-
-  const requireFiles = args.includes('--require-files')
-  const dir = args.find((arg) => !arg.startsWith('--'))
-  if (!dir) {
-    console.error('用法：node scripts/scan-log-secrets.mjs <日志目录> [--require-files]')
-    process.exit(2)
-  }
-
+/** 扫描一个目录，返回命中列表；目录为空且 requireFiles 时直接判失败。 */
+function scanDir(dir, { requireFiles }) {
   const files = listLogFiles(dir)
   if (files.length === 0) {
     if (requireFiles) {
@@ -182,6 +179,100 @@ function main() {
     process.exit(1)
   }
   console.log(`PASS  ${files.length} 个日志文件 / ${lines} 行，未发现明文凭据`)
+}
+
+/**
+ * CI 门禁：让内核亲手写一批日志，再扫自己写的东西。
+ *
+ * 只用固定样本扫描等于自欺——真正要证明的是「内核运行时落盘的日志里没有明文」。
+ * 所以这里启动真实二进制，用 `AI_IDE_LOG_PROBE=1` 触发内置探针（打一条含假密钥的
+ * 事件），日志目录指向临时目录，随后按 `--require-files` 口径扫描。
+ */
+async function probeScan(exe) {
+  if (!existsSync(exe)) {
+    console.error(`找不到内核可执行文件：${exe}`)
+    console.error('请先执行：cargo build -p ai-ide-core')
+    process.exit(1)
+  }
+
+  selfTest()
+
+  const root = mkdtempSync(join(tmpdir(), 'ai-ide-log-gate-'))
+  const logDir = join(root, 'logs')
+  const dataDir = join(root, 'data')
+  mkdirSync(logDir, { recursive: true })
+  mkdirSync(dataDir, { recursive: true })
+
+  let child
+  try {
+    child = spawn(exe, [], {
+      stdio: ['pipe', 'ignore', 'pipe'],
+      windowsHide: true,
+      env: {
+        ...process.env,
+        AI_IDE_LOG_PROBE: '1',
+        AI_IDE_LOG_DIR: logDir,
+        AI_IDE_DATA_DIR: dataDir,
+      },
+    })
+
+    let stderrText = ''
+    child.stderr.setEncoding('utf8')
+    child.stderr.on('data', (chunk) => {
+      stderrText += chunk
+    })
+
+    const exited = new Promise((resolveExit) => {
+      child.on('exit', (code, signal) => resolveExit({ code, signal }))
+    })
+
+    // 探针在启动时同步写一行；留一点落盘时间再关 stdin，让内核按 EOF 正常退出。
+    await new Promise((done) => setTimeout(done, 1200))
+    child.stdin.end()
+    const killer = setTimeout(() => child.kill(), 20_000)
+    const { code } = await exited
+    clearTimeout(killer)
+
+    if (code !== 0) {
+      console.error(`FAIL  内核以退出码 ${code} 结束，日志取样不可信`)
+      if (stderrText.trim().length > 0) console.error(stderrText.trim().slice(0, 800))
+      process.exit(1)
+    }
+
+    console.log(`内核探针日志目录：${logDir}`)
+    scanDir(logDir, { requireFiles: true })
+  } finally {
+    if (child && child.exitCode === null) child.kill()
+    rmSync(root, { recursive: true, force: true })
+  }
+}
+
+function main() {
+  const args = process.argv.slice(2)
+  if (args.includes('--self-test')) {
+    selfTest()
+    return
+  }
+
+  if (args.includes('--probe')) {
+    const exe =
+      args.find((arg) => !arg.startsWith('--')) ??
+      join(repoRoot, 'target', 'debug', process.platform === 'win32' ? 'ai-ide-core.exe' : 'ai-ide-core')
+    probeScan(exe).catch((err) => {
+      console.error(`FAIL  探针取样异常：${err?.message ?? err}`)
+      process.exit(1)
+    })
+    return
+  }
+
+  const dir = args.find((arg) => !arg.startsWith('--'))
+  if (!dir) {
+    console.error('用法：node scripts/scan-log-secrets.mjs <日志目录> [--require-files]')
+    console.error('      node scripts/scan-log-secrets.mjs --probe [内核可执行文件路径]')
+    process.exit(2)
+  }
+
+  scanDir(dir, { requireFiles: args.includes('--require-files') })
 }
 
 main()

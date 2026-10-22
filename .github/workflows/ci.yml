@@ -39,6 +39,14 @@ jobs:
       - name: 协议冒烟
         run: node scripts/smoke-core.mjs
 
+      # 「日志不含 API Key」是 docs/05 的 M5 硬指标。这里不只扫固定样本：
+      # 先自检检测器，再让内核以 AI_IDE_LOG_PROBE=1 写一批含假密钥的真实日志，
+      # 然后扫它自己写的日志。扫不到任何日志行也算失败，避免空目录蒙混过关。
+      # 直接跑脚本（只用 Node 内置模块，不依赖 pnpm 安装）；本机等价入口是
+      # `pnpm scan:secrets`，它执行的就是同一条命令。
+      - name: 日志密钥扫描
+        run: node scripts/scan-log-secrets.mjs --probe
+
   desktop:
     name: Desktop（类型 + 检查 + 测试）
     runs-on: windows-latest
