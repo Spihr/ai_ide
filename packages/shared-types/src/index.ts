@@ -144,6 +144,9 @@ export type { AgentFinishedEvent } from "./generated/AgentFinishedEvent";
 // ---- session.* 方法（M5）----
 export type { SessionView } from "./generated/SessionView";
 export type { MessageView } from "./generated/MessageView";
+// 消息的 usage 是「上游原始用量，原样保存」，形状由上游决定，故用 ts-rs 导出的
+// JSON 值类型而非为它另造结构（造了就得跟着上游字段变而改协议）。
+export type { JsonValue } from "./generated/serde_json/JsonValue";
 export type { SessionCreateParams } from "./generated/SessionCreateParams";
 export type { SessionCreateResult } from "./generated/SessionCreateResult";
 export type { SessionListParams } from "./generated/SessionListParams";
@@ -163,6 +166,29 @@ export type { SessionExportResult } from "./generated/SessionExportResult";
 export type { SessionExportDocument } from "./generated/SessionExportDocument";
 export type { SessionForkParams } from "./generated/SessionForkParams";
 export type { SessionForkResult } from "./generated/SessionForkResult";
+
+// ---- checkpoint.* 方法（M5）----
+export type { CheckpointView } from "./generated/CheckpointView";
+export type { CheckpointFileView } from "./generated/CheckpointFileView";
+export type { CheckpointFileKind } from "./generated/CheckpointFileKind";
+export type { CheckpointOrigin } from "./generated/CheckpointOrigin";
+export type { CheckpointCreateParams } from "./generated/CheckpointCreateParams";
+export type { CheckpointCreateResult } from "./generated/CheckpointCreateResult";
+export type { CheckpointListParams } from "./generated/CheckpointListParams";
+export type { CheckpointListResult } from "./generated/CheckpointListResult";
+export type { CheckpointRestoreParams } from "./generated/CheckpointRestoreParams";
+export type { CheckpointRestoreResult } from "./generated/CheckpointRestoreResult";
+export type { CheckpointRestoreFileView } from "./generated/CheckpointRestoreFileView";
+export type { CheckpointRestoreStatus } from "./generated/CheckpointRestoreStatus";
+export type { CheckpointDeleteParams } from "./generated/CheckpointDeleteParams";
+export type { CheckpointDeleteResult } from "./generated/CheckpointDeleteResult";
+
+// ---- permission.* 方法（M5）----
+export type { PermissionRuleView } from "./generated/PermissionRuleView";
+export type { PermissionListParams } from "./generated/PermissionListParams";
+export type { PermissionListResult } from "./generated/PermissionListResult";
+export type { PermissionRevokeParams } from "./generated/PermissionRevokeParams";
+export type { PermissionRevokeResult } from "./generated/PermissionRevokeResult";
 
 // ---- audit.* 方法（M5）----
 export type { AuditEventView } from "./generated/AuditEventView";
@@ -241,6 +267,16 @@ export const Methods = {
     export: "session.export",
     fork: "session.fork",
   },
+  checkpoint: {
+    create: "checkpoint.create",
+    list: "checkpoint.list",
+    restore: "checkpoint.restore",
+    delete: "checkpoint.delete",
+  },
+  permission: {
+    list: "permission.list",
+    revoke: "permission.revoke",
+  },
   audit: {
     list: "audit.list",
   },
@@ -267,8 +303,9 @@ export const Methods = {
  * M0 + M1（协议内核 / 工作区 / 检索）+ M2 的 `provider.*` / `model.*` / `llm.*`
  * （Provider 与模型目录，含密钥内存保管与脱敏视图；流式对话、取消与用量统计），
  * 再加 M4 第三切片的 `agent.*` 三项、M5 的 `session.*` 九项（会话 / 消息落盘，
- * 含导出与分叉）与 `audit.list`（审计账本只读查询），共 40 项，与 Rust
- * `methods::IMPLEMENTED` 逐项对齐。
+ * 含导出与分叉）、`checkpoint.*` 四项（快照 / 列表 / 回滚 / 删除）、
+ * `permission.*` 两项（免问规则列表 / 撤销）与 `audit.list`（审计账本只读查询），
+ * 共 46 项，与 Rust `methods::IMPLEMENTED` 逐项对齐。
  */
 export const IMPLEMENTED_METHODS = [
   Methods.core.hello,
@@ -310,6 +347,12 @@ export const IMPLEMENTED_METHODS = [
   Methods.session.messages,
   Methods.session.export,
   Methods.session.fork,
+  Methods.checkpoint.create,
+  Methods.checkpoint.list,
+  Methods.checkpoint.restore,
+  Methods.checkpoint.delete,
+  Methods.permission.list,
+  Methods.permission.revoke,
   Methods.audit.list,
 ] as const;
 

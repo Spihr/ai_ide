@@ -65,6 +65,10 @@ impl ErrorCode {
     pub const EXPORT_FAILED: Self = Self(5004);
     /// 会话过大：导出 / 分叉单次只处理 10000 条消息，超过就明确报错而不是静默截断。
     pub const SESSION_TOO_LARGE: Self = Self(5005);
+    /// 检查点不存在：回滚 / 删除都会命中。
+    pub const CHECKPOINT_NOT_FOUND: Self = Self(5006);
+    /// 检查点元数据损坏或回滚后回读校验不一致。
+    pub const CHECKPOINT_CORRUPT: Self = Self(5007);
 
     pub const fn as_i32(self) -> i32 {
         self.0

@@ -1731,6 +1731,282 @@ pub struct AuditListResult {
     pub total: u64,
 }
 
+// ---------------------------------------------------------------------------
+// checkpoint.*（M5 切片五：检查点与回滚）
+// ---------------------------------------------------------------------------
+
+/// 检查点是怎么来的。
+///
+/// 区分来源不是为了好看：UI 里「Agent 自动拍的」和「我手动拍的」要能分开列，
+/// 排查「谁把这个文件改了」时第一眼看的就是这两种。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointOrigin {
+    /// 用户手动创建。
+    Manual,
+    /// Agent 改动文件前自动创建。
+    Agent,
+}
+
+/// 一个文件相对检查点时刻的处置方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointFileKind {
+    /// 拍快照时存在且有内容：回滚要用快照覆盖回去。
+    Modified,
+    /// 拍快照时不存在：回滚要把它删掉。
+    Created,
+    /// 拍快照时存在但已被删除：回滚要把它恢复出来。
+    Deleted,
+}
+
+/// 检查点里的一个文件。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CheckpointFileView {
+    /// 相对工作区根的路径，统一用 `/` 分隔。
+    pub path: String,
+    pub kind: CheckpointFileKind,
+    /// 快照时刻内容的 SHA-256（十六进制）。`created` 下为空。
+    #[serde(default)]
+    #[ts(optional)]
+    pub before_hash: Option<String>,
+    /// 快照内容的字节数。
+    #[ts(type = "number")]
+    pub size: u64,
+}
+
+/// 一个检查点。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CheckpointView {
+    pub checkpoint_id: String,
+    /// 人可读标题，例如「Agent 改动前（run 8f2a）」。
+    pub label: String,
+    /// 建立快照时工作区的绝对根路径。回滚按它定位，不依赖工作区还开着。
+    pub workspace_root: String,
+    pub origin: CheckpointOrigin,
+    /// Agent 自动检查点时关联的会话。
+    #[serde(default)]
+    #[ts(optional)]
+    pub session_id: Option<String>,
+    /// 建立时刻（Unix 毫秒）。
+    #[ts(type = "number")]
+    pub created_at_ms: i64,
+    /// 快照覆盖的文件清单。
+    pub files: Vec<CheckpointFileView>,
+    /// 快照内容占用的字节数。
+    #[ts(type = "number")]
+    pub total_bytes: u64,
+    /// 因为单文件体积 / 文件数 / 总容量上限被跳过的文件数。
+    #[ts(type = "number")]
+    pub skipped: u64,
+}
+
+/// `checkpoint.create` 请求参数。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CheckpointCreateParams {
+    /// 目标工作区；缺省取当前活动工作区。
+    #[serde(default)]
+    #[ts(optional)]
+    pub workspace_id: Option<String>,
+    /// 标题；缺省时内核按来源生成。
+    #[serde(default)]
+    #[ts(optional)]
+    pub label: Option<String>,
+    /// 只给这些相对路径拍快照；缺省时按忽略规则遍历整个工作区。
+    #[serde(default)]
+    #[ts(optional)]
+    pub paths: Option<Vec<String>>,
+    /// 关联会话（Agent 自动检查点会带）。
+    #[serde(default)]
+    #[ts(optional)]
+    pub session_id: Option<String>,
+}
+
+/// `checkpoint.create` 响应结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CheckpointCreateResult {
+    pub checkpoint: CheckpointView,
+}
+
+/// `checkpoint.list` 请求参数。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CheckpointListParams {
+    /// 只看某个工作区的检查点；缺省取当前活动工作区。
+    #[serde(default)]
+    #[ts(optional)]
+    pub workspace_id: Option<String>,
+    /// 返回条数上限，缺省 50，内部夹到 1..=200。
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub limit: Option<u32>,
+    /// 偏移量，缺省 0。
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub offset: Option<u32>,
+}
+
+/// `checkpoint.list` 响应结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CheckpointListResult {
+    /// 按创建时间倒序。
+    pub checkpoints: Vec<CheckpointView>,
+    /// 该工作区下的检查点总数（不受 `limit` / `offset` 影响）。
+    #[ts(type = "number")]
+    pub total: u64,
+}
+
+/// `checkpoint.restore` 请求参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CheckpointRestoreParams {
+    pub checkpoint_id: String,
+}
+
+/// 单个文件的回滚结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointRestoreStatus {
+    /// 用快照内容覆盖了现有文件。
+    Restored,
+    /// 文件是快照之后才出现的，已按快照状态删除。
+    Removed,
+    /// 快照之后被删掉的，已恢复。
+    Recreated,
+    /// 该文件回滚失败，`detail` 里是原因。
+    Failed,
+}
+
+/// 回滚报告里的单个文件。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CheckpointRestoreFileView {
+    pub path: String,
+    pub status: CheckpointRestoreStatus,
+    /// 回滚后回读算出的 SHA-256；`removed` / `failed` 为空。
+    #[serde(default)]
+    #[ts(optional)]
+    pub hash: Option<String>,
+    /// 失败原因（`status = failed` 时非空）。
+    #[serde(default)]
+    #[ts(optional)]
+    pub detail: Option<String>,
+}
+
+/// `checkpoint.restore` 响应结果。
+///
+/// `verified` 是**回读校验**的结论：把文件写回后重新算一遍 SHA-256，与快照登记值
+/// 逐个比对。docs/05 的「回滚后文件逐字节一致」靠这个布尔值兑现，而不是靠
+/// 「写完没报错」。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CheckpointRestoreResult {
+    pub checkpoint_id: String,
+    pub verified: bool,
+    pub files: Vec<CheckpointRestoreFileView>,
+}
+
+/// `checkpoint.delete` 请求参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CheckpointDeleteParams {
+    pub checkpoint_id: String,
+}
+
+/// `checkpoint.delete` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CheckpointDeleteResult {
+    pub checkpoint_id: String,
+    /// 是否真的删掉了（不存在时返回 `false` 而不是报错，便于 UI 幂等清理）。
+    pub removed: bool,
+    /// 释放的字节数。
+    #[ts(type = "number")]
+    pub freed_bytes: u64,
+}
+
+/// 一条免问规则（`permission_rule` 表的一行）。
+///
+/// `id` 是**范围键**本身（`command:cargo` / `path:edit:src` / `tool:foo`），
+/// 撤销时就按它删——UI 不需要另记一个内部主键。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PermissionRuleView {
+    /// 范围键。
+    pub id: String,
+    /// 工具名。
+    pub tool_pattern: String,
+    /// 生效范围：工作区绝对路径，或 `global`。
+    pub scope: String,
+    /// 裁决结果，当前只有 `allow`。
+    pub policy: String,
+    /// 记下这条规则的时刻（Unix 毫秒）。
+    #[ts(type = "number")]
+    pub created_at_ms: i64,
+}
+
+/// `permission.list` 请求参数。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PermissionListParams {
+    /// 只看某个工作区（同时包含 `global` 规则）；缺省取当前活动工作区。
+    #[serde(default)]
+    #[ts(optional)]
+    pub workspace_id: Option<String>,
+    /// 返回条数上限，缺省 200，内部夹到 1..=200。
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub limit: Option<u32>,
+}
+
+/// `permission.list` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PermissionListResult {
+    /// 按记录时间倒序。
+    pub rules: Vec<PermissionRuleView>,
+    /// 该范围内的规则总数（不受 `limit` 影响）。
+    #[ts(type = "number")]
+    pub total: u64,
+}
+
+/// `permission.revoke` 请求参数。
+///
+/// 两种撤销方式二选一：给 `id` 撤销单条，给 `tool` 撤销该工具名下全部。
+/// 两者都给时以 `id` 为准（更精确的意图优先），都不给则报参数错误。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PermissionRevokeParams {
+    /// 要撤销的范围键。
+    #[serde(default)]
+    #[ts(optional)]
+    pub id: Option<String>,
+    /// 要整批撤销的工具名。
+    #[serde(default)]
+    #[ts(optional)]
+    pub tool: Option<String>,
+}
+
+/// `permission.revoke` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PermissionRevokeResult {
+    /// 实际删除的条数（按 `id` 撤销且不存在时为 0，不报错）。
+    #[ts(type = "number")]
+    pub removed: u64,
+    /// 撤销后仍在生效的免问范围条数，便于 UI 直接回显。
+    #[ts(type = "number")]
+    pub remaining: u64,
+}
+
 /// 供 TS 侧引用的导出目录常量说明（不参与序列化，仅为文档服务）。
 pub const _TS_EXPORT_DIR: &str = TS_DIR;
 

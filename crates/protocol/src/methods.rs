@@ -84,12 +84,44 @@ pub mod session {
     pub const FORK: &str = "session.fork";
 }
 
+/// 检查点与回滚（M5 切片五）。
+///
+/// 与 `session.*` 的分工：会话记「说过什么」，检查点记「磁盘上原本是什么」。
+/// 快照内容落在 `<data_dir>/checkpoints/` 下的普通文件里，元数据是同目录的
+/// `meta.json`——回滚要逐字节还原，把内容塞进 SQLite 只会让「同一份字节被
+/// 存两遍」。
+pub mod checkpoint {
+    /// 给当前工作区拍一个检查点（可指定文件子集）。
+    pub const CREATE: &str = "checkpoint.create";
+    /// 列出某工作区的检查点（按创建时间倒序）。
+    pub const LIST: &str = "checkpoint.list";
+    /// 回滚到某个检查点，并回读校验。
+    pub const RESTORE: &str = "checkpoint.restore";
+    /// 删掉一个检查点（释放快照占用的磁盘）。
+    pub const DELETE: &str = "checkpoint.delete";
+}
+
 /// 审计日志（M5 切片四：落盘在 `crates/store` 的 `audit_event` 表）。
 ///
 /// 只有查询入口：写入是内核在关键操作处的**旁路动作**，客户端无权伪造一条
 /// 「某会话被导出到某路径」的记录——审计记录一旦能让外部写，就不再是证据。
 pub mod audit {
     pub const LIST: &str = "audit.list";
+}
+
+/// 权限免问规则（M5 切片六：落盘在 `crates/store` 的 `permission_rule` 表）。
+///
+/// 与 `agent.decide` 的分工：`decide` 是「这一次怎么办」，这里管的是
+/// 「点过『总是允许』之后，那些免问范围还在不在、要不要收回」。
+///
+/// 只有读与撤销两个动作，**没有 `permission.allow`**：能凭空写一条免问规则的
+/// 客户端等于拿到了一把万能钥匙——新增免问必须走 `agent.decide` 的
+/// `allow_always`，让用户当场看着点。
+pub mod permission {
+    /// 列出免问范围（按时间倒序）。
+    pub const LIST: &str = "permission.list";
+    /// 撤销免问范围：按规则的 `id`，或按工具名整批。
+    pub const REVOKE: &str = "permission.revoke";
 }
 
 /// Core → Main 的通知（事件）。
@@ -180,6 +212,14 @@ pub const IMPLEMENTED: &[&str] = &[
     session::FORK,
     // M5 切片四：审计查询（写入由内核在会话关键操作处旁路完成）。
     audit::LIST,
+    // M5 切片五：检查点与回滚（快照落文件、元数据落 meta.json）。
+    checkpoint::CREATE,
+    checkpoint::LIST,
+    checkpoint::RESTORE,
+    checkpoint::DELETE,
+    // M5 切片六：权限免问规则（读取与撤销由 `crates/core` 接线）。
+    permission::LIST,
+    permission::REVOKE,
 ];
 
 /// 协议面**已定义、但内核尚未接线**的方法。
@@ -201,7 +241,7 @@ mod tests {
 
     #[test]
     fn implemented_list_covers_core_m1_m2_agent_domains() {
-        assert_eq!(IMPLEMENTED.len(), 40);
+        assert_eq!(IMPLEMENTED.len(), 46);
         assert!(IMPLEMENTED.contains(&"core.ping"));
         assert!(IMPLEMENTED.contains(&"$/cancelRequest"));
         assert!(IMPLEMENTED.contains(&"workspace.read_file"));
@@ -230,6 +270,12 @@ mod tests {
         assert!(IMPLEMENTED.contains(&session::FORK));
         assert_eq!(session::EXPORT, "session.export");
         assert_eq!(session::FORK, "session.fork");
+        // M5 切片五：检查点四个方法进清单。
+        assert!(IMPLEMENTED.contains(&checkpoint::CREATE));
+        assert!(IMPLEMENTED.contains(&checkpoint::LIST));
+        assert!(IMPLEMENTED.contains(&checkpoint::RESTORE));
+        assert!(IMPLEMENTED.contains(&checkpoint::DELETE));
+        assert_eq!(checkpoint::RESTORE, "checkpoint.restore");
     }
 
     #[test]
@@ -259,7 +305,7 @@ mod tests {
         all.sort_unstable();
         all.dedup();
         assert_eq!(all.len(), total, "两张表不得有重叠");
-        assert_eq!(total, 40, "应恰好覆盖协议里定义的全部 40 个请求方法");
+        assert_eq!(total, 46, "应恰好覆盖协议里定义的全部 46 个请求方法");
     }
 
     #[test]
