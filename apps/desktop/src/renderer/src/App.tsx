@@ -10,11 +10,13 @@ import { CheckpointPanel } from './components/CheckpointPanel'
 import { CodeEditor } from './components/CodeEditor'
 import { EditorTabs } from './components/EditorTabs'
 import { FileTree } from './components/FileTree'
+import { GitPanel } from './components/GitPanel'
 import { PermissionPanel } from './components/PermissionPanel'
 import { SearchPanel } from './components/SearchPanel'
 import { StatusBar } from './components/StatusBar'
 import { TerminalPanel } from './components/TerminalPanel'
 import { initCheckpoints } from './checkpoint-store'
+import { initGit } from './git-store'
 import { initSessions } from './session-store'
 import { initTerminalEvents, toggleTerminalPanel } from './terminal-store'
 import {
@@ -50,11 +52,15 @@ export function App() {
     // M6：终端输出与退出事件常驻订阅——面板收起时也要收，否则后台跑完的输出
     // 会在下次展开时整段缺失。
     const offTerminal = initTerminalEvents()
+    // M6：Git 状态是「工作区内容」的视图——`git.*` 没有自己的事件，靠 `workspace.changed`
+    // 去抖后重拉。订阅常驻，这样活动栏角标在别的视图里也能实时对上。
+    const offGit = initGit()
     return () => {
       alive = false
       offStatus()
       offWorkspace()
       offTerminal()
+      offGit()
       disposeAi()
     }
   }, [])
@@ -137,14 +143,17 @@ export function App() {
               ? '资源管理器'
               : state.activity === 'search'
                 ? '搜索'
-                : state.activity === 'checkpoints'
-                  ? '检查点'
-                  : state.activity === 'permissions'
-                    ? '权限'
-                    : 'AI'}
+                : state.activity === 'git'
+                  ? '源代码管理'
+                  : state.activity === 'checkpoints'
+                    ? '检查点'
+                    : state.activity === 'permissions'
+                      ? '权限'
+                      : 'AI'}
           </div>
           {state.workspaceError &&
             state.activity !== 'ai' &&
+            state.activity !== 'git' &&
             state.activity !== 'checkpoints' &&
             state.activity !== 'permissions' && (
               <p className="panel__error">{state.workspaceError}</p>
@@ -153,6 +162,8 @@ export function App() {
             hasWorkspace ? <FileTree /> : <p className="panel__hint">尚未打开工作区</p>
           ) : state.activity === 'search' ? (
             <SearchPanel />
+          ) : state.activity === 'git' ? (
+            <GitPanel />
           ) : state.activity === 'checkpoints' ? (
             <CheckpointPanel />
           ) : state.activity === 'permissions' ? (

@@ -110,7 +110,21 @@ const RENDERER_ALLOWED = new Set<string>([
   Methods.terminal.write,
   Methods.terminal.resize,
   Methods.terminal.kill,
-  Methods.terminal.list
+  Methods.terminal.list,
+
+  // M6：Git。五条同样是「用户显式动作」的后果——打开 Git 视图才 `status` / `branches`、
+  // 点某个文件才 `diff`、点「暂存 / 取消暂存」才 `stage`、按「提交」才 `commit`。
+  //
+  // 这里要交代清楚它比终端弱在哪：`git.stage` / `git.commit` 会**写仓库对象库**，
+  // 但两者都不能指定任意命令——参数是路径清单与提交信息，动作集合在协议里是封闭的
+  // （没有 `git.checkout` / `git.reset --hard` / `git.push`），所以渲染进程即使被
+  // 注入脚本，也拿不到「丢工作区改动」或「往远端推」的能力。工作区之外的路径由内核
+  // 侧做越界校验（错误码 7004），不依赖白名单兜底。
+  Methods.git.status,
+  Methods.git.diff,
+  Methods.git.stage,
+  Methods.git.commit,
+  Methods.git.branches
 ])
 
 export interface PolicyDecision {

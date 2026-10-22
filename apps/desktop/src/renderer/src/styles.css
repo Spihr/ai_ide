@@ -1154,3 +1154,179 @@ button {
   font-size: 12px;
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
 }
+
+
+/* ---------------------------------------------------------------------------
+   M6：Git 面板
+   ---------------------------------------------------------------------------
+   两个约束决定了这里的写法：
+   1. 侧栏很窄（默认 260px），所以 diff 用等宽字体 + 横向滚动，而不是折行——折行会让
+      「- 旧行 / + 新行」在视觉上连成一片，反而看不出改了什么。
+   2. 只读展示要有稳定的行高：diff 用 grid 两列行号 + 一列正文，行号列固定宽度，
+      正文 white-space: pre 保留缩进（代码缩进是语义的一部分）。
+*/
+
+.git-branch {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.git-branch__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.git-entry-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.git-entry {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 4px;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.git-entry:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.git-entry.is-active {
+  background: rgba(90, 160, 255, 0.18);
+}
+
+.git-entry__flag {
+  flex: none;
+  width: 12px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.git-entry__flag--new {
+  color: #6cc07a;
+}
+
+.git-entry__flag--gone {
+  color: var(--bad);
+}
+
+.git-entry__flag--conflict {
+  color: #e0a44a;
+}
+
+.git-entry__flag--moved {
+  color: #7fb8ff;
+}
+
+.git-entry__path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.git-entry__orig {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.git-check {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+/* diff 区：独立滚动，避免把侧栏整体撑长后「提交框」被推到看不见的地方 */
+.git-diff {
+  margin-top: 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.git-diff__head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.git-diff__path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.git-diff__body {
+  max-height: 320px;
+  overflow: auto;
+  background: #0d1015;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.git-diff__line {
+  display: grid;
+  grid-template-columns: 34px 34px 1fr;
+  gap: 6px;
+  padding: 0 6px 0 0;
+  white-space: pre;
+}
+
+.git-diff__no {
+  color: #4b525c;
+  text-align: right;
+  user-select: none;
+}
+
+.git-diff__text {
+  white-space: pre;
+}
+
+/* hunk 头单独一行灰底：它是「跳到哪里」的路标，不该和增删行混在一起 */
+.git-diff__line--hunk {
+  background: rgba(90, 160, 255, 0.1);
+  color: #8fb6e8;
+}
+
+.git-diff__line--add {
+  background: rgba(60, 160, 90, 0.16);
+}
+
+.git-diff__line--del {
+  background: rgba(200, 70, 70, 0.16);
+}
+
+.git-diff__line--meta {
+  color: #6b737f;
+}

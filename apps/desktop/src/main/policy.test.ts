@@ -100,6 +100,33 @@ describe('checkRendererCall', () => {
     }
   })
 
+  it('放行 M6 的 Git 方法', () => {
+    const methods = [
+      Methods.git.status,
+      Methods.git.diff,
+      Methods.git.stage,
+      Methods.git.commit,
+      Methods.git.branches
+    ]
+
+    for (const method of methods) {
+      expect(checkRendererCall(method).allowed, `${method} 应被放行`).toBe(true)
+    }
+  })
+
+  /*
+   * Git 的「危险动作」目前一个都没进协议：推、切分支、`reset --hard`、强制检出。
+   * 这条用例是防回归的闸门——将来谁加了 `git.push` 之类的方法，会被这里挡下并提醒
+   * 「放行前先想清楚 UI 有没有二次确认」，而不是顺手加进白名单就完事。
+   */
+  it('不放行协议里不存在的 Git 危险动作', () => {
+    const methods = ['git.push', 'git.checkout', 'git.reset', 'git.merge', 'git.rebase']
+
+    for (const method of methods) {
+      expect(checkRendererCall(method).allowed, `${method} 不应被放行`).toBe(false)
+    }
+  })
+
   it('拦截白名单之外的方法，并给出原因', () => {
     // core.hello / core.shutdown 是主进程自用的握手与退出；workspace.chmod、agent.run
     // 之类内核根本没实现（M4 的三条是 agent.start / stop / decide，没有 agent.run），
@@ -142,6 +169,11 @@ describe('checkRendererCall', () => {
       'checkpoint.restore',
       'core.ping',
       'core.stats',
+      'git.branches',
+      'git.commit',
+      'git.diff',
+      'git.stage',
+      'git.status',
       'llm.cancel',
       'llm.chat_stream',
       'llm.count_tokens',
