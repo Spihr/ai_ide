@@ -27,12 +27,12 @@ AIGC:
 | M2 | 模型接入 | 已完成（内核 + 外壳），验收见 [`docs/08-M2-验收报告.md`](./docs/08-M2-验收报告.md) |
 | M3 | 上下文引用 | 已完成，验收见 [`docs/09-M3-验收报告.md`](./docs/09-M3-验收报告.md) |
 | M4 | Agent 闭环 | 内核与外壳主线已完成（Agent 循环与 8 个工具、权限闸门四动作、`agent.*` 协议与 core 接线、外壳运行面板与审批 UI），验收见 [`docs/10-M4-验收报告.md`](./docs/10-M4-验收报告.md)；端到端基线任务与真实上游实跑已完成（基线 4/4、`edit_file` 非唯一匹配 20/20），联调凭据默认读仓库根 `.e2e-m4-credentials.json`（已在 `.gitignore` 中忽略） |
-| M5 | 持久化与治理 | 已完成（内核 + 外壳主线）：`crates/store` 会话 / 消息 / 审计仓储（事务内分叉、审计脱敏留存）、九个 `session.*` 与只读 `audit.list`（能力清单 30 → 40）、外壳会话面板（列表 / 标题过滤 / 打开 / 新建 / 改名 / 删除 / 导出 md·json / 分叉 / 审计）与对话落盘桥，验收见 [`docs/11-M5-验收报告.md`](./docs/11-M5-验收报告.md)；未做：检查点回滚、JSONL 结构化日志 |
+| M5 | 持久化与治理 | 已完成（内核 + 外壳主线 + 收口）：`crates/store` 会话 / 消息 / 审计仓储（事务内分叉、审计脱敏留存）、九个 `session.*` 与只读 `audit.list`、检查点回滚（`checkpoint.create` / `list` / `restore` / `delete`，快照 SHA-256 逐文件复核）、JSONL 结构化日志（按天滚动 + 脱敏开关 + 32 MiB 滚动上限）、权限表持久化（`permission.list` / `revoke`，落 `permission_rule` 表），能力清单 30 → 46，验收见 [`docs/11-M5-验收报告.md`](./docs/11-M5-验收报告.md) |
 | M6–M8 | 终端与 Git / MCP / 打包 | 未开工；M8 仅打包链路先行落地（产出 `AI-IDE-0.1.0-win-x64.exe`，core 二进制在 asar 外），干净环境安装验收未做 |
 
-**已可运行的能力**：打开工作区与文件树（懒加载、忽略规则）、Monaco 多标签编辑与保存（乐观锁 hash + CRLF 往返还原）、文件名模糊检索与内容检索、外部改动监听与通知、Main 侧策略闸门、内核进程监管与优雅退出、Rust 协议类型自动生成到 TS、Provider / 模型目录（落盘 `providers.json`、密钥加密存储）、OpenAI 兼容流式对话（`llm.chat_stream` / `cancel` / `list_models` / `count_tokens`，含 `llm.error` 错误分类）、Agent 闭环（8 个工具、权限闸门四动作、diff 预览与审批）、会话持久化（首条消息自动建会话、流结束按用量落 `assistant`，杀进程重启后历史完整）、会话导出（Markdown / JSON，落点只经系统保存对话框）、会话分叉、只读审计（会话创建 / 更新 / 删除 / 导出 / 分叉留痕，存储层脱敏）。
+**已可运行的能力**：打开工作区与文件树（懒加载、忽略规则）、Monaco 多标签编辑与保存（乐观锁 hash + CRLF 往返还原）、文件名模糊检索与内容检索、外部改动监听与通知、Main 侧策略闸门、内核进程监管与优雅退出、Rust 协议类型自动生成到 TS、Provider / 模型目录（落盘 `providers.json`、密钥加密存储）、OpenAI 兼容流式对话（`llm.chat_stream` / `cancel` / `list_models` / `count_tokens`，含 `llm.error` 错误分类）、Agent 闭环（8 个工具、权限闸门四动作、diff 预览与审批）、会话持久化（首条消息自动建会话、流结束按用量落 `assistant`，杀进程重启后历史完整）、会话导出（Markdown / JSON，落点只经系统保存对话框）、会话分叉、只读审计（会话创建 / 更新 / 删除 / 导出 / 分叉留痕，存储层脱敏）、检查点与回滚（手动 / Agent 自动留痕，回滚后逐文件 SHA-256 复核）、JSONL 结构化日志（`<data_dir>/logs/core-YYYY-MM-DD.jsonl`，按天滚动、出口脱敏）、权限表持久化（`allow_always` 落库，重启后仍生效，可在面板撤销）。
 
-**尚未实现**：检查点（文件快照与回滚）、JSONL 结构化日志（按天滚动 + 脱敏开关）、权限表持久化、内置终端、Git UI、MCP、安装包的干净环境验收、Inline Edit（Ctrl+K）、Tab 补全、LSP、会话与审计列表的「加载更多」、消息内容检索与消息级分叉入口；M4 遗留：工具调用独立卡片组件、多模型复测（`scripts/e2e-m4.mjs` 已落地，跑 `pnpm e2e:m4` 即可，凭据默认读 `<仓库根>/.e2e-m4-credentials.json`，该文件已在 `.gitignore` 中忽略、也可用 `--creds` 覆盖）。
+**尚未实现**：内置终端、Git UI、MCP、安装包的干净环境验收、Inline Edit（Ctrl+K）、Tab 补全、LSP、会话与审计列表的「加载更多」、消息内容检索与消息级分叉入口；M4 遗留：工具调用独立卡片组件、多模型复测（`scripts/e2e-m4.mjs` 已落地，跑 `pnpm e2e:m4` 即可，凭据默认读 `<仓库根>/.e2e-m4-credentials.json`，该文件已在 `.gitignore` 中忽略、也可用 `--creds` 覆盖）。
 
 ---
 
@@ -109,6 +109,8 @@ pnpm dev
 | `pnpm types:gen` | 由 Rust 重新生成 TS 协议类型（产物入库） |
 | `pnpm smoke:core` | 协议冒烟（握手 / ping / 错误路径 / 优雅退出） |
 | `pnpm smoke:m1` | 内核侧 M1 功能面冒烟 |
+| `pnpm scan:secrets` | 日志密钥扫描门禁：检测器自检 + 拉起内核（`AI_IDE_LOG_PROBE=1`）写真实日志再扫，扫不到日志行也判失败 |
+| `pnpm scan:secrets:self` | 只跑检测器自检（正样本必中、脱敏形态必放行） |
 | `pnpm e2e:m1` | Playwright + Electron 真界面端到端 |
 | `pnpm e2e:m4` | 真实模型 Agent 端到端联调（需本机凭据，不入 CI）；凭据默认读 `<仓库根>/.e2e-m4-credentials.json`（已在 `.gitignore` 中忽略），`--check-creds` 只做凭据自检 |
 | `pnpm bench:m1` | 树列举 / 读文件 / 搜索耗时基准 |
@@ -121,7 +123,7 @@ pnpm dev
 
 CI 定义在 [`.github/workflows/ci.yml`](./.github/workflows/ci.yml)，在 `windows-latest` 上执行两个 job：
 
-- **rust**：`cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`、构建 `ai-ide-core`、协议冒烟。
+- **rust**：`cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`、构建 `ai-ide-core`、协议冒烟、日志密钥扫描（`node scripts/scan-log-secrets.mjs --probe`，本机等价入口 `pnpm scan:secrets`：先自检检测器，再由内核 `AI_IDE_LOG_PROBE=1` 写一批含假密钥的真实日志后扫描，取样为空即失败）。
 - **desktop**：`pnpm install --frozen-lockfile`、`pnpm types:gen`、协议类型漂移检查（`git diff --exit-code`）、`pnpm lint`、`pnpm typecheck`、`pnpm test`、构建外壳。
 
 本地以一条命令等价复现全部 CI 步骤：
@@ -142,9 +144,9 @@ pnpm verify:ci
 4. `core.log` 通知通道已定义，内核侧尚未主动推送；UI 显示的是子进程 stderr 原始流。
 5. ts-rs 在编译期会输出若干 `failed to parse serde attribute` 宏诊断，不影响生成结果。
 6. 索引仅为内存态（文件名 + 内容），无持久化索引库；符号检索（`search.symbols`）未实现。
-7. 检查点回滚未实现：docs/05 的 M5 硬指标「回滚后文件 hash 与快照前一致」当前无法验证，Agent 改坏文件仍只能靠 git 与自身备份兜底。
+7. 检查点回滚已实现（`checkpoint.*` 四方法接进 dispatch，回滚后逐文件重算 SHA-256 并折成 `verified` 返回），边界如下：快照只覆盖工作区内经 `PathGuard` 与忽略规则筛选后的非敏感文件，单文件超 8 MiB、单检查点超 5000 文件 / 256 MiB 的条目跳过并计数；回滚只动快照登记过的文件，不删除清单外的新文件；全量快照无增量与去重；检查点无保留期与自动清理，需自行清理 `<data_dir>/checkpoints`。
 8. 会话侧限制：列表固定拉 50 条、审计固定 20 条且无「加载更多」；标题过滤不检索消息内容；分叉只有「会话末尾」入口（内核支持 `from_message_id`，UI 未接）；消息落盘失败不重试，仅提示一次。
-9. 结构化日志未实现：只有审计事件表，无 JSONL 文件与按天滚动，因此「日志不含 API Key」这一条只对审计路径成立。
+9. JSONL 日志只做「按天滚动 + 单文件 32 MiB 上限」，没有保留期与自动清理，长期运行需自行清理 `<data_dir>/logs`；`AI_IDE_LOG_REDACT=off` 只用于本地排查（脱敏默认开，CI 门禁按默认跑）。
 
 ---
 
@@ -161,7 +163,7 @@ pnpm verify:ci
 | [`docs/06-M0-验收报告.md`](./docs/06-M0-验收报告.md) / [`docs/07-M1-验收报告.md`](./docs/07-M1-验收报告.md) | 里程碑验收实测记录（M0 / M1） |
 | [`docs/08-M2-验收报告.md`](./docs/08-M2-验收报告.md) / [`docs/09-M3-验收报告.md`](./docs/09-M3-验收报告.md) | 里程碑验收实测记录（M2 / M3） |
 | [`docs/10-M4-验收报告.md`](./docs/10-M4-验收报告.md) | M4 实测验收：Agent 闭环、权限闸门、真实模型端到端联调与遗留项 |
-| [`docs/11-M5-验收报告.md`](./docs/11-M5-验收报告.md) | M5 实测验收：会话持久化、导出与分叉、审计与脱敏、外壳会话面板、验收标准对照与遗留项 |
+| [`docs/11-M5-验收报告.md`](./docs/11-M5-验收报告.md) | M5 实测验收：会话持久化、导出与分叉、审计与脱敏、检查点回滚、JSONL 日志与密钥扫描门禁、权限表持久化、外壳会话面板、验收标准对照与遗留项 |
 
 ---
 
