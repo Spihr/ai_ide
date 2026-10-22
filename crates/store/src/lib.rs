@@ -6,7 +6,7 @@
 //! | 模块 | 职责 |
 //! |---|---|
 //! | [`store`] | 连接与迁移：`Store::connect` / `Store::open_in_memory`，内嵌 `migrations/` |
-//! | [`repo`] | 仓储读写：会话增删改查、消息追加与分页查询、审计写入与查询 |
+//! | [`repo`] | 仓储读写：会话增删改查、消息追加与分页查询、审计写入与查询、权限免问规则 |
 //! | [`model`] | 领域模型：`Session` / `Message` / `AuditEvent` 及对应 `New*` |
 //! | [`redact`] | 敏感字段脱敏：键名判定、取值打码、JSON 递归处理 |
 //! | [`error`] | [`StoreError`] 与 [`Result`] |
@@ -56,8 +56,10 @@ pub mod store;
 pub use error::{Result, StoreError};
 pub use model::{
     audit_actor, audit_kind, now_millis, AuditEvent, AuditFilter, AuditQuery, ForkOutcome, Message,
-    NewAuditEvent, NewMessage, NewSession, Session, SessionQuery, MAX_FORK_MESSAGES,
+    NewAuditEvent, NewMessage, NewPermissionRule, NewSession, PermissionRule, Session,
+    SessionQuery, MAX_FORK_MESSAGES,
 };
 pub use redact::{is_sensitive_key, mask_secret, redact_text, redact_value, MASK};
 pub use repo::audit::MAX_AUDIT_LIMIT;
+pub use repo::permission::MAX_PERMISSION_RULES;
 pub use store::{Store, MIGRATOR};

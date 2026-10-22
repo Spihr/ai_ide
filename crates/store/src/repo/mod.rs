@@ -2,4 +2,5 @@
 
 pub mod audit;
 pub mod message;
+pub mod permission;
 pub mod session;

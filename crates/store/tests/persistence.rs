@@ -18,17 +18,18 @@ async fn migrations_apply_on_open_and_tables_start_empty() {
     let store = Store::open_in_memory().await.expect("打开内存库");
 
     let applied = store.applied_migrations().await.expect("读取迁移记录");
-    assert_eq!(applied.len(), 2, "当前有会话表与审计表两个迁移版本");
+    assert_eq!(applied.len(), 3, "当前有会话 / 审计 / 权限规则三个迁移版本");
     assert_eq!(applied[0].0, 1);
     assert_eq!(applied[1].0, 2);
+    assert_eq!(applied[2].0, 3);
 
-    assert_eq!(store.count_sessions(None).await.unwrap(), 0);
+    assert_eq!(store.count_sessions(None, None).await.unwrap(), 0);
     assert_eq!(store.count_messages("whatever").await.unwrap(), 0);
     assert!(store.get_session("whatever").await.unwrap().is_none());
 
     // 迁移幂等：重复执行不报错、不重复记录。
     store.migrate().await.expect("重复迁移应幂等");
-    assert_eq!(store.applied_migrations().await.unwrap().len(), 2);
+    assert_eq!(store.applied_migrations().await.unwrap().len(), 3);
 }
 
 #[tokio::test]
@@ -115,8 +116,11 @@ async fn session_crud_round_trip() {
         .unwrap());
 
     // 工作区过滤 + 计数 + 分页
-    assert_eq!(store.count_sessions(None).await.unwrap(), 2);
-    assert_eq!(store.count_sessions(Some("E:/ai_ide")).await.unwrap(), 1);
+    assert_eq!(store.count_sessions(None, None).await.unwrap(), 2);
+    assert_eq!(
+        store.count_sessions(Some("E:/ai_ide"), None).await.unwrap(),
+        1
+    );
     let filtered = store
         .list_sessions(SessionQuery::workspace("E:/ai_ide"))
         .await
@@ -134,7 +138,7 @@ async fn session_crud_round_trip() {
 
     assert!(store.delete_session(&created.id).await.unwrap());
     assert!(store.get_session(&created.id).await.unwrap().is_none());
-    assert_eq!(store.count_sessions(None).await.unwrap(), 1);
+    assert_eq!(store.count_sessions(None, None).await.unwrap(), 1);
 }
 
 #[tokio::test]
@@ -325,7 +329,7 @@ async fn file_backed_store_survives_reopen() {
     };
 
     let reopened = Store::connect(&db).await.expect("重新打开文件库");
-    assert_eq!(reopened.count_sessions(None).await.unwrap(), 1);
+    assert_eq!(reopened.count_sessions(None, None).await.unwrap(), 1);
     let session = reopened
         .get_session(&session_id)
         .await
@@ -342,6 +346,59 @@ async fn file_backed_store_survives_reopen() {
     reopened.close().await;
 
     // 清理本用例自己创建的临时目录（尽力而为，不影响断言结果）。
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 免问规则必须跨进程活着：用户点过一次「总是允许」，重启后不该再问一遍；
+/// 而撤销必须同样落盘，否则「永久同意」就成了唯一的终点。
+#[tokio::test]
+async fn permission_rules_survive_reopen_and_revoke() {
+    let dir = std::env::temp_dir().join(format!("ai-ide-perm-test-{}", uuid::Uuid::new_v4()));
+    let db = dir.join("data.sqlite");
+
+    {
+        let store = Store::connect(&db).await.expect("打开文件库");
+        store
+            .remember_permission(ai_ide_store::NewPermissionRule::allow(
+                "command:cargo",
+                "run_command",
+                "E:/ai_ide",
+            ))
+            .await
+            .expect("记下免问");
+        store
+            .remember_permission(ai_ide_store::NewPermissionRule::allow(
+                "path:edit:E:/ai_ide/src",
+                "edit",
+                "E:/ai_ide",
+            ))
+            .await
+            .expect("记下免问");
+        store.close().await;
+    }
+
+    let reopened = Store::connect(&db).await.expect("重新打开");
+    let mut ids = reopened.permission_ids(None).await.expect("读回键");
+    ids.sort();
+    assert_eq!(ids, vec!["command:cargo", "path:edit:E:/ai_ide/src"]);
+
+    let rules = reopened
+        .list_permissions(Some("E:/ai_ide"), 50)
+        .await
+        .unwrap();
+    assert_eq!(rules.len(), 2);
+    assert!(rules.iter().all(|rule| rule.policy == "allow"));
+
+    assert!(reopened.revoke_permission("command:cargo").await.unwrap());
+    reopened.close().await;
+
+    let reopened = Store::connect(&db).await.expect("再开");
+    assert_eq!(
+        reopened.permission_ids(None).await.unwrap(),
+        vec!["path:edit:E:/ai_ide/src".to_string()],
+        "撤销也要落盘"
+    );
+    reopened.close().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -420,7 +477,7 @@ async fn fork_copies_messages_and_remaps_parents() {
     assert_eq!(source_messages.len(), 3);
     assert_eq!(source_messages[0].id, first.id);
     assert_eq!(store.count_messages(&outcome.session.id).await.unwrap(), 3);
-    assert_eq!(store.count_sessions(None).await.unwrap(), 2);
+    assert_eq!(store.count_sessions(None, None).await.unwrap(), 2);
     let _ = third;
 }
 
@@ -493,9 +550,95 @@ async fn fork_rejects_unknown_session_and_foreign_message() {
     assert!(matches!(err, StoreError::MessageNotFound(id) if id == foreign.id));
 
     // 失败不能留下半截新会话。
-    assert_eq!(store.count_sessions(None).await.unwrap(), 2);
+    assert_eq!(store.count_sessions(None, None).await.unwrap(), 2);
 }
 
 fn ids(sessions: &[ai_ide_store::Session]) -> Vec<String> {
     sessions.iter().map(|session| session.id.clone()).collect()
+}
+
+/// 关键词检索：标题与消息正文都算命中，`count_sessions` 与分页结果必须同源。
+#[tokio::test]
+async fn keyword_search_spans_title_and_message_body() {
+    let store = Store::open_in_memory().await.expect("打开内存库");
+    let base = 1_700_000_000_000;
+
+    let by_title = store
+        .create_session(NewSession::new("重构 SessionStore").with_created_at(base))
+        .await
+        .unwrap();
+    let by_body = store
+        .create_session(NewSession::new("随手记").with_created_at(base + 1))
+        .await
+        .unwrap();
+    let silent = store
+        .create_session(NewSession::new("无关会话").with_created_at(base + 2))
+        .await
+        .unwrap();
+
+    store
+        .append_message(
+            NewMessage::user(&by_body.id, "把 sessionStore 的落盘队列改成串行")
+                .with_created_at(base + 10),
+        )
+        .await
+        .unwrap();
+    store
+        .append_message(NewMessage::user(&silent.id, "今天天气如何").with_created_at(base + 11))
+        .await
+        .unwrap();
+
+    // 大小写不敏感：正文里写的是 `sessionStore`，用小写去搜也要命中。
+    let hits = store
+        .list_sessions(SessionQuery::default().with_keyword("sessionstore"))
+        .await
+        .unwrap();
+    let mut hit_ids = ids(&hits);
+    hit_ids.sort();
+    let mut expected = vec![by_title.id.clone(), by_body.id.clone()];
+    expected.sort();
+    assert_eq!(hit_ids, expected, "标题与正文命中都要返回");
+
+    assert_eq!(
+        store
+            .count_sessions(None, Some("sessionstore"))
+            .await
+            .unwrap(),
+        2,
+        "计数与列表同条件"
+    );
+
+    // 只在正文里出现、标题里没有的词。
+    let body_only = store
+        .list_sessions(SessionQuery::default().with_keyword("串行"))
+        .await
+        .unwrap();
+    assert_eq!(ids(&body_only), vec![by_body.id.clone()]);
+    assert_eq!(store.count_sessions(None, Some("串行")).await.unwrap(), 1);
+
+    // 过滤 + 工作区分页：关键词命中 2 条时，limit=1 只给 1 条，total 仍是 2。
+    let paged = store
+        .list_sessions(
+            SessionQuery::default()
+                .with_keyword("sessionstore")
+                .with_limit(1)
+                .with_offset(0),
+        )
+        .await
+        .unwrap();
+    assert_eq!(paged.len(), 1);
+    assert_eq!(
+        store
+            .count_sessions(None, Some("sessionstore"))
+            .await
+            .unwrap(),
+        2
+    );
+
+    // `%` / `_` 是字面量而非通配符：搜 `%` 命中 0 条。
+    assert_eq!(store.count_sessions(None, Some("%")).await.unwrap(), 0);
+    assert_eq!(store.count_sessions(None, Some("_")).await.unwrap(), 0);
+
+    // 空关键词等于不过滤（调用方把空串归一为 None，这里验证 None 的语义）。
+    assert_eq!(store.count_sessions(None, None).await.unwrap(), 3);
 }

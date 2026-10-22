@@ -11,6 +11,36 @@ use crate::{Result, Store, StoreError};
 const SELECT_SESSION: &str =
     "SELECT id, title, workspace_path, model_ref_json, created_at, updated_at FROM session";
 
+/// 关键词匹配子句：命中**标题**或**该会话任意一条消息的正文**。
+///
+/// 正文存在 `content_json.content` 里，正常路径都由 `encode_content` 写入；但历史行
+/// 若被外部改坏，`json_extract` 会直接抛 `malformed JSON` 把整条查询带崩，所以先用
+/// `CASE` 守住 `json_valid`，坏行退化成对整段 JSON 文本做子串匹配。
+/// 两个 `?` 是同一个关键词（标题一次、正文一次）。
+const KEYWORD_CLAUSE: &str = "(title LIKE ? ESCAPE '\\' OR EXISTS (\
+     SELECT 1 FROM message m WHERE m.session_id = session.id AND (\
+       CASE WHEN json_valid(m.content_json) \
+            THEN json_extract(m.content_json, '$.content') \
+            ELSE m.content_json END) LIKE ? ESCAPE '\\'))";
+
+/// 把用户输入变成 LIKE 模式：转义 `\` / `%` / `_`，两端加通配。
+///
+/// SQLite 的 `LIKE` 对 ASCII 默认不区分大小写（中文没有大小写概念），所以这里不
+/// 需要额外 lower；反过来说，用户在搜 `README` 时也能命中 `readme`。
+fn like_pattern(keyword: &str) -> String {
+    let mut escaped = String::with_capacity(keyword.len() + 8);
+    for ch in keyword.chars() {
+        match ch {
+            '\\' | '%' | '_' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    format!("%{escaped}%")
+}
+
 /// `session` 表原始行。
 #[derive(Debug, sqlx::FromRow)]
 struct SessionRow {
@@ -74,53 +104,74 @@ impl Store {
     }
 
     /// 列出会话，按 `updated_at` 倒序（同刻按 `created_at`，再按 id 保证稳定）。
+    ///
+    /// `query.keyword` 同时匹配标题与该会话的消息正文：过滤与分页都在 SQL 里做，
+    /// 因此 `count_sessions` 给出的 `total` 与页内容天然一致（不会出现「过滤后
+    /// 总条数比页还小」的错位）。
     pub async fn list_sessions(&self, query: SessionQuery<'_>) -> Result<Vec<Session>> {
         let limit = query.limit.clamp(1, 500);
         let offset = query.offset.max(0);
 
-        let rows = match query.workspace_path {
-            Some(workspace_path) => {
-                sqlx::query_as::<_, SessionRow>(&format!(
-                    "{SELECT_SESSION} WHERE workspace_path = ? \
-                     ORDER BY updated_at DESC, created_at DESC, id ASC LIMIT ? OFFSET ?"
-                ))
-                .bind(workspace_path)
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(&self.pool)
-                .await?
-            }
-            None => {
-                sqlx::query_as::<_, SessionRow>(&format!(
-                    "{SELECT_SESSION} ORDER BY updated_at DESC, created_at DESC, id ASC LIMIT ? OFFSET ?"
-                ))
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(&self.pool)
-                .await?
-            }
-        };
+        let mut sql = String::from(SELECT_SESSION);
+        let mut conds: Vec<&str> = Vec::new();
+        if query.workspace_path.is_some() {
+            conds.push("workspace_path = ?");
+        }
+        if query.keyword.is_some() {
+            conds.push(KEYWORD_CLAUSE);
+        }
+        if !conds.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&conds.join(" AND "));
+        }
+        sql.push_str(" ORDER BY updated_at DESC, created_at DESC, id ASC LIMIT ? OFFSET ?");
+
+        let mut statement = sqlx::query_as::<_, SessionRow>(&sql);
+        if let Some(workspace_path) = query.workspace_path {
+            statement = statement.bind(workspace_path);
+        }
+        if let Some(keyword) = query.keyword {
+            let pattern = like_pattern(keyword);
+            statement = statement.bind(pattern.clone()).bind(pattern);
+        }
+        let rows = statement
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
 
         rows.into_iter().map(SessionRow::into_session).collect()
     }
 
-    /// 会话计数；`workspace_path` 为 `None` 时统计全部。
-    pub async fn count_sessions(&self, workspace_path: Option<&str>) -> Result<i64> {
-        let count = match workspace_path {
-            Some(workspace_path) => {
-                sqlx::query_scalar::<_, i64>(
-                    "SELECT COUNT(*) FROM session WHERE workspace_path = ?",
-                )
-                .bind(workspace_path)
-                .fetch_one(&self.pool)
-                .await?
-            }
-            None => {
-                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM session")
-                    .fetch_one(&self.pool)
-                    .await?
-            }
-        };
+    /// 会话计数；`workspace_path` 为 `None` 时统计全部，`keyword` 的语义与
+    /// [`Self::list_sessions`] 完全一致（标题 + 消息正文）。
+    pub async fn count_sessions(
+        &self,
+        workspace_path: Option<&str>,
+        keyword: Option<&str>,
+    ) -> Result<i64> {
+        let mut sql = String::from("SELECT COUNT(*) FROM session");
+        let mut conds: Vec<&str> = Vec::new();
+        if workspace_path.is_some() {
+            conds.push("workspace_path = ?");
+        }
+        if keyword.is_some() {
+            conds.push(KEYWORD_CLAUSE);
+        }
+        if !conds.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&conds.join(" AND "));
+        }
+
+        let mut statement = sqlx::query_scalar::<_, i64>(&sql);
+        if let Some(workspace_path) = workspace_path {
+            statement = statement.bind(workspace_path);
+        }
+        if let Some(keyword) = keyword {
+            let pattern = like_pattern(keyword);
+            statement = statement.bind(pattern.clone()).bind(pattern);
+        }
+        let count = statement.fetch_one(&self.pool).await?;
         Ok(count)
     }
 

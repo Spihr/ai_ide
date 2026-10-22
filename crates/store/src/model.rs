@@ -93,6 +93,9 @@ impl NewSession {
 pub struct SessionQuery<'a> {
     /// 只列指定工作区的会话；`None` 表示不过滤。
     pub workspace_path: Option<&'a str>,
+    /// 关键词：同时匹配**标题**与**该会话的消息正文**（大小写不敏感的子串）。
+    /// `None` 表示不过滤。匹配与分页都在 SQL 里做，`total` 因此是过滤后的真值。
+    pub keyword: Option<&'a str>,
     /// 返回条数上限（内部会夹到 1..=500）。
     pub limit: i64,
     pub offset: i64,
@@ -102,6 +105,7 @@ impl Default for SessionQuery<'_> {
     fn default() -> Self {
         Self {
             workspace_path: None,
+            keyword: None,
             limit: 50,
             offset: 0,
         }
@@ -126,6 +130,12 @@ impl<'a> SessionQuery<'a> {
     /// 设置偏移量。
     pub fn with_offset(mut self, offset: i64) -> Self {
         self.offset = offset;
+        self
+    }
+
+    /// 设置关键词（标题 + 消息正文）。
+    pub fn with_keyword(mut self, keyword: &'a str) -> Self {
+        self.keyword = Some(keyword);
         self
     }
 }
@@ -294,6 +304,12 @@ pub mod audit_kind {
     pub const SESSION_EXPORTED: &str = "session.exported";
     /// 会话分叉。
     pub const SESSION_FORKED: &str = "session.forked";
+    /// 建立检查点（快照一组文件）。
+    pub const CHECKPOINT_CREATED: &str = "checkpoint.created";
+    /// 回滚到检查点。
+    pub const CHECKPOINT_RESTORED: &str = "checkpoint.restored";
+    /// 删除检查点。
+    pub const CHECKPOINT_DELETED: &str = "checkpoint.deleted";
 }
 
 /// 审计事件的发起方。
@@ -534,6 +550,59 @@ pub(crate) fn role_from_str(raw: &str) -> Result<ChatRole> {
         "assistant" => Ok(ChatRole::Assistant),
         "tool" => Ok(ChatRole::Tool),
         other => Err(StoreError::InvalidRole(other.to_string())),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 权限规则
+// ---------------------------------------------------------------------------
+
+/// 一条免问规则（`permission_rule` 表），对应 `docs/02` §6.2 的同名表。
+///
+/// `id` 是**范围键**本身（`command:cargo` / `path:edit:src` / `tool:foo`），
+/// 不是随机 UUID：重启后要把它原样灌回闸门，粒度必须逐字一致。
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct PermissionRule {
+    /// 范围键，兼作主键。
+    pub id: String,
+    /// 工具名（`run_command` / `edit` / …）。
+    pub tool_pattern: String,
+    /// 生效范围：工作区绝对路径或 `global`。
+    pub scope: String,
+    /// 裁决结果，当前只有 `allow`。
+    pub policy: String,
+    /// Unix 毫秒。
+    pub created_at: i64,
+}
+
+impl PermissionRule {
+    /// 规则是否跨工作区生效。
+    pub fn is_global(&self) -> bool {
+        self.scope == "global"
+    }
+}
+
+/// 写入一条免问规则的入参（字段借用，省一次分配）。
+#[derive(Debug, Clone, Copy)]
+pub struct NewPermissionRule<'a> {
+    pub id: &'a str,
+    pub tool_pattern: &'a str,
+    pub scope: &'a str,
+    pub policy: &'a str,
+    /// 显式指定创建时间（测试造数据用）；`None` 表示取 [`now_millis`]。
+    pub created_at: Option<i64>,
+}
+
+impl<'a> NewPermissionRule<'a> {
+    /// 以范围键与工具名构造，策略默认 `allow`。
+    pub fn allow(id: &'a str, tool_pattern: &'a str, scope: &'a str) -> Self {
+        Self {
+            id,
+            tool_pattern,
+            scope,
+            policy: "allow",
+            created_at: None,
+        }
     }
 }
 
