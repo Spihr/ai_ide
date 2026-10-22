@@ -13,19 +13,37 @@ pub const PROTOCOL_VERSION: &str = ai_ide_protocol::PROTOCOL_VERSION;
 ///
 /// 日志级别通过环境变量 `AI_IDE_CORE_LOG` 控制，例如
 /// `AI_IDE_CORE_LOG=debug` 或 `AI_IDE_CORE_LOG=ai_ide_core::dispatch=trace`。
+///
+/// **M5 任务 4**：在 stderr 之外再挂一条 JSONL 文件通道（见 [`crate::logging`]）。
+/// 两条通道共用同一个 `EnvFilter`，因此级别开关只需要拧一次；文件通道按天滚动、
+/// 出口脱敏，`AI_IDE_LOG_JSONL=off` 可整体关掉。
 pub fn init_tracing() {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::EnvFilter;
 
     let filter = EnvFilter::try_from_env("AI_IDE_CORE_LOG")
         .or_else(|_| EnvFilter::try_from_default_env())
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
-    let _ = tracing_subscriber::fmt()
+    let stderr_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
-        .with_env_filter(filter)
         .with_ansi(false)
-        .with_target(true)
-        .try_init();
+        .with_target(true);
+    let registry = tracing_subscriber::registry()
+        .with(filter)
+        .with(stderr_layer);
+
+    if crate::logging::jsonl_enabled() {
+        let writer = crate::logging::DailyJsonlWriter::new(crate::logging::log_dir());
+        // span 列表不落文件：一行一条是「能 grep / 能被扫描器按行读」的前提。
+        let json_layer = tracing_subscriber::fmt::layer()
+            .event_format(crate::logging::JsonLinesFormatter)
+            .with_writer(writer);
+        let _ = registry.with(json_layer).try_init();
+    } else {
+        let _ = registry.try_init();
+    }
 }
 
 /// 安装 panic 钩子。

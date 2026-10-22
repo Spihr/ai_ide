@@ -7,8 +7,10 @@
 
 use crate::agent_api;
 use crate::audit_api;
+use crate::checkpoint_api;
 use crate::llm_api;
 use crate::peer::Peer;
+use crate::permission_api;
 use crate::provider_api;
 use crate::session_api;
 use crate::state::{now_ms, AppState};
@@ -115,6 +117,16 @@ async fn handle_request(peer: &Peer, state: &AppState, req: Request) {
         methods::session::EXPORT => session_api::export(peer, state, &req).await,
         methods::session::FORK => session_api::fork(peer, state, &req).await,
         methods::audit::LIST => audit_api::list(peer, state, &req).await,
+
+        // 检查点与回滚（M5 切片五）：快照落文件，元数据落 meta.json
+        methods::checkpoint::CREATE => checkpoint_api::create(peer, state, &req).await,
+        methods::checkpoint::LIST => checkpoint_api::list(peer, state, &req).await,
+        methods::checkpoint::RESTORE => checkpoint_api::restore(peer, state, &req).await,
+        methods::checkpoint::DELETE => checkpoint_api::delete(peer, state, &req).await,
+
+        // 权限免问规则（M5 切片六）：只读列表与撤销。授予只能走 `agent.decide`。
+        methods::permission::LIST => permission_api::list(peer, state, &req).await,
+        methods::permission::REVOKE => permission_api::revoke(peer, state, &req).await,
 
         other => {
             warn!(method = %other, "未实现的方法");

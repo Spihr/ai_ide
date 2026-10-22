@@ -47,6 +47,7 @@ use ai_ide_protocol::dto::{
     ChatParams, ChatRole, ChatToolCall, ModelRef, ToolChoice,
 };
 use ai_ide_protocol::{methods, ErrorCode, ErrorObject, Request};
+use ai_ide_store::{audit_kind, NewAuditEvent, Store};
 use ai_ide_workspace::Workspace;
 use async_trait::async_trait;
 use tokio::sync::mpsc::unbounded_channel;
@@ -54,10 +55,13 @@ use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::audit_api;
+use crate::checkpoint::{CheckpointRecorder, CheckpointStore};
 use crate::context;
 use crate::dispatch::parse_params;
 use crate::llm_api::workspace_error;
 use crate::peer::Peer;
+use crate::permission_api;
 use crate::state::AppState;
 
 /// 审批等待上限。
@@ -373,6 +377,7 @@ pub async fn start(peer: &Peer, state: &AppState, req: &Request) {
         steps,
         cancelled,
         cancel,
+        store: state.store().cloned(),
     };
 
     info!(
@@ -504,6 +509,9 @@ struct RunCtx {
     steps: Arc<AtomicU32>,
     cancelled: Arc<AtomicBool>,
     cancel: CancelToken,
+    /// 会话库句柄：Agent 改文件前拍的检查点要记一条审计（M5 切片五）。
+    /// 启动时库没连上就是 `None`，此时只是少一条审计，不影响运行。
+    store: Option<Store>,
 }
 
 /// 跑完一次运行并把结果翻成 `agent.finished`。
@@ -631,16 +639,75 @@ async fn run_loop(
     })
     .with_timeout(APPROVAL_TIMEOUT);
 
+    // 免问规则落盘（M5 切片六）：`allow_always` 在闸门里命中时就记进库，重启后
+    // 由 `seed_always` 灌回来——否则「总是允许」只是这一次进程的承诺。
+    // 库里读不到就按空集合起跑，最多是再问一遍。
+    let gate = if let Some(store) = &ctx.store {
+        let scope = permission_api::scope_for_root(workspace.root.to_string_lossy().as_ref());
+        let seeded = permission_api::seed_gate(&gate, store, Some(scope.as_str())).await;
+        if seeded > 0 {
+            debug!(seeded, scope = %scope, "已灌入历史免问规则");
+        }
+        gate.with_recorder(permission_api::StoreRecorder::new(store.clone()))
+    } else {
+        gate
+    };
+
+    // Agent 改动前的自动检查点（M5 切片五）：懒建目录，一次运行里同一文件只拍一次，
+    // 一个文件都没改就什么都不留。记录器初始化失败只告警——少一份快照不该让整次
+    // 运行作废。
+    let recorder = match CheckpointRecorder::new(
+        CheckpointStore::from_env(),
+        workspace.root.clone(),
+        ctx.session_id.clone(),
+        &ctx.run_id,
+    ) {
+        Ok(recorder) => Some(recorder),
+        Err(err) => {
+            warn!(error = %err, "检查点记录器初始化失败，本次运行不留快照");
+            None
+        }
+    };
+
     let tool_ctx = ToolContext::new(workspace);
-    let runner = AgentLoop::new(model, &registry)
+    let mut runner = AgentLoop::new(model, &registry)
         .with_gate(&gate)
         .with_limits(ctx.limits)
         .with_progress(&ctx.steps);
+    if let Some(recorder) = &recorder {
+        runner = runner.with_write_hook(recorder);
+    }
 
-    match runner
+    let outcome = runner
         .run_cancellable(&tool_ctx, messages, &ctx.cancelled)
-        .await
-    {
+        .await;
+
+    // 收工即定稿：把这一轮改过的文件落成一份检查点，并留一条审计。
+    // 必须在 `outcome` 分支前做——被取消 / 撞上限的运行同样改过磁盘，同样该能回滚。
+    if let Some(recorder) = &recorder {
+        if let Some(checkpoint_id) = recorder.finish() {
+            if let Some(store) = &ctx.store {
+                audit_api::record(
+                    store,
+                    NewAuditEvent::core(
+                        audit_kind::CHECKPOINT_CREATED,
+                        format!("Agent 改动前自动留痕（run {}）", short_run_id(&ctx.run_id)),
+                    )
+                    .with_session(ctx.session_id.as_deref().unwrap_or_default())
+                    .with_detail(serde_json::json!({
+                        "checkpoint_id": checkpoint_id,
+                        "run_id": ctx.run_id,
+                        "workspace_root": workspace.root.display().to_string(),
+                        "origin": "agent",
+                    })),
+                )
+                .await;
+            }
+            info!(run_id = %ctx.run_id, checkpoint_id = %checkpoint_id, "已留下 Agent 自动检查点");
+        }
+    }
+
+    match outcome {
         Ok(outcome) => match outcome.stop_reason {
             StopReason::Completed => (
                 AgentRunStatus::Completed,
@@ -664,6 +731,11 @@ fn last_assistant_text(messages: &[ChatMessage]) -> Option<String> {
         .iter()
         .rfind(|item| item.role == ChatRole::Assistant)
         .and_then(|item| non_empty(item.content.clone()))
+}
+
+/// 取 run_id 前 8 位：检查点标题要短到能在列表里一眼看完。
+fn short_run_id(run_id: &str) -> &str {
+    run_id.get(..8).unwrap_or(run_id)
 }
 
 /// 撞上限时给用户的一句交代。

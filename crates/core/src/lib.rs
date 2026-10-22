@@ -36,11 +36,16 @@
 
 pub mod agent_api;
 pub mod audit_api;
+pub mod checkpoint;
+pub mod checkpoint_api;
 pub mod context;
 pub mod dispatch;
 pub mod llm_api;
 pub mod llm_runtime;
+/// 结构化日志（M5 任务 4）：JSONL 按天滚动 + 出口脱敏。
+pub mod logging;
 pub mod peer;
+pub mod permission_api;
 pub mod provider_api;
 pub mod session_api;
 pub mod session_export;

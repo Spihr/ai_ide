@@ -7,6 +7,8 @@ use anyhow::Result;
 fn main() -> Result<()> {
     ai_ide_core::version::init_tracing();
     ai_ide_core::version::install_panic_hook();
+    // CI 的「日志不含密钥」门禁靠这条探针取样（详见 `logging` 模块）。
+    ai_ide_core::logging::probe_if_requested();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

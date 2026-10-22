@@ -169,11 +169,28 @@ fn session_lifecycle_round_trip() {
             >= created["session"]["updated_at_ms"].as_i64().unwrap()
     );
 
-    // 关键词过滤：命中 / 不命中都试一次。
+    // 关键词过滤：命中 / 不命中都试一次。这里命中的是**标题**。
     let hit = core.ok("session.list", json!({ "query": "导览" }));
     assert_eq!(hit["total"], json!(1));
     let miss = core.ok("session.list", json!({ "query": "不存在的关键词" }));
     assert_eq!(miss["total"], json!(0));
+
+    // 关键词也搜**消息正文**：标题里没有「目录结构」，命中的是 assistant 那条。
+    let by_body = core.ok("session.list", json!({ "query": "目录结构" }));
+    assert_eq!(by_body["total"], json!(1), "正文命中也要算进 total");
+    assert_eq!(by_body["sessions"][0]["session_id"], json!(session_id));
+
+    // 正文搜索 + 分页：命中 1 条时 offset=1 必须给空页，且 total 仍是 1（不是 0）。
+    let paged = core.ok(
+        "session.list",
+        json!({ "query": "目录结构", "limit": 10, "offset": 1 }),
+    );
+    assert_eq!(paged["total"], json!(1));
+    assert_eq!(paged["sessions"].as_array().map(Vec::len), Some(0));
+
+    // LIKE 通配符必须被当字面量：库里没有 `%`，所以搜 `%` 应当 0 命中。
+    let wildcard = core.ok("session.list", json!({ "query": "%" }));
+    assert_eq!(wildcard["total"], json!(0), "% 不能当通配符用");
 
     // 删除是幂等的：同一个 id 删两次，第二次 deleted = 0 而不是报错。
     let deleted = core.ok("session.delete", json!({ "session_ids": [session_id] }));

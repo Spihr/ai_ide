@@ -112,56 +112,31 @@ pub async fn list(peer: &Peer, state: &AppState, req: &Request) {
         .unwrap_or(LIST_DEFAULT_LIMIT)
         .clamp(1, LIST_MAX_LIMIT);
     let offset = params.offset.unwrap_or(0);
+    // 关键词由 store 的 SQL 处理（标题 + 消息正文），分页与计数都在同一条件下做，
+    // 所以不需要像早期那样「先取 500 条再在内存里过滤标题」——内存过滤会让
+    // `total` 与真实命中数分离，也无法搜到正文里的内容。
     let keyword = params
         .query
         .as_deref()
         .map(str::trim)
-        .filter(|q| !q.is_empty())
-        .map(str::to_lowercase);
+        .filter(|q| !q.is_empty());
 
-    // 标题过滤在 store 里没有对应 SQL（它只按工作区过滤），所以带关键词时先取
-    // 一页最多 500 条再在内存里过滤。单机 IDE 的会话量远小于这个量级；分页仍按
-    // 「过滤之后」切，语义不会错位（不会出现过滤后 total 与页内容对不上）。
-    let (sessions, total) = match &keyword {
-        Some(keyword) => {
-            let probe = SessionQuery {
-                workspace_path: workspace_path.as_deref(),
-                limit: LIST_MAX_LIMIT as i64,
-                offset: 0,
-            };
-            match store.list_sessions(probe).await {
-                Ok(rows) => {
-                    let hits: Vec<Session> = rows
-                        .into_iter()
-                        .filter(|row| row.title.to_lowercase().contains(keyword))
-                        .collect();
-                    let total = hits.len() as u64;
-                    let page = hits
-                        .into_iter()
-                        .skip(offset as usize)
-                        .take(limit as usize)
-                        .collect::<Vec<_>>();
-                    (page, total)
-                }
-                Err(err) => return peer.respond_error(&req.id, &map_store_error(err)).await,
-            }
-        }
-        None => {
-            let query = SessionQuery {
-                workspace_path: workspace_path.as_deref(),
-                limit: limit as i64,
-                offset: offset as i64,
-            };
-            let rows = match store.list_sessions(query).await {
-                Ok(rows) => rows,
-                Err(err) => return peer.respond_error(&req.id, &map_store_error(err)).await,
-            };
-            let total = match store.count_sessions(workspace_path.as_deref()).await {
-                Ok(total) => total as u64,
-                Err(err) => return peer.respond_error(&req.id, &map_store_error(err)).await,
-            };
-            (rows, total)
-        }
+    let query = SessionQuery {
+        workspace_path: workspace_path.as_deref(),
+        keyword,
+        limit: limit as i64,
+        offset: offset as i64,
+    };
+    let sessions = match store.list_sessions(query).await {
+        Ok(rows) => rows,
+        Err(err) => return peer.respond_error(&req.id, &map_store_error(err)).await,
+    };
+    let total = match store
+        .count_sessions(workspace_path.as_deref(), keyword)
+        .await
+    {
+        Ok(total) => total as u64,
+        Err(err) => return peer.respond_error(&req.id, &map_store_error(err)).await,
     };
 
     let result = SessionListResult {
