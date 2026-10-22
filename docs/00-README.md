@@ -14,7 +14,7 @@ AIGC:
 模型可插拔的 AI 原生代码编辑器。技术栈：**Electron + React + TypeScript（外壳/UI） + Rust（内核）**。
 
 > 文档状态：v0.1（设计基线，待审阅）
-> 实现状态：**M0 / M1 / M2 / M3 已完成并通过实测验收；M4（Agent 闭环）内核与外壳主线已完成**（Agent 循环与 8 个工具、权限闸门四动作、`agent.*` 协议与 `crates/core` 接线、外壳运行面板与审批 UI），遗留工具调用独立卡片组件、协议文档一致性巡检与多模型复测，详见 [10-M4-验收报告.md](./10-M4-验收报告.md)；**M5（持久化与治理）进行中**：会话 / 消息持久化层 `crates/store`、`session.*` 九个方法与只读 `audit.list` 已在内核接线并通过端到端测试（含杀进程重启后会话与消息完整恢复、审计留痕在会话删除后仍存活），能力清单 30 → 40；M6–M8 中仅 M8 的打包链路先行落地，尚未验收（截至 2026-10-21）。本套文档撰写于编码之前，部分表述已与实现不符，凡有冲突以本文「实现状态」章节为准。
+> 实现状态：**M0 / M1 / M2 / M3 已完成并通过实测验收；M4（Agent 闭环）内核与外壳主线已完成**（Agent 循环与 8 个工具、权限闸门四动作、`agent.*` 协议与 `crates/core` 接线、外壳运行面板与审批 UI），遗留工具调用独立卡片组件、协议文档一致性巡检与多模型复测，详见 [10-M4-验收报告.md](./10-M4-验收报告.md)；**M5（持久化与治理）内核与外壳主线已完成**：会话 / 消息持久化层 `crates/store`、`session.*` 九个方法与只读 `audit.list` 已在内核接线并通过端到端测试（含杀进程重启后会话与消息完整恢复、审计留痕在会话删除后仍存活），能力清单 30 → 40，外壳会话面板（列表 / 搜索 / 新建 / 改名 / 删除 / 导出 / 分叉 / 审计）与对话落盘链路已接进渲染端（详见 [11-M5-验收报告.md](./11-M5-验收报告.md)），其中检查点回滚与 JSONL 结构化日志未实现（docs/05 的 M5 硬指标未全部达成，见 [11-M5-验收报告.md](./11-M5-验收报告.md)）；M6–M7 未开工，M8 仅打包链路先行落地、验收未做（截至 2026-10-22）。本套文档撰写于编码之前，部分表述已与实现不符，凡有冲突以本文「实现状态」章节为准。
 
 ---
 
@@ -31,8 +31,10 @@ AIGC:
 | [07-M1-验收报告.md](./07-M1-验收报告.md) | M1 实测验收：编辑器壳功能面、e2e 19 条断言、缺陷复盘、遗留项 |
 | [08-M2-验收报告.md](./08-M2-验收报告.md) | M2 实测验收：内核 + 外壳全链路、门禁实测、三条硬指标对照、缺陷复盘、M3 起点 |
 | [09-M3-验收报告.md](./09-M3-验收报告.md) | M3 实测验收：引用注入与预算裁剪、精确计数与压缩分流、硬指标对照、缺陷复盘、三处限制 |
+| [10-M4-验收报告.md](./10-M4-验收报告.md) | M4 实测验收：Agent 循环与 8 个工具、权限闸门四动作、真实模型联调、缺陷复盘、八处限制 |
+| [11-M5-验收报告.md](./11-M5-验收报告.md) | M5 实测验收：会话 / 消息持久化、导出与分叉、审计与脱敏、外壳会话面板、验收标准对照（检查点与结构化日志未达成）、缺陷复盘、八处限制 |
 
-## 实现状态（截至 2026-10-21）
+## 实现状态（截至 2026-10-22）
 
 ### 里程碑进度
 
@@ -43,9 +45,9 @@ AIGC:
 | M2 | 模型接入 | 已完成（内核 + 外壳）：`provider.*` / `model.*` / `llm.*` 共新增 11 个请求方法，能力清单方法数 16 → 27；Provider 设置面板、密钥 `safeStorage` 托管、流式对话 / 取消 / 错误分类全链路可跑，实测见 [08-M2-验收报告.md](./08-M2-验收报告.md)。遗留：`provider.test` 与流式首 token 时延未对真实厂商实测（M4 联调阶段已用真实网关跑通流式对话链路，见 [10-M4-验收报告.md](./10-M4-验收报告.md)） |
 | M3 | 上下文引用 | 已完成：`context.refs` 注入与预算裁剪、`truncate` / 离线 `summarize` 分流、tiktoken 按模型族精确计数，实测见 [09-M3-验收报告.md](./09-M3-验收报告.md)。遗留：tree-sitter 符号表、模型摘要；tiktoken 本地计数与上游 `usage` 未做端到端比对 |
 | M4 | Agent 闭环 | 已完成（内核 + 外壳主线）：`crates/agent` 循环调度与 8 个工具、权限闸门四动作、`agent.start` / `stop` / `decide` 协议与 `crates/core` 接线、外壳运行面板与审批卡片，实测见 [10-M4-验收报告.md](./10-M4-验收报告.md)。遗留：工具调用独立卡片组件、协议文档一致性巡检、多模型复测与多次采样 |
-| M5 | 持久化与治理 | 进行中（切片二、三、四已落地）：`crates/store`（sqlx + SQLite 会话 / 消息 / 审计仓储，32 项测试，含事务内 `fork_session`、审计脱敏与留存）、`crates/protocol` 九个 `session.*` 方法 + 只读 `audit.list` 及 DTO（能力清单 37 → 39 → 40）、`crates/core/src/session_api.rs` 接线、`crates/core/src/session_export.rs` 渲染（Markdown / JSON 导出，无额外时间库依赖）、`crates/core/src/audit_api.rs` 提供只读查询并在会话创建 / 更新 / 删除 / 导出 / 分叉处旁路留痕，端到端测试（会话 3 + 导出 5 + 审计 6，含杀进程重启后会话可恢复、导出文件可重算一致、分叉父子链重映射、审计比会话活得久）。待做：检查点回滚、会话 UI |
+| M5 | 持久化与治理 | 已完成（内核 + 外壳主线）：`crates/store`（sqlx + SQLite 会话 / 消息 / 审计仓储，32 项测试，含事务内 `fork_session` 与审计脱敏留存）、`crates/protocol` 九个 `session.*` + 只读 `audit.list` 及 DTO（能力清单 30 → 40）、`crates/core` 的 `session_api.rs` / `session_export.rs` / `audit_api.rs` 接线、外壳 `session-store.ts` + `session-bridge.ts` + `SessionPanel.tsx`（列表 / 标题过滤 / 打开 / 新建 / 改名 / 删除 / 导出 md·json / 分叉 / 审计），对话侧首条消息自动建会话、流结束按用量落 `assistant`；实测见 [11-M5-验收报告.md](./11-M5-验收报告.md)。未做：检查点回滚、JSONL 结构化日志、权限表持久化、消息级分叉入口、列表与审计的「加载更多」 |
 | M6–M7 | 终端与 Git / MCP | 未开工 |
-| M8 | 打包 | 打包链路（electron-builder + 打包脚本）已落地，验收未做 |
+| M8 | 打包 | 打包链路（electron-builder + 打包脚本）已落地，产出 `AI-IDE-0.1.0-win-x64.exe`（core 二进制在 asar 外），干净环境安装验收未做 |
 
 ### 已落地的技术栈（实测）
 
@@ -55,7 +57,7 @@ AIGC:
 | UI | React 19 + TypeScript 5.6 + Monaco 0.57 | 状态管理为手写 store（`useSyncExternalStore` 订阅），未引入第三方状态库 |
 | 样式 | 手写 CSS | 未引入 Tailwind / Radix 等 UI 框架 |
 | 测试 | Vitest 3 + playwright-core | 前端单测 + Electron 真界面 E2E |
-| 内核 | Rust 2021（rust-version 1.79）+ tokio | 六个 crate：`protocol` / `workspace` / `indexer` / `llm` / `agent` / `core` |
+| 内核 | Rust 2021（rust-version 1.79）+ tokio | 七个 crate：`protocol` / `workspace` / `indexer` / `llm` / `agent` / `store` / `core` |
 | 通信 | JSON-RPC 2.0 over stdio（NDJSON） | 帧与 DTO 定义在 `crates/protocol`，TS 类型由 ts-rs 生成 |
 
 > `02-系统架构设计.md` 中的技术栈清单（React 18、Zustand、Tailwind、Radix、features 分层等）与实测**存在偏差**，属待拍板事项，未擅自改写。
@@ -65,20 +67,21 @@ AIGC:
 - `core.*`：`hello` / `ping` / `stats` / `shutdown`
 - `workspace.*`：`open` / `close` / `tree` / `read_file` / `write_file` / `create` / `rename` / `delete` / `reveal`
 - `search.*`：`files`（文件名模糊）、`content`（内容检索，支持正则）
+- `session.*`：`create` / `list` / `get` / `update` / `delete` / `append_message` / `messages` / `export`（Markdown / JSON，`out_path` 由系统保存对话框决定）/ `fork`；`audit.list` 只读查询（会话创建 / 更新 / 删除 / 导出 / 分叉留痕，存储层已脱敏）
 - `provider.*` / `model.*`：`upsert` / `list` / `delete`（provider 另有 `test`）；目录落盘 `AI_IDE_DATA_DIR/providers.json`，密钥经 `ai-ide-llm` 的 `secret` 模块加密后存储
 - `llm.*`：`chat_stream`（流式，支持 `context.refs` 注入为前置 `system` 消息）、`cancel`、`list_models`、`count_tokens`（按模型族分流 tiktoken 精确计数 / 估算回落，`messages[]` 与 `texts[]` 相加）；上游协议为 OpenAI Chat Completions 兼容
 - 事件：`workspace.changed`、`provider.changed`、`llm.started` / `delta` / `reasoning` / `tool_call` / `usage` / `finished` / `error`
-- 外壳能力：主进程策略闸门、内核进程监管与优雅退出、preload 能力收窄、渲染端工作区/文件树/多标签/搜索状态机与 Monaco 集成
+- 外壳能力：主进程策略闸门、内核进程监管与优雅退出、preload 能力收窄、渲染端工作区/文件树/多标签/搜索状态机与 Monaco 集成；M5 会话面板与落盘桥（导出落点只经系统保存对话框、白名单按方法逐个放行）
 
 ### 尚未实现（设计图纸状态）
 
 - 协议面：`terminal.*` / `git.*` / `mcp.*` / `permission.*` / `search.symbols` / `workspace.indexed` / `core.log` 主动推送（`DECLARED_NOT_IMPLEMENTED` 目前为空表，这些方法尚未进协议常量表；M4 的 `agent.*` 已接线并进入 `IMPLEMENTED`）
-- 模块：`mcp` / `terminal` / `store` / `parser`（`crates/agent` 已创建，见上）
-- 界面：M2 的 Provider 配置 / 对话面板与 M3 的 `@` 补全、引用 chip、M4 的 Agent 运行面板与审批卡片均已接入渲染端；Inline Edit（Ctrl+K）、Tab 补全、LSP、会话历史 UI 未开工
+- 模块：`mcp` / `terminal` / `parser` / 检查点（`crates/store` 已落地，检查点未开工）
+- 界面：M2 的 Provider 配置 / 对话面板、M3 的 `@` 补全与引用 chip、M4 的 Agent 运行面板与审批卡片、M5 的会话面板与审计列表均已接入渲染端；Inline Edit（Ctrl+K）、Tab 补全、LSP、列表与审计分页加载、消息级分叉入口未开工
 
-### 质量门禁实测（2026-10-21，M4 收尾）
+### 质量门禁实测（2026-10-22，M5 收尾）
 
-`cargo test --workspace` **533 passed / 0 failed / 9 ignored**；`cargo clippy --workspace --all-targets -- -D warnings` 零告警；`cargo fmt --all -- --check` 通过；`pnpm test` **137 用例全过**（8 文件）；`pnpm smoke:core` 6/6；`pnpm smoke:m1` 23/23；`pnpm e2e:m1` 19/19；`pnpm lint` / `pnpm typecheck` 零问题；`pnpm --filter @ai-ide/desktop build` 成功。CI 定义已含上述全部步骤，可用 `pnpm verify:ci` 本地等价复现（**远端 Actions 尚未真正执行，见 [06-M0-验收报告.md](./06-M0-验收报告.md) 四-1**）。
+`cargo test --workspace` **622 passed / 0 failed / 9 ignored**（25 个测试目标）；`cargo clippy --workspace --all-targets -- -D warnings` 退出码 0（另有 ts-rs 的 `failed to parse serde attribute` 构建期噪声，非本项目代码）；`cargo fmt --all -- --check` 通过；`pnpm test` **162 用例全过**（9 文件）；`pnpm smoke:core` 6/6；`pnpm smoke:m1` 23/23；`pnpm e2e:m1` 19/19；`pnpm lint` / `pnpm typecheck` 零问题；`pnpm --filter @ai-ide/desktop build` 成功；`pnpm types:gen` 无漂移。CI 定义已含上述步骤，可用 `pnpm verify:ci` 本地等价复现（**远端 Actions 尚未真正执行**）；M5 专项：`pnpm verify:m5`。
 
 ## 建议阅读顺序
 
