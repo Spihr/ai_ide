@@ -15,6 +15,8 @@ import {
   type CoreStatus,
   type CredentialStatus,
   type PingBenchmarkResult,
+  type TerminalDataEvent,
+  type TerminalExitEvent,
   type WorkspaceChangedEvent,
   type WorkspaceIndexedEvent
 } from '../shared/ipc'
@@ -91,6 +93,24 @@ const api: AiIdeApi = {
     ipcRenderer.on(IpcChannels.credentialsStatusChanged, handler)
     return () => {
       ipcRenderer.removeListener(IpcChannels.credentialsStatusChanged, handler)
+    }
+  },
+
+  // M6：终端输出与退出各走一条专用通道。这里只负责转交，base64 解码在渲染侧做
+  // （preload 不该替 UI 决定二进制怎么表示）。
+  onTerminalData: (listener: (event: TerminalDataEvent) => void): (() => void) => {
+    const handler = (_event: IpcRendererEvent, payload: TerminalDataEvent): void => listener(payload)
+    ipcRenderer.on(IpcChannels.terminalData, handler)
+    return () => {
+      ipcRenderer.removeListener(IpcChannels.terminalData, handler)
+    }
+  },
+
+  onTerminalExit: (listener: (event: TerminalExitEvent) => void): (() => void) => {
+    const handler = (_event: IpcRendererEvent, payload: TerminalExitEvent): void => listener(payload)
+    ipcRenderer.on(IpcChannels.terminalExit, handler)
+    return () => {
+      ipcRenderer.removeListener(IpcChannels.terminalExit, handler)
     }
   }
 }

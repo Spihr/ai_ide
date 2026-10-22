@@ -98,7 +98,19 @@ const RENDERER_ALLOWED = new Set<string>([
   // 协议里没有 `permission.allow`（授免问只能经 `agent.decide` 的 `allow_always`），
   // 所以外壳不存在「悄悄给自己开权限」的入口，`revoke` 只会让闸门更严。
   Methods.permission.list,
-  Methods.permission.revoke
+  Methods.permission.revoke,
+
+  // M6：终端。五条同样是「用户显式动作」的后果——点「新建终端」才 `create`、
+  // 敲键盘才 `write`、拖动面板才 `resize`、点关闭才 `kill`、面板展开时对齐
+  // 内核真实的会话表才 `list`。这里放行的是**在 PTY 里跑用户自己敲的命令**，
+  // 它不构成「渲染进程能执行任意命令」的新入口：`terminal.create` 不能指定
+  // 任意可执行文件以外的东西，也拿不到内核的 workspace 权限提升——命令的
+  // 破坏力受制于开终端的那个人（用户），而不是某个脚本自动拼出来的。
+  Methods.terminal.create,
+  Methods.terminal.write,
+  Methods.terminal.resize,
+  Methods.terminal.kill,
+  Methods.terminal.list
 ])
 
 export interface PolicyDecision {

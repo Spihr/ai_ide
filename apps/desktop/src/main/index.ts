@@ -183,15 +183,20 @@ async function startCore(): Promise<CoreStatus> {
   instance.on('stderr', (chunk) => pushLog(chunk))
   instance.on('notification', (method, params) => {
     // 工作区事件走各自专用通道，M2 的 `provider.changed` / `llm.*` 与 M4 的
-    // `agent.*` 走统一 AI 事件通道；其余通知只留在内核日志里。
+    // `agent.*` 走统一 AI 事件通道，M6 的 `terminal.data` / `terminal.exit`
+    // 走终端专用通道（高频字节流，不能混进 AI 事件）；其余通知只留在内核日志里。
     const channel =
       method === Methods.event.workspaceChanged
         ? IpcChannels.workspaceChanged
         : method === Methods.event.workspaceIndexed
           ? IpcChannels.workspaceIndexed
-          : isAiEvent(method)
-            ? IpcChannels.aiEvent
-            : null
+          : method === Methods.event.terminalData
+            ? IpcChannels.terminalData
+            : method === Methods.event.terminalExit
+              ? IpcChannels.terminalExit
+              : isAiEvent(method)
+                ? IpcChannels.aiEvent
+                : null
 
     if (channel && mainWindow && !mainWindow.isDestroyed()) {
       const payload = channel === IpcChannels.aiEvent ? ({ method, params } satisfies AiEvent) : params

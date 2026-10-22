@@ -13,8 +13,10 @@ import { FileTree } from './components/FileTree'
 import { PermissionPanel } from './components/PermissionPanel'
 import { SearchPanel } from './components/SearchPanel'
 import { StatusBar } from './components/StatusBar'
+import { TerminalPanel } from './components/TerminalPanel'
 import { initCheckpoints } from './checkpoint-store'
 import { initSessions } from './session-store'
+import { initTerminalEvents, toggleTerminalPanel } from './terminal-store'
 import {
   closeWorkspace,
   dismissNotice,
@@ -45,10 +47,14 @@ export function App() {
     initSessions()
     // 检查点列表同理：有工作区就先拉一次，切到「检查点」视图时看到的就是最新的。
     initCheckpoints()
+    // M6：终端输出与退出事件常驻订阅——面板收起时也要收，否则后台跑完的输出
+    // 会在下次展开时整段缺失。
+    const offTerminal = initTerminalEvents()
     return () => {
       alive = false
       offStatus()
       offWorkspace()
+      offTerminal()
       disposeAi()
     }
   }, [])
@@ -67,6 +73,10 @@ export function App() {
       } else if (key === 'b') {
         event.preventDefault()
         setActivity('explorer')
+      } else if (key === '`' && !event.metaKey) {
+        // Ctrl+` 开关终端面板（与 VS Code 一致）；不拦 Meta 组合，避免抢系统快捷键。
+        event.preventDefault()
+        void toggleTerminalPanel()
       }
     }
     window.addEventListener('keydown', onKeyDown)
@@ -175,6 +185,9 @@ export function App() {
           )}
         </main>
       </div>
+
+      {/* M6：终端是底部面板，横跨整个外壳（在 body 之外），不挤占侧栏与编辑器。 */}
+      <TerminalPanel />
 
       {state.notice && (
         <div className={`notice notice--${state.notice.kind}`} onClick={dismissNotice} role="alert">

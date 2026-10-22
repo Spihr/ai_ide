@@ -86,6 +86,20 @@ describe('checkRendererCall', () => {
     }
   })
 
+  it('放行 M6 的终端方法', () => {
+    const methods = [
+      Methods.terminal.create,
+      Methods.terminal.write,
+      Methods.terminal.resize,
+      Methods.terminal.kill,
+      Methods.terminal.list
+    ]
+
+    for (const method of methods) {
+      expect(checkRendererCall(method).allowed, `${method} 应被放行`).toBe(true)
+    }
+  })
+
   it('拦截白名单之外的方法，并给出原因', () => {
     // core.hello / core.shutdown 是主进程自用的握手与退出；workspace.chmod、agent.run
     // 之类内核根本没实现（M4 的三条是 agent.start / stop / decide，没有 agent.run），
@@ -152,6 +166,11 @@ describe('checkRendererCall', () => {
       'session.list',
       'session.messages',
       'session.update',
+      'terminal.create',
+      'terminal.kill',
+      'terminal.list',
+      'terminal.resize',
+      'terminal.write',
       'workspace.close',
       'workspace.create',
       'workspace.delete',

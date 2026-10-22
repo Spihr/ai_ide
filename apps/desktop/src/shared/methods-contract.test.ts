@@ -77,6 +77,11 @@ describe('协议常量', () => {
       permissionList: Methods.permission.list,
       permissionRevoke: Methods.permission.revoke,
       auditList: Methods.audit.list,
+      terminalCreate: Methods.terminal.create,
+      terminalWrite: Methods.terminal.write,
+      terminalResize: Methods.terminal.resize,
+      terminalKill: Methods.terminal.kill,
+      terminalList: Methods.terminal.list,
       wsChanged: Methods.event.workspaceChanged,
       wsIndexed: Methods.event.workspaceIndexed,
       providerChanged: Methods.event.providerChanged,
@@ -88,7 +93,9 @@ describe('协议常量', () => {
       llmFinished: Methods.event.llmFinished,
       llmError: Methods.event.llmError,
       agentApprovalRequired: Methods.event.agentApprovalRequired,
-      agentFinished: Methods.event.agentFinished
+      agentFinished: Methods.event.agentFinished,
+      terminalData: Methods.event.terminalData,
+      terminalExit: Methods.event.terminalExit
     }).toEqual({
       hello: 'core.hello',
       ping: 'core.ping',
@@ -137,6 +144,11 @@ describe('协议常量', () => {
       permissionList: 'permission.list',
       permissionRevoke: 'permission.revoke',
       auditList: 'audit.list',
+      terminalCreate: 'terminal.create',
+      terminalWrite: 'terminal.write',
+      terminalResize: 'terminal.resize',
+      terminalKill: 'terminal.kill',
+      terminalList: 'terminal.list',
       wsChanged: 'workspace.changed',
       wsIndexed: 'workspace.indexed',
       providerChanged: 'provider.changed',
@@ -148,7 +160,9 @@ describe('协议常量', () => {
       llmFinished: 'llm.finished',
       llmError: 'llm.error',
       agentApprovalRequired: 'agent.approval_required',
-      agentFinished: 'agent.finished'
+      agentFinished: 'agent.finished',
+      terminalData: 'terminal.data',
+      terminalExit: 'terminal.exit'
     })
   })
 
@@ -199,7 +213,13 @@ describe('协议常量', () => {
       'checkpoint.delete',
       'permission.list',
       'permission.revoke',
-      'audit.list'
+      'audit.list',
+      // M6 切片一：终端会话（PTY 在 crates/terminal，dispatch 已接线）。
+      'terminal.create',
+      'terminal.write',
+      'terminal.resize',
+      'terminal.kill',
+      'terminal.list'
     ])
   })
 
