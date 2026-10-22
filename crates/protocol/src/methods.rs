@@ -143,6 +143,23 @@ pub mod terminal {
     pub const LIST: &str = "terminal.list";
 }
 
+/// Git 工作区能力（M6 切片三）：状态 / diff / 暂存 / 提交 / 分支。
+///
+/// 五个方法都以「工作区根」为操作对象，路径参数一律相对工作区根；
+/// 事件侧不新增通知——状态变化由客户端在写操作后自行重查，避免内核猜测外部改动。
+pub mod git {
+    /// 工作区变更清单与分支头信息。
+    pub const STATUS: &str = "git.status";
+    /// unified diff（单文件或全量、工作区或暂存区）。
+    pub const DIFF: &str = "git.diff";
+    /// 暂存 / 取消暂存。
+    pub const STAGE: &str = "git.stage";
+    /// 提交暂存区并返回新提交哈希。
+    pub const COMMIT: &str = "git.commit";
+    /// 当前分支与分支列表。
+    pub const BRANCHES: &str = "git.branches";
+}
+
 /// Core → Main 的通知（事件）。
 pub mod event {
     /// 内核日志转发，便于 Main 侧统一落盘。
@@ -250,6 +267,12 @@ pub const IMPLEMENTED: &[&str] = &[
     terminal::RESIZE,
     terminal::KILL,
     terminal::LIST,
+    // M6 切片三：Git 工作区能力（实现在 `crates/git`，dispatch 已接线）。
+    git::STATUS,
+    git::DIFF,
+    git::STAGE,
+    git::COMMIT,
+    git::BRANCHES,
 ];
 
 /// 协议面**已定义、但内核尚未接线**的方法。
@@ -271,7 +294,7 @@ mod tests {
 
     #[test]
     fn implemented_list_covers_core_m1_m2_agent_domains() {
-        assert_eq!(IMPLEMENTED.len(), 51);
+        assert_eq!(IMPLEMENTED.len(), 56);
         assert!(IMPLEMENTED.contains(&"core.ping"));
         assert!(IMPLEMENTED.contains(&"$/cancelRequest"));
         assert!(IMPLEMENTED.contains(&"workspace.read_file"));
@@ -318,6 +341,18 @@ mod tests {
         }
         assert_eq!(terminal::CREATE, "terminal.create");
         assert_eq!(terminal::RESIZE, "terminal.resize");
+        // M6 切片三：Git 五个方法进清单，事件侧不新增任何通知。
+        for name in [
+            git::STATUS,
+            git::DIFF,
+            git::STAGE,
+            git::COMMIT,
+            git::BRANCHES,
+        ] {
+            assert!(IMPLEMENTED.contains(&name), "{name} 应已接线");
+        }
+        assert_eq!(git::STATUS, "git.status");
+        assert_eq!(git::BRANCHES, "git.branches");
     }
 
     #[test]
@@ -347,7 +382,7 @@ mod tests {
         all.sort_unstable();
         all.dedup();
         assert_eq!(all.len(), total, "两张表不得有重叠");
-        assert_eq!(total, 51, "应恰好覆盖协议里定义的全部 51 个请求方法");
+        assert_eq!(total, 56, "应恰好覆盖协议里定义的全部 56 个请求方法");
     }
 
     #[test]

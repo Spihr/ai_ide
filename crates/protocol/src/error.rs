@@ -11,6 +11,7 @@
 //! | `4xxx` | 运行时（取消等） |
 //! | `5xxx` | 会话持久化 |
 //! | `6xxx` | 终端会话 |
+//! | `7xxx` | Git 操作 |
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -80,6 +81,18 @@ impl ErrorCode {
     pub const TERMINAL_IO_ERROR: Self = Self(6003);
     /// 参数不可用：`data` 不是合法 base64、尺寸无法夹取等。
     pub const TERMINAL_INVALID: Self = Self(6004);
+
+    // ---------- 7xxx Git ----------
+    /// 机器上没有可用的 `git`：未安装、或 `AI_IDE_GIT` 指向的文件不可执行。
+    pub const GIT_UNAVAILABLE: Self = Self(7001);
+    /// 工作区不是 Git 仓库（或不在工作树之内）。
+    pub const GIT_NOT_A_REPOSITORY: Self = Self(7002);
+    /// git 命令本身失败：非零退出，`data.stderr` 带原文。
+    pub const GIT_COMMAND_FAILED: Self = Self(7003);
+    /// 参数不可用：路径越界 / 绝对路径、上下文行数越界、空提交信息。
+    pub const GIT_INVALID_PARAMS: Self = Self(7004);
+    /// 没有可提交的变更（暂存区为空且未 `--allow-empty`）。
+    pub const GIT_NOTHING_TO_COMMIT: Self = Self(7005);
 
     pub const fn as_i32(self) -> i32 {
         self.0

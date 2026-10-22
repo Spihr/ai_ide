@@ -8,6 +8,7 @@ members = [
     "crates/agent",
     "crates/store",
     "crates/terminal",
+    "crates/git",
     "crates/core",
 ]
 
@@ -100,6 +101,7 @@ ai-ide-llm = { path = "crates/llm" }
 ai-ide-agent = { path = "crates/agent" }
 ai-ide-store = { path = "crates/store" }
 ai-ide-terminal = { path = "crates/terminal" }
+ai-ide-git = { path = "crates/git" }
 
 [profile.release]
 lto = "thin"

@@ -82,6 +82,11 @@ describe('协议常量', () => {
       terminalResize: Methods.terminal.resize,
       terminalKill: Methods.terminal.kill,
       terminalList: Methods.terminal.list,
+      gitStatus: Methods.git.status,
+      gitDiff: Methods.git.diff,
+      gitStage: Methods.git.stage,
+      gitCommit: Methods.git.commit,
+      gitBranches: Methods.git.branches,
       wsChanged: Methods.event.workspaceChanged,
       wsIndexed: Methods.event.workspaceIndexed,
       providerChanged: Methods.event.providerChanged,
@@ -149,6 +154,11 @@ describe('协议常量', () => {
       terminalResize: 'terminal.resize',
       terminalKill: 'terminal.kill',
       terminalList: 'terminal.list',
+      gitStatus: 'git.status',
+      gitDiff: 'git.diff',
+      gitStage: 'git.stage',
+      gitCommit: 'git.commit',
+      gitBranches: 'git.branches',
       wsChanged: 'workspace.changed',
       wsIndexed: 'workspace.indexed',
       providerChanged: 'provider.changed',
@@ -219,7 +229,13 @@ describe('协议常量', () => {
       'terminal.write',
       'terminal.resize',
       'terminal.kill',
-      'terminal.list'
+      'terminal.list',
+      // M6 切片三：工作区 Git（crates/git，dispatch 已接线）。
+      'git.status',
+      'git.diff',
+      'git.stage',
+      'git.commit',
+      'git.branches'
     ])
   })
 

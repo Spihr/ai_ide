@@ -7,6 +7,7 @@ use crate::agent_api::AgentHub;
 use crate::llm_api::StreamHub;
 use crate::llm_runtime::{default_store_path, LlmRuntime};
 use crate::peer::Peer;
+use ai_ide_git::GitService;
 use ai_ide_indexer::FileIndex;
 use ai_ide_store::Store;
 use ai_ide_terminal::TerminalManager;
@@ -43,6 +44,10 @@ pub struct AppState {
     /// 状态里只留管理器句柄：`terminal.*` 是独立报文，和 agent / stream 一样要按
     /// 会话 id 找到对应实例。
     terminals: Arc<TerminalManager>,
+    /// Git 仓库句柄缓存（M6 切片三）。按工作区根缓存 `GitRepo`：每次 `git.status`
+    /// 都重新 `rev-parse` 一遍仓库根是白花钱，而工作区关闭时缓存必须失效
+    /// （同一个路径可能被关掉后重新 `init` 成另一个仓库），见 `ws::close`。
+    git: Arc<GitService>,
     /// 会话与消息库（M5）。进程启动时连一次，此后只读句柄。
     ///
     /// 用 `OnceLock` 而不是 `Mutex<Option<..>>`：它只写一次，写入发生在开始读 stdin
@@ -70,6 +75,7 @@ impl AppState {
             streams: Arc::new(StreamHub::new()),
             agents: Arc::new(AgentHub::new()),
             terminals: Arc::new(TerminalManager::new()),
+            git: Arc::new(GitService::new()),
             store: OnceLock::new(),
         }
     }
@@ -97,6 +103,11 @@ impl AppState {
     /// 终端会话管理器（M6 切片一）。事件通道由 `run()` 取走后统一转发。
     pub fn terminal(&self) -> Arc<TerminalManager> {
         Arc::clone(&self.terminals)
+    }
+
+    /// Git 仓库句柄缓存（M6 切片三）。
+    pub fn git(&self) -> Arc<GitService> {
+        Arc::clone(&self.git)
     }
 
     /// 装上会话库（M5）。重复调用保留第一次装上的那份——库句柄是进程级资源，

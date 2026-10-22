@@ -33,6 +33,7 @@ name = "ai-ide-core"
 version = "0.1.0"
 dependencies = [
  "ai-ide-agent",
+ "ai-ide-git",
  "ai-ide-indexer",
  "ai-ide-llm",
  "ai-ide-protocol",
@@ -49,6 +50,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "ai-ide-git"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.21",
+ "tracing",
 ]
 
 [[package]]

@@ -2171,6 +2171,224 @@ pub struct TerminalExitEvent {
     pub at_ms: i64,
 }
 
+// ---------------------------------------------------------------------------
+// git.*（M6 切片三：工作区 Git 能力）
+// ---------------------------------------------------------------------------
+
+/// `git.status` 请求参数。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitStatusParams {
+    /// 工作区 id；缺省作用于活动工作区。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub workspace_id: Option<String>,
+}
+
+/// 工作区里的一个变更条目。
+///
+/// `index` / `worktree` 是 git 的两列状态字母，未变更的一侧为 `"."`；直接透出字母
+/// 而不翻译成布尔量，是因为 UI 要区分「已暂存的新增（`A`）」与「未暂存的新增（`?`）」，
+/// 这两者合并成一个 `is_new` 就再也分不开了。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitStatusEntry {
+    /// 相对工作区根的文件路径（正斜杠）。
+    pub path: String,
+    /// 重命名 / 复制前的原路径；其它情况为 `null`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub original_path: Option<String>,
+    /// 索引区（暂存区）状态：`M` / `A` / `D` / `R` / `C` / `T` / `U`，无变更为 `.`。
+    pub index: String,
+    /// 工作区状态，无变更为 `.`。
+    pub worktree: String,
+    /// 条目类别：`changed` / `renamed` / `unmerged` / `untracked` / `ignored`。
+    pub kind: String,
+}
+
+/// `git.status` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitStatusResult {
+    /// 工作区 id。
+    pub workspace_id: String,
+    /// 当前分支名；分离头指针时为 `null`。
+    pub branch: Option<String>,
+    /// 是否处于分离头指针状态。
+    pub detached: bool,
+    /// HEAD 指向的提交；仓库还没有任何提交时为 `null`。
+    pub head_oid: Option<String>,
+    /// 上游分支（`origin/main` 这类）；未设置时为 `null`。
+    pub upstream: Option<String>,
+    /// 相对上游领先的提交数；无上游时为 0。
+    #[ts(type = "number")]
+    pub ahead: u64,
+    /// 相对上游落后的提交数；无上游时为 0。
+    #[ts(type = "number")]
+    pub behind: u64,
+    /// 工作区是否干净（`entries` 为空）。
+    pub clean: bool,
+    /// 变更清单，按 git 输出顺序（路径升序）。
+    pub entries: Vec<GitStatusEntry>,
+}
+
+/// `git.diff` 请求参数。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitDiffParams {
+    /// 工作区 id；缺省作用于活动工作区。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub workspace_id: Option<String>,
+    /// 只取该路径的 diff（相对工作区根）；缺省为全量 diff。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub path: Option<String>,
+    /// 是否看暂存区（`git diff --cached`）。`false` 为「工作区相对暂存区」。
+    #[serde(default)]
+    pub staged: bool,
+    /// 上下文行数；缺省 3（与 git 缺省一致），上限 100。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[ts(type = "number")]
+    pub context_lines: Option<u32>,
+}
+
+/// `git.diff` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitDiffResult {
+    /// 请求里的路径；全量 diff 时为 `null`。
+    pub path: Option<String>,
+    /// 是否是暂存区 diff（回显请求参数）。
+    pub staged: bool,
+    /// unified diff 文本（未着色，`\n` 换行）。无差异时为空串。
+    pub diff: String,
+    /// diff 文本的字节数（UTF-8 编码后）。
+    #[ts(type = "number")]
+    pub bytes: u64,
+    /// 是否因超过 1 MiB 上限被截断。截断只切尾部，头部始终完整。
+    pub truncated: bool,
+}
+
+/// `git.stage` 请求参数。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitStageParams {
+    /// 工作区 id；缺省作用于活动工作区。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub workspace_id: Option<String>,
+    /// 要暂存 / 取消暂存的路径；与 `all` 二选一（都给了按 `all` 处理）。
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// 暂存全部变更（含删除），等价 `git add -A`。
+    #[serde(default)]
+    pub all: bool,
+    /// `true` 为取消暂存（`git reset`），`false` 为暂存（`git add`）。
+    #[serde(default)]
+    pub unstage: bool,
+}
+
+/// `git.stage` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitStageResult {
+    /// 实际操作的路径（回显，已归一化为正斜杠）；全量操作为空表。
+    pub paths: Vec<String>,
+    /// 是否为全量操作。
+    pub all: bool,
+    /// 是否为取消暂存。
+    pub unstage: bool,
+    /// 操作后仍在暂存区的条目数，便于 UI 立刻刷新角标而不必再发一次 `git.status`。
+    #[ts(type = "number")]
+    pub staged_total: u64,
+}
+
+/// `git.commit` 请求参数。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitCommitParams {
+    /// 工作区 id；缺省作用于活动工作区。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub workspace_id: Option<String>,
+    /// 提交信息（首行为摘要）。
+    pub message: String,
+    /// 只提交这些路径；缺省提交整个暂存区。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub paths: Option<Vec<String>>,
+    /// 追加到上一次提交（`--amend`）。
+    #[serde(default)]
+    pub amend: bool,
+    /// 允许空提交（`--allow-empty`）。
+    #[serde(default)]
+    pub allow_empty: bool,
+}
+
+/// `git.commit` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitCommitResult {
+    /// 新提交的完整 SHA-1。
+    pub oid: String,
+    /// 短哈希（至少 7 位）。
+    pub short_oid: String,
+    /// 提交信息首行。
+    pub summary: String,
+    /// 提交后的分支名；分离头指针时为 `null`。
+    pub branch: Option<String>,
+    /// 本次提交涉及的文件数。
+    #[ts(type = "number")]
+    pub files: u64,
+    /// 作者（`Name <email>`）。仓库未配置身份时由内核填入临时身份，见协议文档。
+    pub author: String,
+}
+
+/// `git.branches` 请求参数。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitBranchesParams {
+    /// 工作区 id；缺省作用于活动工作区。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub workspace_id: Option<String>,
+}
+
+/// 一个分支（本地或远端）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitBranch {
+    /// 分支名；远端的形如 `origin/main`。
+    pub name: String,
+    /// 分支指向的完整提交哈希。
+    pub oid: String,
+    /// 短哈希。
+    pub short_oid: String,
+    /// 是否为当前分支。
+    pub is_current: bool,
+    /// 是否为远端跟踪分支。
+    pub is_remote: bool,
+    /// 上游分支名；未设置为 `null`。
+    pub upstream: Option<String>,
+}
+
+/// `git.branches` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitBranchesResult {
+    /// 工作区 id。
+    pub workspace_id: String,
+    /// 当前分支名；分离头指针时为 `null`。
+    pub current: Option<String>,
+    /// 是否处于分离头指针状态。
+    pub detached: bool,
+    /// 本地分支在前、远端分支在后，各自按名字升序。
+    pub branches: Vec<GitBranch>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

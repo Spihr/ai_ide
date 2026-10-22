@@ -33,7 +33,13 @@
 //! 请求-响应，而是由 [`terminal_api::pump`] 把管理器的事件通道抬成 `terminal.data` /
 //! `terminal.exit` 两条单向通知——一次 `ls` 不必等到进程退出才有回执。
 //!
-//! 后续里程碑在此骨架上继续挂载：mcp / git 等模块。
+//! **`git.*` 已接线（M6 切片三）**：`git.status` / `git.diff` / `git.stage` /
+//! `git.commit` / `git.branches` 五个方法在 [`git_api`]，仓库操作在 `crates/git`
+//! （系统 git 子进程，`AI_IDE_GIT` 可覆盖可执行文件路径）。这些方法都带
+//! `workspace_id` 可选参数，缺省作用于活动工作区；同步的子进程调用统一搬进
+//! 阻塞线程池，不占 tokio worker。Git 不新增事件：索引变化已有 `workspace.changed`。
+//!
+//! 后续里程碑在此骨架上继续挂载：mcp 等模块。
 //!
 //! ## 绝对约定：stdout 只跑协议
 //!
@@ -46,6 +52,7 @@ pub mod checkpoint;
 pub mod checkpoint_api;
 pub mod context;
 pub mod dispatch;
+pub mod git_api;
 pub mod llm_api;
 pub mod llm_runtime;
 /// 结构化日志（M5 任务 4）：JSONL 按天滚动 + 出口脱敏。
