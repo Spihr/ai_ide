@@ -41,6 +41,7 @@ use crate::registry::{ToolContext, ToolRegistry};
 use ai_ide_protocol::dto::{ChatMessage, ChatRole, ChatToolCall, ToolSpec};
 use async_trait::async_trait;
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// 默认最大轮数（模型调用次数）。
@@ -48,6 +49,19 @@ pub const DEFAULT_MAX_ROUNDS: u32 = 24;
 
 /// 默认最大步数（工具执行次数）。
 pub const DEFAULT_MAX_STEPS: u32 = 64;
+
+/// 写盘前的留痕钩子（M5 切片五）。
+///
+/// 循环只管「在真正落笔之前喊一声」，具体是拍检查点、写影子副本还是什么都不做，
+/// 由上层决定——`crates/agent` 不认识检查点存储，也不该认识。
+///
+/// 实现必须**不阻塞、不报错**：留痕失败没有任何理由拦下一次正常编辑，所以签名
+/// 里既没有 `async` 也没有 `Result`。同一文件在一次运行里被喊多次是常态，去重
+/// 由实现方负责（见 `crates/core` 的 `CheckpointRecorder`）。
+pub trait WriteHook: Send + Sync {
+    /// 某个绝对路径即将被写入 / 覆盖 / 删除。
+    fn before_write(&self, abs: &Path);
+}
 
 /// 循环上限。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +197,7 @@ pub struct AgentLoop<'a> {
     gate: Option<&'a PermissionGate>,
     limits: RunLimits,
     progress: Option<&'a AtomicU32>,
+    write_hook: Option<&'a dyn WriteHook>,
 }
 
 impl<'a> AgentLoop<'a> {
@@ -194,6 +209,7 @@ impl<'a> AgentLoop<'a> {
             gate: None,
             limits: RunLimits::default(),
             progress: None,
+            write_hook: None,
         }
     }
 
@@ -222,6 +238,17 @@ impl<'a> AgentLoop<'a> {
     #[must_use]
     pub fn with_progress(mut self, counter: &'a AtomicU32) -> Self {
         self.progress = Some(counter);
+        self
+    }
+
+    /// 挂一个写盘前留痕钩子（M5 切片五）。
+    ///
+    /// 只在写类工具（`write` / `edit` / `create` / `apply_diff`）即将执行时触发，
+    /// 触发点在权限闸门之后、工具执行之前：被拒的调用不该留下快照，因为磁盘
+    /// 根本不会变。
+    #[must_use]
+    pub fn with_write_hook(mut self, hook: &'a dyn WriteHook) -> Self {
+        self.write_hook = Some(hook);
         self
     }
 
@@ -363,6 +390,14 @@ impl<'a> AgentLoop<'a> {
                     }
                 }
 
+                // 落笔前留痕：把「即将被改掉的内容」先交给钩子（M5 切片五）。
+                // 放在闸门之后、执行之前——被拒的调用磁盘不会变，没必要留快照。
+                if let Some(hook) = self.write_hook {
+                    if let Some(abs) = write_target(&call.name, &call.arguments, ctx) {
+                        hook.before_write(&abs);
+                    }
+                }
+
                 state.steps += 1;
                 // 先记账再执行：这一步「已经发生」了，即便工具自己报错也不退回。
                 if let Some(counter) = self.progress {
@@ -439,6 +474,26 @@ fn gate_arguments(arguments: &str) -> Option<Value> {
     serde_json::from_str::<Value>(trimmed)
         .ok()
         .filter(Value::is_object)
+}
+
+/// 解析出写类工具的目标绝对路径。
+///
+/// 只要 `path`（四个写工具的公共参数），不解析内容——留痕关心的是「哪个文件会被动」。
+/// 只做路径规范化、不碰磁盘；越界 / 敏感路径会解析失败，这种调用本来也写不进去。
+fn write_target(name: &str, arguments: &str, ctx: &ToolContext<'_>) -> Option<PathBuf> {
+    if !crate::permission::is_write_tool(name) {
+        return None;
+    }
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let value: Value = serde_json::from_str(trimmed).ok()?;
+    let path = value.get("path")?.as_str()?.trim();
+    if path.is_empty() {
+        return None;
+    }
+    ctx.guard.resolve(path).ok()
 }
 
 /// 从「工具名 + 参数」抽出闸门判定要的三样：工具名、目标路径、命令内容。
@@ -923,5 +978,100 @@ mod tests {
             .unwrap();
 
         assert_eq!(outcome.steps, 1);
+    }
+
+    /// 记录钩子收到的路径与「喊话那一刻的磁盘内容」。
+    ///
+    /// 存内容而不是只存路径，是为了验证「留痕发生在改动之前」——如果循环改成
+    /// 先写后喊，这里读到的就会是新内容，断言会立刻炸。
+    struct RecordingHook {
+        seen: Mutex<Vec<(String, Option<String>)>>,
+    }
+
+    impl RecordingHook {
+        fn new() -> Self {
+            Self {
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn seen(&self) -> Vec<(String, Option<String>)> {
+            self.seen.lock().expect("seen 锁").clone()
+        }
+    }
+
+    impl WriteHook for RecordingHook {
+        fn before_write(&self, abs: &Path) {
+            let before = std::fs::read_to_string(abs).ok();
+            self.seen
+                .lock()
+                .expect("seen 锁")
+                .push((abs.display().to_string(), before));
+        }
+    }
+
+    #[tokio::test]
+    async fn write_hook_sees_the_file_before_it_changes() {
+        let sandbox = Sandbox::new("loop-hook-write");
+        sandbox.write("a.txt", "old\n");
+
+        let model = Scripted::new(vec![
+            Ok(TurnReply::with_tool_calls(
+                "",
+                vec![call("c1", "write", r#"{"path":"a.txt","content":"new\n"}"#)],
+            )),
+            Ok(TurnReply::text_only("改好了")),
+        ]);
+        let registry = ToolRegistry::core();
+        let hook = RecordingHook::new();
+
+        let outcome = AgentLoop::new(&model, &registry)
+            .with_write_hook(&hook)
+            .run(&sandbox.ctx(), vec![message::user_message("改 a.txt")])
+            .await
+            .expect("循环应成功");
+
+        assert_eq!(outcome.steps, 1);
+        let seen = hook.seen();
+        assert_eq!(seen.len(), 1, "一次写入只该留一次痕");
+        assert!(
+            seen[0].0.ends_with("a.txt"),
+            "钩子拿到的是绝对路径：{}",
+            seen[0].0
+        );
+        assert_eq!(
+            seen[0].1.as_deref(),
+            Some("old\n"),
+            "钩子必须在改动前拿到旧内容，否则回滚无从谈起"
+        );
+        assert_eq!(sandbox.read("a.txt"), "new\n");
+    }
+
+    #[tokio::test]
+    async fn write_hook_ignores_read_only_tools() {
+        let sandbox = Sandbox::new("loop-hook-read");
+        sandbox.write("a.txt", "hello\n");
+
+        let model = Scripted::new(vec![
+            Ok(TurnReply::with_tool_calls(
+                "",
+                vec![call("c1", "read", r#"{"path":"a.txt"}"#)],
+            )),
+            Ok(TurnReply::text_only("done")),
+        ]);
+        let registry = ToolRegistry::core();
+        let hook = RecordingHook::new();
+
+        AgentLoop::new(&model, &registry)
+            .with_write_hook(&hook)
+            .run(&sandbox.ctx(), vec![message::user_message("看看")])
+            .await
+            .expect("循环应成功");
+
+        assert!(
+            hook.seen().is_empty(),
+            "读文件不该触发留痕：{:?}",
+            hook.seen()
+        );
     }
 }

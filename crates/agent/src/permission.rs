@@ -20,7 +20,7 @@
 //! | 动作 | 语义 |
 //! |---|---|
 //! | `allow_once` | 只放行这一次，同类调用下次还得问 |
-//! | `allow_always` | 同工具同范围记一笔，**本次进程内**不再问 |
+//! | `allow_always` | 同工具同范围记一笔，本次进程内不再问；装了 [`AlwaysRecorder`] 则同时落盘，重启仍有效 |
 //! | `deny` | 拒绝，理由由闸门补齐 |
 //! | `deny_with_reason` | 拒绝，并把原因原文留在错误里回灌给模型自纠 |
 //!
@@ -50,6 +50,14 @@ const READ_TOOLS: &[&str] = &["read", "list", "grep"];
 
 /// 写工具：工作区内放行，越界 / 敏感路径照拒。
 const WRITE_TOOLS: &[&str] = &["write", "edit", "create", "apply_diff"];
+
+/// 该工具是否会改动磁盘。
+///
+/// 唯一的判断依据：循环的写盘留痕（`AgentLoop::with_write_hook`）与闸门的
+/// 「写工具放行」用的是同一份名单，免得一处新增工具、另一处忘了留快照。
+pub(crate) fn is_write_tool(name: &str) -> bool {
+    WRITE_TOOLS.contains(&name)
+}
 
 /// 跑外部命令的工具：非高危命令一律走审批。
 const COMMAND_TOOL: &str = "run_command";
@@ -246,6 +254,40 @@ pub enum Grant {
     Approved(ApprovalReply),
 }
 
+// ---------------------------------------------------------------- 免问落盘
+
+/// 一条「总是允许」记录：**范围键 + 工具名 + 作用域**。
+///
+/// 范围键由 [`scope_key`] 算出，键本身就是去重粒度（`command:cargo` 而非整个
+/// `run_command`），落盘与内存用同一把钥匙，重启后不会放大成「全放行」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlwaysRecord {
+    /// 范围键，形如 `command:cargo` / `path:edit:src` / `tool:foo`。
+    pub key: String,
+    /// 工具名，供列表展示与「按工具撤销」。
+    pub tool: String,
+    /// 作用域：工作区绝对路径或 `global`。
+    pub scope: String,
+}
+
+/// 免问范围的持久化落点（由上层注入，agent crate 不依赖存储层）。
+///
+/// 实现方**必须自己保证不阻塞判定**：这里在 `authorize` 的热路径上同步调用，
+/// 写库应当转交后台任务（先落内存、再异步写盘），失败只记日志即可——
+/// 「记不住」不该让用户当场被拦下。
+pub trait AlwaysRecorder: Send + Sync {
+    /// 记下一条免问范围（同键覆盖，幂等）。
+    fn remember(&self, record: AlwaysRecord);
+}
+
+/// 某次调用对应的免问范围键：与 `allow_always` 的去重粒度逐字一致。
+///
+/// 命令按「程序」、路径按「工具 + 所在目录」、其余按「工具」——与
+/// [`scope_of`] 共享同一个函数，杜绝「内存用一个键、落盘用另一个键」。
+pub fn scope_key(call: &ToolCall<'_>) -> String {
+    scope_of(call)
+}
+
 // ---------------------------------------------------------------- 闸门
 
 /// 权限闸门：默认策略 + 可注入裁决者 + `allow_always` 的进程内记忆。
@@ -253,6 +295,7 @@ pub struct PermissionGate {
     decider: Option<Box<dyn Decider>>,
     timeout: Duration,
     always: Mutex<HashSet<String>>,
+    recorder: Option<Box<dyn AlwaysRecorder>>,
 }
 
 impl PermissionGate {
@@ -262,6 +305,7 @@ impl PermissionGate {
             decider: None,
             timeout: DEFAULT_APPROVAL_TIMEOUT,
             always: Mutex::new(HashSet::new()),
+            recorder: None,
         }
     }
 
@@ -271,6 +315,36 @@ impl PermissionGate {
             decider: Some(Box::new(decider)),
             ..Self::new()
         }
+    }
+
+    /// 注入免问落盘器：`allow_always` 命中时同步记一笔，重启后仍免问。
+    #[must_use]
+    pub fn with_recorder(mut self, recorder: impl AlwaysRecorder + 'static) -> Self {
+        self.recorder = Some(Box::new(recorder));
+        self
+    }
+
+    /// 灌入历史免问范围（进程启动时从库里读回），返回灌入条数。
+    ///
+    /// 只接受**范围键**，不重新推导：库里存的就是哪个键，重启后就是哪个键。
+    pub fn seed_always(&self, keys: impl IntoIterator<Item = String>) -> usize {
+        let mut guard = self.always.lock().unwrap_or_else(|err| err.into_inner());
+        let before = guard.len();
+        guard.extend(keys);
+        guard.len() - before
+    }
+
+    /// 当前内存里的免问范围键（测试与诊断用，按字典序稳定输出）。
+    pub fn always_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .always
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .iter()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
     }
 
     /// 改等待审批的时长（超时判拒）。
@@ -309,12 +383,17 @@ impl PermissionGate {
         match self.ruling(ctx, call) {
             Ruling::Allow => Ok(Grant::Policy),
             Ruling::Deny(err) => Err(err),
-            Ruling::Ask(reason) => self.ask(call, reason).await,
+            Ruling::Ask(reason) => self.ask(ctx, call, reason).await,
         }
     }
 
     /// 向裁决者要一次答复，并把四种动作落到结果上。
-    async fn ask(&self, call: &ToolCall<'_>, reason: String) -> Result<Grant, AgentError> {
+    async fn ask(
+        &self,
+        ctx: &ToolContext<'_>,
+        call: &ToolCall<'_>,
+        reason: String,
+    ) -> Result<Grant, AgentError> {
         let tool = call.tool_name();
         let scope = scope_of(call);
 
@@ -366,7 +445,15 @@ impl PermissionGate {
                     self.always
                         .lock()
                         .unwrap_or_else(|err| err.into_inner())
-                        .insert(scope);
+                        .insert(scope.clone());
+                    // 落盘失败由实现方吞掉：记住不了只是「下次再问」，不该让这次调用失败。
+                    if let Some(recorder) = self.recorder.as_ref() {
+                        recorder.remember(AlwaysRecord {
+                            key: scope,
+                            tool: tool.to_string(),
+                            scope: ctx.root.to_string_lossy().replace('\\', "/"),
+                        });
+                    }
                     Ok(Grant::Approved(reply))
                 }
                 ApprovalDecision::Deny => Err(refused(tool, "审批被拒绝（deny）".to_string())),
@@ -716,6 +803,91 @@ mod tests {
         // 第二次照样问：allow_once 不落记录。
         assert!(gate.authorize(&ctx, &call).await.is_ok());
         assert_eq!(stub.calls(), 2, "allow_once 不该被复用");
+    }
+
+    /// 会记账的假落盘器：验证「同一把钥匙」与作用域，不碰真库。
+    #[derive(Clone, Default)]
+    struct StubRecorder {
+        saved: Arc<Mutex<Vec<AlwaysRecord>>>,
+    }
+
+    impl StubRecorder {
+        fn records(&self) -> Vec<AlwaysRecord> {
+            self.saved
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .clone()
+        }
+    }
+
+    impl AlwaysRecorder for StubRecorder {
+        fn remember(&self, record: AlwaysRecord) {
+            self.saved
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .push(record);
+        }
+    }
+
+    #[tokio::test]
+    async fn allow_always_is_persisted_with_the_same_key_as_memory() {
+        let sandbox = Sandbox::new("perm-persist");
+        let ctx = sandbox.ctx();
+        let stub = StubDecider::answering(ApprovalReply::new(ApprovalDecision::AllowAlways));
+        let recorder = StubRecorder::default();
+        let gate = PermissionGate::with_decider(stub).with_recorder(recorder.clone());
+
+        let call = ToolCall::new("run_command").command("cargo", &argv(&["test"]));
+        gate.authorize(&ctx, &call).await.expect("放行");
+
+        let records = recorder.records();
+        assert_eq!(records.len(), 1, "allow_always 必须落一笔");
+        assert_eq!(records[0].tool, "run_command");
+        assert_eq!(
+            records[0].key,
+            gate.always_keys()[0],
+            "落盘的键必须与内存里的免问键逐字一致"
+        );
+        assert_eq!(records[0].key, "command:cargo", "命令按程序记范围");
+        assert!(!records[0].scope.is_empty(), "作用域要记工作区");
+    }
+
+    #[tokio::test]
+    async fn allow_once_never_reaches_the_recorder() {
+        let sandbox = Sandbox::new("perm-once");
+        let ctx = sandbox.ctx();
+        let stub = StubDecider::answering(ApprovalReply::new(ApprovalDecision::AllowOnce));
+        let recorder = StubRecorder::default();
+        let gate = PermissionGate::with_decider(stub).with_recorder(recorder.clone());
+
+        let call = ToolCall::new("run_command").command("cargo", &argv(&["test"]));
+        gate.authorize(&ctx, &call).await.expect("放行一次");
+        assert!(recorder.records().is_empty(), "allow_once 不该落盘");
+        assert!(gate.always_keys().is_empty(), "allow_once 不该进免问集合");
+    }
+
+    #[tokio::test]
+    async fn seeded_rules_skip_the_question_after_restart() {
+        let sandbox = Sandbox::new("perm-seed");
+        let ctx = sandbox.ctx();
+        let stub = StubDecider::answering(ApprovalReply::new(ApprovalDecision::Deny));
+        let gate = PermissionGate::with_decider(stub.clone());
+
+        let call = ToolCall::new("run_command").command("cargo", &argv(&["test"]));
+        // 重启后：库里读回这把钥匙，灌进新闸门。
+        assert_eq!(gate.seed_always(vec!["command:cargo".to_string()]), 1);
+        gate.authorize(&ctx, &call)
+            .await
+            .expect("灌入的免问范围应生效");
+        assert_eq!(stub.calls(), 0, "命中历史免问范围就不该再问");
+        assert_eq!(gate.always_keys(), vec!["command:cargo".to_string()]);
+
+        // 再灌一遍是幂等的，不重复计数。
+        assert_eq!(gate.seed_always(vec!["command:cargo".to_string()]), 0);
+        // 别的程序仍要问。
+        let other = ToolCall::new("run_command").command("git", &argv(&["status"]));
+        assert!(gate.authorize(&ctx, &other).await.is_err());
+        assert_eq!(stub.calls(), 1);
     }
 
     #[tokio::test]

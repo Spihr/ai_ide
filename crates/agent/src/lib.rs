@@ -70,6 +70,6 @@ pub use permission::{
 };
 pub use registry::{Tool, ToolContext, ToolOutcome, ToolRegistry};
 pub use runner::{
-    AgentLoop, ModelTurn, RunLimits, RunOutcome, StopReason, TurnReply, TurnRequest,
+    AgentLoop, ModelTurn, RunLimits, RunOutcome, StopReason, TurnReply, TurnRequest, WriteHook,
     DEFAULT_MAX_ROUNDS, DEFAULT_MAX_STEPS,
 };
