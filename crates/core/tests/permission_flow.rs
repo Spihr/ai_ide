@@ -13,7 +13,7 @@
 mod common;
 
 use ai_ide_store::{NewPermissionRule, Store};
-use common::{Core, TempDataDir};
+use common::{unique_temp_dir, Core, TempDataDir};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
@@ -24,18 +24,9 @@ struct TempDir {
 
 impl TempDir {
     fn new(tag: &str) -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "ai-ide-m5-perm-{}-{}-{}",
-            tag,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("建临时目录");
-        Self { root }
+        Self {
+            root: unique_temp_dir("ai-ide-m5-perm", tag),
+        }
     }
 
     fn path(&self) -> &Path {
@@ -113,6 +104,10 @@ fn lists_rules_written_from_another_connection() {
     let scope = workspace.scope();
     let mut core = Core::spawn(&data.root);
 
+    // 同 `revoke_by_id_and_by_tool`：先握手等内核迁移落库，再让测试进程写种子规则，
+    // 避免两个进程对同一个 `sessions.db` 并发跑迁移。
+    core.capabilities();
+
     // 模拟「上一次会话里点过总是允许」：外部连接写进同一个库。
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -167,6 +162,12 @@ fn revoke_by_id_and_by_tool() {
     let workspace = TempDir::new("ws");
     let scope = workspace.scope();
     let mut core = Core::spawn(&data.root);
+
+    // 先握手，等内核把启动流程走完（`Store::connect` 的迁移至此落库），再让测试进程
+    // 写种子规则。否则两个进程会同时对着同一个 `sessions.db` 跑 `MIGRATOR.run`，
+    // CI runner 冷启动慢时偶发抢锁超时，内核侧迁不上去就退化成「会话库未就绪 5002」
+    // （docs/11 §5、docs/12 §4.5 记录的正是这个偶发）。
+    core.capabilities();
 
     tokio::runtime::Builder::new_current_thread()
         .enable_all()

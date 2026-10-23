@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::{Core, TempDataDir};
+use common::{unique_temp_dir, Core, TempDataDir};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -17,18 +17,9 @@ struct TempDir {
 
 impl TempDir {
     fn new(tag: &str) -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "ai-ide-m5-audit-{}-{}-{}",
-            tag,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("建临时目录");
-        Self { root }
+        Self {
+            root: unique_temp_dir("ai-ide-m5-audit", tag),
+        }
     }
 
     fn path(&self) -> &Path {

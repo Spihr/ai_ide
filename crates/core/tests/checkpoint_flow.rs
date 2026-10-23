@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::{Core, TempDataDir};
+use common::{unique_temp_dir, Core, TempDataDir};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
@@ -17,16 +17,7 @@ struct TempWorkspace {
 
 impl TempWorkspace {
     fn new(tag: &str) -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "ai-ide-m5-ckpt-{}-{}-{}",
-            tag,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = unique_temp_dir("ai-ide-m5-ckpt", tag);
         std::fs::create_dir_all(root.join("src")).expect("建工作区");
         // 覆盖规则文件也顺手铺一个：快照要按忽略规则跳过它，才谈得上「快照里没有噪音」。
         std::fs::write(root.join(".gitignore"), "target/\nnode_modules/\n").expect("写忽略规则");

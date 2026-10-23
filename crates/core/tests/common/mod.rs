@@ -296,6 +296,27 @@ impl Drop for Core {
 // 临时数据目录
 // ---------------------------------------------------------------------------
 
+/// 进程内唯一的临时目录序号。
+///
+/// 不能用「`pid` + 纳秒时间戳」区分：同一个测试二进制里的用例是并发跑的，而
+/// `SystemTime::now()` 在 Windows 上的实际粒度可达毫秒级，同一刻度内取到的值完全相同。
+/// 两个用例共用同名目录后，先结束的那个 `Drop` 会把另一个正在用的目录整个删掉，
+/// 表现就是随机的「落盘目录不可写 / 迁移失败」（见 docs/11 §5、docs/12 §4.5）。
+/// 原子序号保证同一进程内绝不重号。
+static TEMP_DIR_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+/// 生成一个进程内唯一、且已清空的临时目录。
+///
+/// `prefix` 区分用途（`ai-ide-m5-perm` 等），`tag` 区分用例。
+/// 返回前会先清掉同名残留，避免上一次进程崩溃留下的脏数据混进来。
+pub fn unique_temp_dir(prefix: &str, tag: &str) -> PathBuf {
+    let seq = TEMP_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("{prefix}-{tag}-{}-{seq}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("建临时目录");
+    root
+}
+
 /// 一个用完即删的临时数据目录。
 pub struct TempDataDir {
     pub root: PathBuf,
@@ -303,18 +324,9 @@ pub struct TempDataDir {
 
 impl TempDataDir {
     pub fn new(tag: &str) -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "ai-ide-m2-{}-{}-{}",
-            tag,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("建数据目录");
-        Self { root }
+        Self {
+            root: unique_temp_dir("ai-ide-m2", tag),
+        }
     }
 
     pub fn store_file(&self) -> PathBuf {
