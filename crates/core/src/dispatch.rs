@@ -72,7 +72,7 @@ async fn handle_request(peer: &Peer, state: &AppState, req: Request) {
         methods::core::HELLO => core_hello(peer, &req).await,
         methods::core::PING => core_ping(peer, &req).await,
         methods::core::STATS => core_stats(peer, &req).await,
-        methods::core::SHUTDOWN => core_shutdown(peer, &req).await,
+        methods::core::SHUTDOWN => core_shutdown(peer, state, &req).await,
 
         // 工作区与文件系统（M1）
         methods::workspace::OPEN => ws::open(peer, state, &req).await,
@@ -281,7 +281,7 @@ async fn core_stats(peer: &Peer, req: &Request) {
 // core.shutdown
 // ---------------------------------------------------------------------------
 
-async fn core_shutdown(peer: &Peer, req: &Request) {
+async fn core_shutdown(peer: &Peer, state: &AppState, req: &Request) {
     let params: ShutdownParams = match parse_params(req.params.as_ref()) {
         Ok(params) => params,
         Err(err) => return peer.respond_error(&req.id, &err).await,
@@ -293,6 +293,12 @@ async fn core_shutdown(peer: &Peer, req: &Request) {
 
     // 让出一次调度，确保写入任务彻底完成后再退出。
     tokio::task::yield_now().await;
+
+    // 子进程必须由内核自己收：`std::process::exit` 不跑析构，Job Object 只在
+    // 「进程被强杀」时兜底，正常退出路径漏了这一步，插件就成了孤儿进程。
+    crate::terminal_api::shutdown_all(state);
+    crate::shutdown_plugins(state).await;
+
     std::process::exit(0);
 }
 

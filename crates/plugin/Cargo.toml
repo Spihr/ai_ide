@@ -1,6 +1,6 @@
 [package]
 name = "ai-ide-plugin"
-description = "插件系统 P1：清单三段校验、安装目录与包复制（不启动插件进程）"
+description = "插件系统：清单三段校验、安装目录与包复制（P1）+ 子进程装载与握手（P2）"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,3 +12,9 @@ ai-ide-protocol = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# P2：拉起插件子进程、读写管道、超时都走 tokio。
+tokio = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# P2：Job Object（KILL_ON_JOB_CLOSE）保证内核被强杀后插件不残留。
+windows-sys = { workspace = true }

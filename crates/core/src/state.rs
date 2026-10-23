@@ -10,6 +10,7 @@ use crate::mcp_manager::McpManager;
 use crate::peer::Peer;
 use ai_ide_git::GitService;
 use ai_ide_indexer::FileIndex;
+use ai_ide_plugin::host::Host;
 use ai_ide_store::Store;
 use ai_ide_terminal::TerminalManager;
 use ai_ide_workspace::{Workspace, WorkspaceError, WorkspaceManager};
@@ -60,6 +61,13 @@ pub struct AppState {
     /// 用 `OnceLock` 而非字段直挂，是为了让「内核没装载 MCP」（单测、精简构建）
     /// 成为一个**显式状态**：`mcp.*` 会如实回空表 / 8001，而不是 panic 或假装成功。
     mcp: OnceLock<Arc<McpManager>>,
+    /// 插件宿主（P2）：已装载的插件及其子进程。
+    ///
+    /// 与 `mcp` 不同，这里是**直接字段**而不是 `OnceLock`：宿主本身只是一个
+    /// `Mutex<HashMap>`，没有任何后台资源；真正需要「只装一次」的是里面的子进程，
+    /// 而它们的存在本身就是「装过一次」的证明。直接挂字段还换来一件事：
+    /// 单测里不需要先 `install_*` 就能直接装载/卸载，少一层初始化就少一种假失败。
+    plugins: Host,
 }
 
 impl Default for AppState {
@@ -85,6 +93,7 @@ impl AppState {
             git: Arc::new(GitService::new()),
             store: OnceLock::new(),
             mcp: OnceLock::new(),
+            plugins: Host::new(),
         }
     }
 
@@ -139,6 +148,11 @@ impl AppState {
     /// MCP 连接管理器；未装载时为 `None`，此时 `mcp.*` 如实回空表或 8001。
     pub fn mcp(&self) -> Option<&Arc<McpManager>> {
         self.mcp.get()
+    }
+
+    /// 插件宿主：`plugin.load` / `unload` / `reload` 与崩溃巡检都从这里进。
+    pub fn plugins(&self) -> &Host {
+        &self.plugins
     }
 
     /// 换上一个现成的模型接入运行时。

@@ -202,9 +202,27 @@ pub async fn run() -> Result<()> {
     // 内核一退它就成了任务管理器里谁也管不了的孤儿进程。
     terminal_api::shutdown_all(&state);
 
+    // 插件子进程同理。Windows 的 Job Object（`KILL_ON_JOB_CLOSE`）只在「内核被强杀」
+    // 时兜底，正常退出路径必须自己走一遍 `plugin/shutdown`，让插件有机会落盘收尾。
+    shutdown_plugins(&state).await;
+
     drain_inflight(&mut inflight).await;
 
     Ok(())
+}
+
+/// 停掉所有已装载的插件子进程。
+///
+/// 抽成函数是因为有两条退出路径：stdin 关闭（[`run`] 末尾）与 `core.shutdown`
+/// （[`dispatch`] 里直接 `exit`）。漏掉任何一条，插件都会变成孤儿进程留在任务管理器里
+/// ——Windows 上它还会继续占着安装目录，导致下一次卸载删不掉文件。
+pub async fn shutdown_plugins(state: &AppState) {
+    let running = state.plugins().running_ids();
+    if running.is_empty() {
+        return;
+    }
+    info!(plugins = running.len(), "退出：停用已装载插件");
+    state.plugins().shutdown_all().await;
 }
 
 /// 等在途请求把响应写完再退出。

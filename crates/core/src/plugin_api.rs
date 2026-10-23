@@ -1,18 +1,34 @@
-//! `plugin.*` 的协议处理器（插件系统 P1：清单与安装）。
+//! `plugin.*` 的协议处理器（插件系统 P1：清单与安装 / P2：装载与握手）。
 //!
 //! P0 时这 10 个方法一律回 `6101`，作用是「协议面可路由、业务面未实现」。
-//! P1 把其中 4 个换成真实现：
+//! P1 把 4 个换成真实现，P2 再补 3 个：
 //!
-//! | 方法 | P1 行为 |
+//! | 方法 | 行为 |
 //! |---|---|
 //! | `plugin.install` | 校验清单 → 复制到 `<data>/plugins/<id>` → 写账本；**不 spawn 任何进程** |
-//! | `plugin.list` | 读账本，按 id 升序 |
-//! | `plugin.status` | 读账本 + 回读安装目录里的清单，给出工具/命令明细 |
-//! | `plugin.uninstall` | 删账本 + 删目录 |
+//! | `plugin.list` | 读账本，按 id 升序（先做一次崩溃巡检） |
+//! | `plugin.status` | 读账本 + 回读安装目录里的清单，给出工具/命令明细（先做一次崩溃巡检） |
+//! | `plugin.uninstall` | 停进程 → 删账本 → 删目录 |
+//! | `plugin.load` | 授权齐备 → 起子进程 → 握手 → 校验工具集合 → 落 `ready`；失败按类落账本 |
+//! | `plugin.unload` | 停进程 → 工具下架 → 落 `installed` |
+//! | `plugin.reload` | 停 + 起，账本 `restarts` 不变（那计数只记崩溃重启） |
 //!
-//! `load` / `unload` / `reload` / `call` / `grant` / `revoke` 仍是 6101：它们要么需要
-//! 子进程，要么需要授权面板，属于 P2/P3。**保持它们原样**是刻意的——P1 的验收里有一条
-//! 「安装全程不产生进程」，只有把「起进程」的入口继续留在空分支上，这条断言才有意义。
+//! `call` / `grant` / `revoke` 仍是 6101：它们属于 P3/P4（网关与授权面板）。
+//! 「安装全程不产生进程」这条 P1 验收仍成立——只有 `load` / `reload` 会 `spawn`。
+//!
+//! ## 账本状态机
+//!
+//! ```text
+//! install ──► installed ──load──► ready ──unload──► installed
+//!                │                 │
+//!       缺授权   │                 │ 意外退出
+//!                ▼                 ▼
+//!           needs_grant         crashed ──load──► ready（restarts +1）
+//! ```
+//!
+//! 崩溃巡检（[`sweep_crashed`]）把宿主判死的插件落成 `crashed` + `last_error`：
+//! 工具在宿主侧已经下架（`take_crashed` 会把它从装载表摘掉），账本只负责把这件事
+//! 记下来，面板才有东西可展示。
 //!
 //! ## 错误码约定
 //!
@@ -26,15 +42,17 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use ai_ide_plugin::host::{LoadError, LoadSpec};
 use ai_ide_plugin::{details_json, install as install_package, manifest, PackageError};
 use ai_ide_protocol::dto::{
     PluginCallParams, PluginCommandSummary, PluginGrantParams, PluginInstallParams,
-    PluginInstallResult, PluginListParams, PluginListResult, PluginLoadParams, PluginReloadParams,
-    PluginRevokeParams, PluginState, PluginStatusParams, PluginStatusResult, PluginSummary,
-    PluginToolSummary, PluginUninstallParams, PluginUninstallResult, PluginUnloadParams,
+    PluginInstallResult, PluginListParams, PluginListResult, PluginLoadParams, PluginLoadResult,
+    PluginReloadParams, PluginReloadResult, PluginRevokeParams, PluginState, PluginStatusParams,
+    PluginStatusResult, PluginSummary, PluginToolRisk, PluginToolSummary, PluginUninstallParams,
+    PluginUninstallResult, PluginUnloadParams, PluginUnloadResult,
 };
 use ai_ide_protocol::{methods, ErrorCode, ErrorObject, Request};
-use ai_ide_store::{plugin_status, NewPlugin, PluginRecord, StoreError};
+use ai_ide_store::{plugin_status, NewPlugin, PluginRecord, Store, StoreError};
 use serde::de::DeserializeOwned;
 
 use crate::dispatch::parse_params;
@@ -231,6 +249,8 @@ pub async fn list(peer: &Peer, state: &AppState, req: &Request) {
         Ok(store) => store,
         Err(err) => return peer.respond_error(&req.id, &err).await,
     };
+    // 列表面板不该展示「上一秒就已经崩了、但账本还写着 ready」的陈旧状态。
+    sweep_crashed(state, store).await;
     let records = match store.list_plugins().await {
         Ok(records) => records,
         Err(err) => return peer.respond_error(&req.id, &store_error(err)).await,
@@ -265,6 +285,8 @@ pub async fn status(peer: &Peer, state: &AppState, req: &Request) {
         Err(err) => return peer.respond_error(&req.id, &err).await,
     };
 
+    // 详情页要能如实显示 `crashed`：崩溃是子进程结束，账本不会自己知道。
+    sweep_crashed(state, store).await;
     let record = match store.get_plugin(&plugin_id).await {
         Ok(Some(record)) => record,
         Ok(None) => return peer.respond_error(&req.id, &not_found(&plugin_id)).await,
@@ -323,6 +345,16 @@ pub async fn uninstall(peer: &Peer, state: &AppState, req: &Request) {
         Err(err) => return peer.respond_error(&req.id, &store_error(err)).await,
     }
 
+    // 卸载前必须先停进程：目录被一个还在跑的插件占着时，Windows 会拒绝删文件，
+    // 结果就是「账本没了、进程还在、目录残留」——最难解释的一种半成品状态。
+    // `removed_tools` 只在真的从装载表摘掉东西时才非零（P2）。
+    let removed_tools = state
+        .plugins()
+        .unload(&plugin_id)
+        .await
+        .map(|tools| tools.len() as u32)
+        .unwrap_or(0);
+
     if let Err(err) = store.delete_plugin(&plugin_id).await {
         return peer.respond_error(&req.id, &store_error(err)).await;
     }
@@ -341,14 +373,12 @@ pub async fn uninstall(peer: &Peer, state: &AppState, req: &Request) {
         }
     };
 
-    tracing::info!(plugin_id = %plugin_id, removed_dir, "插件已卸载");
-    // P1 从不加载插件，agent 注册表里没有任何插件工具可下架，因此恒为 0；
-    // P2 起这里要换成「实际从注册表摘掉的条数」。
+    tracing::info!(plugin_id = %plugin_id, removed_dir, removed_tools, "插件已卸载");
     peer.respond(
         &req.id,
         &PluginUninstallResult {
             plugin_id,
-            removed_tools: 0,
+            removed_tools,
             removed_dir,
         },
     )
@@ -356,36 +386,371 @@ pub async fn uninstall(peer: &Peer, state: &AppState, req: &Request) {
 }
 
 /// `plugin.load`：授权齐备则起子进程并握手（P2）。
-pub async fn load(peer: &Peer, _state: &AppState, req: &Request) {
-    if require_params::<PluginLoadParams>(peer, req)
-        .await
-        .is_none()
-    {
+pub async fn load(peer: &Peer, state: &AppState, req: &Request) {
+    let Some(params) = require_params::<PluginLoadParams>(peer, req).await else {
         return;
+    };
+    let Some(plugin_id) = require_plugin_id(peer, req, &params.plugin_id).await else {
+        return;
+    };
+    let store = match store_of(state) {
+        Ok(store) => store,
+        Err(err) => return peer.respond_error(&req.id, &err).await,
+    };
+
+    // 装载前先巡检：同一 id 若上一轮已经崩了，账本要先落 `crashed`，
+    // 这次装载才谈得上「restarts + 1」。
+    sweep_crashed(state, store).await;
+
+    match load_into(state, store, &plugin_id).await {
+        Ok(result) => peer.respond(&req.id, &result).await,
+        Err(err) => peer.respond_error(&req.id, &err).await,
     }
-    not_wired(peer, req, methods::plugin::LOAD).await;
 }
 
 /// `plugin.unload`：停进程并把工具从 agent 注册表下架（P2）。
-pub async fn unload(peer: &Peer, _state: &AppState, req: &Request) {
-    if require_params::<PluginUnloadParams>(peer, req)
-        .await
-        .is_none()
-    {
+pub async fn unload(peer: &Peer, state: &AppState, req: &Request) {
+    let Some(params) = require_params::<PluginUnloadParams>(peer, req).await else {
         return;
+    };
+    let Some(plugin_id) = require_plugin_id(peer, req, &params.plugin_id).await else {
+        return;
+    };
+    let store = match store_of(state) {
+        Ok(store) => store,
+        Err(err) => return peer.respond_error(&req.id, &err).await,
+    };
+    sweep_crashed(state, store).await;
+
+    match store.get_plugin(&plugin_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return peer.respond_error(&req.id, &not_found(&plugin_id)).await,
+        Err(err) => return peer.respond_error(&req.id, &store_error(err)).await,
     }
-    not_wired(peer, req, methods::plugin::UNLOAD).await;
+
+    // `None` = 这个插件已经不在装载表里（没 load 过，或刚刚崩了被收走）。
+    // 两种情况都算「工具已下架」，回 0 条而不是报错——卸载一个没跑的插件是合法操作。
+    let removed_tools = state
+        .plugins()
+        .unload(&plugin_id)
+        .await
+        .map(|tools| tools.len() as u32)
+        .unwrap_or(0);
+
+    // 用户显式停用：`crashed` / `ready` 都退回 `installed`，顺手抹掉上次的错误，
+    // 否则面板会一直挂着一句「上次崩溃」的旧话术，看起来像刚发生的。
+    if let Err(err) = store
+        .set_plugin_status(&plugin_id, plugin_status::INSTALLED, None)
+        .await
+    {
+        return peer.respond_error(&req.id, &store_error(err)).await;
+    }
+
+    tracing::info!(plugin_id = %plugin_id, removed_tools, "插件已卸载");
+    peer.respond(
+        &req.id,
+        &PluginUnloadResult {
+            plugin_id,
+            removed_tools,
+        },
+    )
+    .await;
 }
 
 /// `plugin.reload`：停 + 起（P2）。
-pub async fn reload(peer: &Peer, _state: &AppState, req: &Request) {
-    if require_params::<PluginReloadParams>(peer, req)
-        .await
-        .is_none()
-    {
+pub async fn reload(peer: &Peer, state: &AppState, req: &Request) {
+    let Some(params) = require_params::<PluginReloadParams>(peer, req).await else {
         return;
+    };
+    let Some(plugin_id) = require_plugin_id(peer, req, &params.plugin_id).await else {
+        return;
+    };
+    let store = match store_of(state) {
+        Ok(store) => store,
+        Err(err) => return peer.respond_error(&req.id, &err).await,
+    };
+    sweep_crashed(state, store).await;
+
+    match store.get_plugin(&plugin_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return peer.respond_error(&req.id, &not_found(&plugin_id)).await,
+        Err(err) => return peer.respond_error(&req.id, &store_error(err)).await,
     }
-    not_wired(peer, req, methods::plugin::RELOAD).await;
+
+    // 先停再起。停不下来就直接报错：带着旧进程起新进程会得到两个抢同一份状态
+    // 的插件，工具注册也会出现重名，后面所有排查都会被这份脏状态带偏。
+    let _ = state.plugins().unload(&plugin_id).await;
+
+    match load_into(state, store, &plugin_id).await {
+        Ok(result) => {
+            peer.respond(
+                &req.id,
+                &PluginReloadResult {
+                    plugin: result.plugin,
+                    tools: result.tools,
+                },
+            )
+            .await
+        }
+        Err(err) => peer.respond_error(&req.id, &err).await,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 装载实现（P2）
+// ---------------------------------------------------------------------------
+
+/// 统一校验 `plugin_id`（空白值不能答「插件不存在」，那是 -32602）。
+async fn require_plugin_id(peer: &Peer, req: &Request, raw: &str) -> Option<String> {
+    let plugin_id = raw.trim();
+    if plugin_id.is_empty() {
+        peer.respond_error(&req.id, &ErrorObject::invalid_params("plugin_id 不能为空"))
+            .await;
+        return None;
+    }
+    Some(plugin_id.to_string())
+}
+
+/// 一次完整的装载：回读清单 → 查授权 → 起进程握手 → 落账本。
+///
+/// 失败时也写账本：面板要能解释「为什么它没起来」，只回一个错误码说明不了。
+async fn load_into(
+    state: &AppState,
+    store: &Store,
+    plugin_id: &str,
+) -> Result<PluginLoadResult, ErrorObject> {
+    let record = match store.get_plugin(plugin_id).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return Err(not_found(plugin_id)),
+        Err(err) => return Err(store_error(err)),
+    };
+
+    // 装目录是用户可写的地方：账本记着 `ready`，磁盘上的文件却可能已经被人删了。
+    // 先判存在，再回读清单——顺序反了会把「目录没了」报成「清单不合法」。
+    let install_dir = PathBuf::from(&record.install_dir);
+    if !install_dir.is_dir() {
+        let message = format!("插件安装目录已不存在：{}（请重新安装）", record.install_dir);
+        let _ = store
+            .set_plugin_status(plugin_id, plugin_status::CRASHED, Some(&message))
+            .await;
+        return Err(ErrorObject::new(ErrorCode::PLUGIN_NOT_FOUND, message)
+            .with_data(serde_json::json!({ "plugin_id": plugin_id })));
+    }
+    let validated = match ai_ide_plugin::install::inspect(&install_dir) {
+        Ok(validated) => validated,
+        Err(PackageError::Invalid(violations)) => {
+            let message = format!("插件清单不合法（{} 条问题）", violations.len());
+            let _ = store
+                .set_plugin_status(plugin_id, plugin_status::CRASHED, Some(&message))
+                .await;
+            return Err(
+                ErrorObject::new(ErrorCode::PLUGIN_MANIFEST_INVALID, message)
+                    .with_data(details_json(&violations)),
+            );
+        }
+        Err(PackageError::Io(message)) => {
+            return Err(ErrorObject::new(
+                ErrorCode::STORE_ERROR,
+                format!("读取插件安装目录失败：{message}"),
+            ));
+        }
+    };
+
+    let granted = match store.granted_capabilities(plugin_id).await {
+        Ok(granted) => granted,
+        Err(err) => return Err(store_error(err)),
+    };
+    let requested = validated.manifest.capabilities.clone();
+
+    let spec = LoadSpec {
+        plugin_id,
+        install_dir: &install_dir,
+        validated: &validated,
+        requested: requested.clone(),
+        granted: granted.clone(),
+        workspace: workspace_json(state),
+    };
+
+    match state.plugins().load(spec).await {
+        Ok(loaded) => {
+            // 工具明细以握手为准：清单只声明「有哪些工具」，描述/风险/schema 允许
+            // 插件在运行时收窄（校验已保证名字集合一致）。
+            let tools = tools_from_handshake(plugin_id, &validated.manifest, &loaded.tools);
+            // 前面记着 `crashed` 说明这是崩溃后重启，计数要跟上（面板据此提示不稳定）。
+            if record.status == plugin_status::CRASHED {
+                let _ = store.bump_plugin_restarts(plugin_id).await;
+            }
+            if let Err(err) = store
+                .set_plugin_status(plugin_id, plugin_status::READY, None)
+                .await
+            {
+                // 账本写不进去就把刚起来的进程停掉：留下一个「在跑但账本说没跑」
+                // 的插件，下一次 load 会造出第二个进程，工具也会重名。
+                let _ = state.plugins().unload(plugin_id).await;
+                return Err(store_error(err));
+            }
+
+            let mut fresh = record.clone();
+            fresh.status = plugin_status::READY.to_string();
+            fresh.last_error = None;
+            tracing::info!(
+                plugin_id = %plugin_id,
+                pid = ?loaded.pid,
+                reused = loaded.reused,
+                tools = tools.len(),
+                "插件已装载并握手成功"
+            );
+            Ok(PluginLoadResult {
+                plugin: summary_from_record(&fresh, &requested, &granted),
+                tools,
+            })
+        }
+        Err(error) => {
+            let mapped = load_error(plugin_id, &error);
+            let status = if matches!(error, LoadError::MissingCapabilities { .. }) {
+                plugin_status::NEEDS_GRANT
+            } else {
+                plugin_status::CRASHED
+            };
+            let _ = store
+                .set_plugin_status(plugin_id, status, Some(&error.to_string()))
+                .await;
+            Err(mapped)
+        }
+    }
+}
+
+/// 握手工具声明 → 协议视图（描述/风险/schema 缺省时回落清单里的同类字段）。
+fn tools_from_handshake(
+    plugin_id: &str,
+    declared: &manifest::Manifest,
+    tools: &[ai_ide_plugin::host::HandshakeTool],
+) -> Vec<PluginToolSummary> {
+    tools
+        .iter()
+        .map(|tool| {
+            let fallback = declared
+                .tools
+                .iter()
+                .find(|candidate| candidate.name == tool.name);
+            PluginToolSummary {
+                name: tool.name.clone(),
+                namespaced_name: ai_ide_plugin::namespaced_tool(plugin_id, &tool.name),
+                description: tool
+                    .description
+                    .clone()
+                    .or_else(|| fallback.and_then(|item| item.description.clone()))
+                    .unwrap_or_else(|| format!("{} 插件提供的工具 {}", declared.name, tool.name)),
+                risk: tool
+                    .risk
+                    .or_else(|| fallback.map(|item| item.risk))
+                    .unwrap_or(PluginToolRisk::Read),
+                input_schema: tool
+                    .parameters
+                    .clone()
+                    .or_else(|| fallback.map(|item| item.parameters.clone()))
+                    .unwrap_or_else(|| serde_json::json!({ "type": "object" })),
+            }
+        })
+        .collect()
+}
+
+/// 握手参数里的 `workspace`：没打开工作区就是 `null`，不编一个假路径。
+fn workspace_json(state: &AppState) -> serde_json::Value {
+    match state.workspace(None) {
+        Ok(workspace) => serde_json::json!({
+            "id": workspace.id,
+            "root": workspace.root.to_string_lossy().replace('\\', "/"),
+        }),
+        Err(_) => serde_json::Value::Null,
+    }
+}
+
+/// 装载失败 → 61xx。错误码按「外壳该给用户看哪种补救」划分，不按内部枚举名。
+fn load_error(plugin_id: &str, error: &LoadError) -> ErrorObject {
+    match error {
+        LoadError::NotInstalled(dir) => ErrorObject::new(
+            ErrorCode::PLUGIN_NOT_FOUND,
+            format!("插件安装目录不存在：{dir}"),
+        )
+        .with_data(serde_json::json!({ "plugin_id": plugin_id })),
+        LoadError::MissingCapabilities { missing } => ErrorObject::new(
+            ErrorCode::PLUGIN_CAPABILITY_DENIED,
+            format!("插件需要的能力尚未授权：{}", missing.join(", ")),
+        )
+        .with_data(serde_json::json!({
+            "plugin_id": plugin_id,
+            "missing": missing,
+        })),
+        LoadError::Spawn(spawn) => ErrorObject::new(
+            ErrorCode::PLUGIN_CRASHED,
+            format!("拉起插件进程失败：{spawn}"),
+        )
+        .with_data(serde_json::json!({ "plugin_id": plugin_id })),
+        LoadError::Timeout { stage, timeout } => ErrorObject::new(
+            ErrorCode::PLUGIN_TIMEOUT,
+            format!("{stage}超时（{} ms）", timeout.as_millis()),
+        )
+        .with_data(serde_json::json!({ "plugin_id": plugin_id })),
+        LoadError::Crashed { code, tail } => ErrorObject::new(
+            ErrorCode::PLUGIN_CRASHED,
+            match code {
+                Some(code) => format!("插件进程在握手期间退出（退出码 {code}）"),
+                None => "插件进程在握手期间退出".to_string(),
+            },
+        )
+        .with_data(serde_json::json!({
+            "plugin_id": plugin_id,
+            "exit_code": code,
+            "stderr_tail": tail,
+        })),
+        LoadError::Protocol { message } => ErrorObject::new(
+            ErrorCode::PLUGIN_PROTOCOL_VIOLATION,
+            format!("插件协议错误：{message}"),
+        )
+        .with_data(serde_json::json!({ "plugin_id": plugin_id })),
+        LoadError::ApiMismatch { plugin, host } => ErrorObject::new(
+            ErrorCode::PLUGIN_API_MISMATCH,
+            format!("pluginApi {plugin} 与宿主 {host} 不兼容"),
+        )
+        .with_data(serde_json::json!({
+            "plugin_id": plugin_id,
+            "plugin_api": plugin,
+            "host_api": host,
+        })),
+    }
+}
+
+/// 崩溃巡检：把宿主已判死的插件落成 `crashed` + `last_error`。
+///
+/// 工具下架由宿主内部完成（`take_crashed` 会把它们从装载表摘掉），这里只补账本。
+/// 账本写失败只记日志：插件确实没了这个事实比账本状态更重要，不能因为写库失败
+/// 就把巡检卡住——否则每轮巡检都会重复报同一个崩溃。
+pub async fn sweep_crashed(state: &AppState, store: &Store) {
+    for crashed in state.plugins().take_crashed() {
+        let message = match crashed.exit_code {
+            Some(code) => format!("插件进程意外退出（退出码 {code}）"),
+            None => "插件进程意外退出".to_string(),
+        };
+        tracing::warn!(
+            plugin_id = %crashed.plugin_id,
+            tools = crashed.namespaced_tools.len(),
+            exit_code = ?crashed.exit_code,
+            "插件已崩溃，工具已下架"
+        );
+        if let Err(err) = store
+            .set_plugin_status(&crashed.plugin_id, plugin_status::CRASHED, Some(&message))
+            .await
+        {
+            tracing::warn!(
+                plugin_id = %crashed.plugin_id,
+                %err,
+                "崩溃状态写入账本失败"
+            );
+        }
+        // 崩了就是崩了，别留着 `ready`：账本上不写 restarts（那计数只在重启时 +1），
+        // 但「崩过」这件事必须能被下一次 load 看见。
+    }
 }
 
 /// `plugin.call`：调用网关（P3）。
