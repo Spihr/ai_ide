@@ -11,6 +11,7 @@ import { CodeEditor } from './components/CodeEditor'
 import { EditorTabs } from './components/EditorTabs'
 import { FileTree } from './components/FileTree'
 import { GitPanel } from './components/GitPanel'
+import { McpPanel } from './components/McpPanel'
 import { PermissionPanel } from './components/PermissionPanel'
 import { SearchPanel } from './components/SearchPanel'
 import { StatusBar } from './components/StatusBar'
@@ -27,8 +28,20 @@ import {
   refreshTree,
   saveTab,
   setActivity,
-  useEditor
+  useEditor,
+  type ActivityView
 } from './store'
+
+/** 侧栏标题：与活动栏一一对应，用表而不是嵌套三元——再加一个视图不该动结构。 */
+const SIDEBAR_TITLES: Record<ActivityView, string> = {
+  explorer: '资源管理器',
+  search: '搜索',
+  ai: 'AI',
+  git: '源代码管理',
+  checkpoints: '检查点',
+  permissions: '权限',
+  mcp: 'MCP Server'
+}
 
 export function App() {
   const state = useEditor()
@@ -138,24 +151,14 @@ export function App() {
         <ActivityBar />
 
         <aside className="sidebar">
-          <div className="sidebar__header">
-            {state.activity === 'explorer'
-              ? '资源管理器'
-              : state.activity === 'search'
-                ? '搜索'
-                : state.activity === 'git'
-                  ? '源代码管理'
-                  : state.activity === 'checkpoints'
-                    ? '检查点'
-                    : state.activity === 'permissions'
-                      ? '权限'
-                      : 'AI'}
-          </div>
+          <div className="sidebar__header">{SIDEBAR_TITLES[state.activity]}</div>
           {state.workspaceError &&
             state.activity !== 'ai' &&
             state.activity !== 'git' &&
             state.activity !== 'checkpoints' &&
-            state.activity !== 'permissions' && (
+            state.activity !== 'permissions' &&
+            // MCP 的 Server 清单来自配置文件、不依赖工作区，没有工作区时照样能用。
+            state.activity !== 'mcp' && (
               <p className="panel__error">{state.workspaceError}</p>
             )}
           {state.activity === 'explorer' ? (
@@ -168,6 +171,8 @@ export function App() {
             <CheckpointPanel />
           ) : state.activity === 'permissions' ? (
             <PermissionPanel />
+          ) : state.activity === 'mcp' ? (
+            <McpPanel />
           ) : (
             <AiPanel />
           )}

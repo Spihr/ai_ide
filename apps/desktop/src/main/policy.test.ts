@@ -114,6 +114,32 @@ describe('checkRendererCall', () => {
     }
   })
 
+  it('放行 M7 的 MCP 方法', () => {
+    const methods = [
+      Methods.mcp.servers,
+      Methods.mcp.connect,
+      Methods.mcp.disconnect,
+      Methods.mcp.tools,
+      Methods.mcp.call
+    ]
+
+    for (const method of methods) {
+      expect(checkRendererCall(method).allowed, `${method} 应被放行`).toBe(true)
+    }
+  })
+
+  /*
+   * MCP 的「配置面」不进白名单：面板只能连 `mcp.json` 里已有的 Server，不能自己
+   * 塞一个进去。这条用例钉的就是「UI 拿不到改配置 / 绕过已连接清单」的能力。
+   */
+  it('不放行 MCP 的配置面方法（Server 清单只能来自 mcp.json）', () => {
+    const methods = ['mcp.register', 'mcp.config', 'mcp.upsert', 'mcp.install']
+
+    for (const method of methods) {
+      expect(checkRendererCall(method).allowed, `${method} 不应被放行`).toBe(false)
+    }
+  })
+
   /*
    * Git 的「危险动作」目前一个都没进协议：推、切分支、`reset --hard`、强制检出。
    * 这条用例是防回归的闸门——将来谁加了 `git.push` 之类的方法，会被这里挡下并提醒
@@ -178,6 +204,11 @@ describe('checkRendererCall', () => {
       'llm.chat_stream',
       'llm.count_tokens',
       'llm.list_models',
+      'mcp.call',
+      'mcp.connect',
+      'mcp.disconnect',
+      'mcp.servers',
+      'mcp.tools',
       'model.delete',
       'model.list',
       'model.upsert',

@@ -1330,3 +1330,80 @@ button {
 .git-diff__line--meta {
   color: #6b737f;
 }
+
+/*
+ * M7：MCP 面板。
+ *
+ * 与 Git / 检查点同一套底色，只补三处这个面板独有的东西：Server 头（名字 + 状态
+ * 标记）、工具行（整行可点，选中态与活动栏同色）、以及试跑区的等宽正文。
+ */
+.mcp-server__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mcp-server__name {
+  font-weight: 600;
+}
+
+/* 状态标记：未连接用灰，已连接用绿——和状态栏的 ready 同一语义色 */
+.mcp-server__state {
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: rgba(120, 130, 145, 0.2);
+  color: #9aa3b0;
+  font-size: 11px;
+}
+
+.mcp-server__state.is-ready {
+  background: rgba(60, 160, 90, 0.2);
+  color: #6fce8f;
+}
+
+.mcp-tool {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.mcp-tool.is-active {
+  background: rgba(90, 160, 255, 0.16);
+}
+
+.mcp-tool__name {
+  display: block;
+  font-weight: 600;
+}
+
+.mcp-schema {
+  margin: 6px 0;
+}
+
+.mcp-schema summary {
+  cursor: pointer;
+  color: #8fb6e8;
+  font-size: 12px;
+}
+
+.mcp-pre {
+  margin: 4px 0;
+  padding: 8px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.25);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow: auto;
+}
+
+.mcp-args {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}

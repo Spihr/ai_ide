@@ -20,7 +20,12 @@ const ITEMS: ActivityItem[] = [
    */
   { id: 'git', label: '源代码管理', glyph: '⑂' },
   { id: 'checkpoints', label: '检查点', glyph: '⟲' },
-  { id: 'permissions', label: '权限', glyph: '⚿' }
+  { id: 'permissions', label: '权限', glyph: '⚿' },
+  /*
+   * MCP 排在最后：它是「配置面」而不是日常视图——只在接新 Server、排障、
+   * 临时试跑工具时才会点开，放在权限之后不会挡住高频入口。
+   */
+  { id: 'mcp', label: 'MCP Server', glyph: '⑃' }
 ]
 
 export function ActivityBar() {

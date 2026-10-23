@@ -124,7 +124,23 @@ const RENDERER_ALLOWED = new Set<string>([
   Methods.git.diff,
   Methods.git.stage,
   Methods.git.commit,
-  Methods.git.branches
+  Methods.git.branches,
+
+  // M7：MCP。五条同样是「用户显式动作」的后果——打开 MCP 视图才 `servers` / `tools`、
+  // 点某个 Server 的「连接 / 断开」才 `connect` / `disconnect`、在面板里手写一条参数
+  // 并按「执行」才 `call`。
+  //
+  // 这里要交代清楚它的边界：放行的是**外壳能发起的动作**，不是「绕过权限闸门」的入口。
+  // `mcp.call` 与 `agent.start` 的关系是并列而非替代——它只调到「已连接 Server 已注册
+  // 的工具」，没有 `mcp.register` / `mcp.config` 之类能自己塞 Server 的方法，Server 清单
+  // 始终来自磁盘上的 `mcp.json`（用户自己写的文件）。工具调用的风险判定也不在这里：
+  // 同一批工具被注入 agent 注册表后走的是同一条权限闸门，经 UI 直接调用只是把
+  // 「这一次」显式落到用户手上，且面板强制行内二次确认（第一次点变「确认执行」）。
+  Methods.mcp.servers,
+  Methods.mcp.connect,
+  Methods.mcp.disconnect,
+  Methods.mcp.tools,
+  Methods.mcp.call
 ])
 
 export interface PolicyDecision {
