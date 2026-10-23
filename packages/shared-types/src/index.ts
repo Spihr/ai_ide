@@ -240,6 +240,33 @@ export type { McpCallParams } from "./generated/McpCallParams";
 export type { McpCallResult } from "./generated/McpCallResult";
 export type { McpContentBlock } from "./generated/McpContentBlock";
 
+// ---- plugin.* 方法（P0 协议骨架）----
+export type { PluginState } from "./generated/PluginState";
+export type { PluginToolRisk } from "./generated/PluginToolRisk";
+export type { PluginSummary } from "./generated/PluginSummary";
+export type { PluginToolSummary } from "./generated/PluginToolSummary";
+export type { PluginCommandSummary } from "./generated/PluginCommandSummary";
+export type { PluginListParams } from "./generated/PluginListParams";
+export type { PluginListResult } from "./generated/PluginListResult";
+export type { PluginStatusParams } from "./generated/PluginStatusParams";
+export type { PluginStatusResult } from "./generated/PluginStatusResult";
+export type { PluginInstallParams } from "./generated/PluginInstallParams";
+export type { PluginInstallResult } from "./generated/PluginInstallResult";
+export type { PluginUninstallParams } from "./generated/PluginUninstallParams";
+export type { PluginUninstallResult } from "./generated/PluginUninstallResult";
+export type { PluginLoadParams } from "./generated/PluginLoadParams";
+export type { PluginLoadResult } from "./generated/PluginLoadResult";
+export type { PluginUnloadParams } from "./generated/PluginUnloadParams";
+export type { PluginUnloadResult } from "./generated/PluginUnloadResult";
+export type { PluginReloadParams } from "./generated/PluginReloadParams";
+export type { PluginReloadResult } from "./generated/PluginReloadResult";
+export type { PluginCallParams } from "./generated/PluginCallParams";
+export type { PluginCallResult } from "./generated/PluginCallResult";
+export type { PluginGrantParams } from "./generated/PluginGrantParams";
+export type { PluginGrantResult } from "./generated/PluginGrantResult";
+export type { PluginRevokeParams } from "./generated/PluginRevokeParams";
+export type { PluginRevokeResult } from "./generated/PluginRevokeResult";
+
 // ---- 协议常量（与 Rust 侧保持一致的运行时镜像）----
 
 /** JSON-RPC 版本字面量。对应 Rust `ai_ide_protocol::JSONRPC_VERSION`。 */
@@ -346,6 +373,18 @@ export const Methods = {
     tools: "mcp.tools",
     call: "mcp.call",
   },
+  plugin: {
+    list: "plugin.list",
+    status: "plugin.status",
+    install: "plugin.install",
+    uninstall: "plugin.uninstall",
+    load: "plugin.load",
+    unload: "plugin.unload",
+    reload: "plugin.reload",
+    call: "plugin.call",
+    grant: "plugin.grant",
+    revoke: "plugin.revoke",
+  },
   event: {
     log: "core.log",
     workspaceChanged: "workspace.changed",
@@ -374,7 +413,9 @@ export const Methods = {
  * 含导出与分叉）、`checkpoint.*` 四项（快照 / 列表 / 回滚 / 删除）、
  * `permission.*` 两项（免问规则列表 / 撤销）与 `audit.list`（审计账本只读查询），
  * 再加 M6 切片一的 `terminal.*` 五项（PTY 会话的建 / 写 / 改尺寸 / 杀 / 列），
- * 共 61 项，与 Rust `methods::IMPLEMENTED` 逐项对齐。
+ * M7 的 `mcp.*` 五项（Server 清单 / 连接 / 断开 / 工具 / 调用），
+ * 以及插件系统 P0 的 `plugin.*` 十项（协议骨架：能路由，但统一回 6101），
+ * 共 71 项，与 Rust `methods::IMPLEMENTED` 逐项对齐。
  */
 export const IMPLEMENTED_METHODS = [
   Methods.core.hello,
@@ -438,6 +479,16 @@ export const IMPLEMENTED_METHODS = [
   Methods.mcp.disconnect,
   Methods.mcp.tools,
   Methods.mcp.call,
+  Methods.plugin.list,
+  Methods.plugin.status,
+  Methods.plugin.install,
+  Methods.plugin.uninstall,
+  Methods.plugin.load,
+  Methods.plugin.unload,
+  Methods.plugin.reload,
+  Methods.plugin.call,
+  Methods.plugin.grant,
+  Methods.plugin.revoke,
 ] as const;
 
 /**

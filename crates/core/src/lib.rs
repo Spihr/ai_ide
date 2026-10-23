@@ -39,6 +39,10 @@
 //! `workspace_id` 可选参数，缺省作用于活动工作区；同步的子进程调用统一搬进
 //! 阻塞线程池，不占 tokio worker。Git 不新增事件：索引变化已有 `workspace.changed`。
 //!
+//! **`plugin.*` 已定义、尚未实现（插件系统 P2 的 P0 切片）**：10 个方法的 dispatch
+//! 分支都在 [`plugin_api`]，但每个分支只返回 `6101`——协议面先冻结，业务实现留给
+//! P1 / P2。这样外壳可以先按 `6101` 把插件面板写成「未启用」，而不是靠 `-32601` 猜。
+//!
 //! 后续里程碑在此骨架上继续挂载：mcp 等模块。
 //!
 //! ## 绝对约定：stdout 只跑协议
@@ -65,6 +69,8 @@ pub mod mcp_manager;
 pub mod mcp_tools;
 pub mod peer;
 pub mod permission_api;
+/// 插件协议处理器（P0 协议骨架）：10 个 `plugin.*` 方法的空分支。
+pub mod plugin_api;
 pub mod provider_api;
 pub mod session_api;
 pub mod session_export;

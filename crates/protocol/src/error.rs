@@ -10,7 +10,8 @@
 //! | `3xxx` | 工具与 Agent 执行 |
 //! | `4xxx` | 运行时（取消等） |
 //! | `5xxx` | 会话持久化 |
-//! | `6xxx` | 终端会话 |
+//! | `6001`–`6099` | 终端会话 |
+//! | `6101`–`6199` | 插件宿主 |
 //! | `7xxx` | Git 操作 |
 //! | `8xxx` | MCP 连接与工具 |
 
@@ -82,6 +83,38 @@ impl ErrorCode {
     pub const TERMINAL_IO_ERROR: Self = Self(6003);
     /// 参数不可用：`data` 不是合法 base64、尺寸无法夹取等。
     pub const TERMINAL_INVALID: Self = Self(6004);
+
+    // ---------- 61xx 插件宿主 ----------
+    //
+    // 这一段**不是** 6xxx 的开头：终端已占住 6001–6004，`crates/protocol` 的测试
+    // 有一条撞号断言盯着它。docs/14 §6.6 原先按「6xxx 整段空缺」写成 6001–6009，
+    // 那个前提在 M6 接终端时就失效了，因此插件改占 6101–6109。
+    //
+    // 码值与 `PLUGIN_` 前缀同步：`CAPABILITY_DENIED` / `TOOL_CONFLICT` 这类通用名
+    // 在内核里已有近似含义（3001 `TOOL_NOT_ALLOWED`、1003 `PATH_DENIED`），
+    // 加前缀是为了让「这是插件闸门拒的」在日志里一眼可辨。
+
+    /// 插件未安装 / 未加载，或宿主尚未接线（P0 的空分支就回这一条）。
+    pub const PLUGIN_NOT_FOUND: Self = Self(6101);
+    /// 进程不在或刚崩溃：工具已下架，等重启。
+    ///
+    /// 与 [`Self::PLUGIN_NOT_FOUND`] 必须分开：前者让模型「别编工具名了」，
+    /// 后者让它「等它重启」。合成一个码会让模型反复重试同一个不存在的工具。
+    pub const PLUGIN_CRASHED: Self = Self(6102);
+    /// 能力未授予：清单申请了，但用户没批。
+    pub const PLUGIN_CAPABILITY_DENIED: Self = Self(6103);
+    /// `pluginApi` 主版本不兼容。
+    pub const PLUGIN_API_MISMATCH: Self = Self(6104);
+    /// 调用超时（默认 30 s，`timeoutMs` 可放宽到 120 s）；超时即杀进程。
+    pub const PLUGIN_TIMEOUT: Self = Self(6105);
+    /// 帧非法 / 方法越权 / 握手工具集合不一致。
+    pub const PLUGIN_PROTOCOL_VIOLATION: Self = Self(6106);
+    /// 清单非法，`data.details[]` 一次报全所有错误。
+    pub const PLUGIN_MANIFEST_INVALID: Self = Self(6107);
+    /// 工具名与已有工具冲突（含与核心工具冲突）。
+    pub const PLUGIN_TOOL_CONFLICT: Self = Self(6108);
+    /// 单次调用宿主 API 超过配额（默认 200 次）。
+    pub const PLUGIN_QUOTA_EXCEEDED: Self = Self(6109);
 
     // ---------- 7xxx Git ----------
     /// 机器上没有可用的 `git`：未安装、或 `AI_IDE_GIT` 指向的文件不可执行。
@@ -266,5 +299,45 @@ mod tests {
         }
         assert_eq!(ErrorCode::MCP_SERVER_UNKNOWN.as_i32(), 8001);
         assert_eq!(ErrorCode::MCP_INVALID_PARAMS.as_i32(), 8007);
+    }
+
+    /// 插件错误码占 61xx：终端已占 6001-6004（上面那条撞号断言盯着），
+    /// 所以 docs/14 §6.6 原写的 6001-6009 必须整体挪到 6101-6109。
+    ///
+    /// 这条测试同时钉住三件事：段位、唯一性、与终端段不重叠。
+    #[test]
+    fn plugin_error_codes_use_their_own_61xx_band() {
+        let codes = [
+            ErrorCode::PLUGIN_NOT_FOUND,
+            ErrorCode::PLUGIN_CRASHED,
+            ErrorCode::PLUGIN_CAPABILITY_DENIED,
+            ErrorCode::PLUGIN_API_MISMATCH,
+            ErrorCode::PLUGIN_TIMEOUT,
+            ErrorCode::PLUGIN_PROTOCOL_VIOLATION,
+            ErrorCode::PLUGIN_MANIFEST_INVALID,
+            ErrorCode::PLUGIN_TOOL_CONFLICT,
+            ErrorCode::PLUGIN_QUOTA_EXCEEDED,
+        ];
+        for (index, code) in codes.iter().enumerate() {
+            let raw = code.as_i32();
+            assert!((6101..=6199).contains(&raw), "{raw} 不在 61xx 段");
+            assert!(!code.is_standard(), "{raw} 不该被当成标准码");
+            assert!(
+                !(6001..=6099).contains(&raw),
+                "{raw} 落进了终端占用的 6001-6099 段"
+            );
+            assert!(
+                !codes[..index].contains(code),
+                "{raw} 重复定义，同段内码值必须唯一"
+            );
+        }
+        assert_eq!(ErrorCode::PLUGIN_NOT_FOUND.as_i32(), 6101);
+        assert_eq!(ErrorCode::PLUGIN_QUOTA_EXCEEDED.as_i32(), 6109);
+        // 相邻两段不能重叠：终端段最高位 6004 仍在插件段起点 6101 之下。
+        assert_eq!(ErrorCode::TERMINAL_NOT_FOUND.as_i32(), 6001);
+        assert_ne!(
+            ErrorCode::PLUGIN_NOT_FOUND.as_i32(),
+            ErrorCode::TERMINAL_NOT_FOUND.as_i32()
+        );
     }
 }

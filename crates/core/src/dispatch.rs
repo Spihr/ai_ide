@@ -13,6 +13,7 @@ use crate::llm_api;
 use crate::mcp_api;
 use crate::peer::Peer;
 use crate::permission_api;
+use crate::plugin_api;
 use crate::provider_api;
 use crate::session_api;
 use crate::state::{now_ms, AppState};
@@ -152,6 +153,20 @@ async fn handle_request(peer: &Peer, state: &AppState, req: Request) {
         methods::mcp::DISCONNECT => mcp_api::disconnect(peer, state, &req).await,
         methods::mcp::TOOLS => mcp_api::tools(peer, state, &req).await,
         methods::mcp::CALL => mcp_api::call(peer, state, &req).await,
+
+        // 插件（P0 协议骨架）：10 个方法都真实路由到这里，但宿主尚未接线，
+        // 统一回 6101（插件未装载 / 未加载），而不是落到下面的 -32601 兜底。
+        // 差别在于外壳能不能区分「本版本没有插件系统」和「方法名敲错了」。
+        methods::plugin::LIST => plugin_api::list(peer, state, &req).await,
+        methods::plugin::STATUS => plugin_api::status(peer, state, &req).await,
+        methods::plugin::INSTALL => plugin_api::install(peer, state, &req).await,
+        methods::plugin::UNINSTALL => plugin_api::uninstall(peer, state, &req).await,
+        methods::plugin::LOAD => plugin_api::load(peer, state, &req).await,
+        methods::plugin::UNLOAD => plugin_api::unload(peer, state, &req).await,
+        methods::plugin::RELOAD => plugin_api::reload(peer, state, &req).await,
+        methods::plugin::CALL => plugin_api::call(peer, state, &req).await,
+        methods::plugin::GRANT => plugin_api::grant(peer, state, &req).await,
+        methods::plugin::REVOKE => plugin_api::revoke(peer, state, &req).await,
 
         other => {
             warn!(method = %other, "未实现的方法");

@@ -180,6 +180,39 @@ pub mod mcp {
     pub const CALL: &str = "mcp.call";
 }
 
+/// 插件宿主（P0 协议骨架）。
+///
+/// 只有这 10 个方法属于**内核协议**：它们进 [`IMPLEMENTED`]、进 `core.hello`
+/// 的能力清单、进外壳 `policy.ts` 白名单、由 ts-rs 导出类型。目录里的
+/// `plugin/*`（宿主 → 插件）与 `host/*`（插件 → 宿主）是插件包内部协议，
+/// **不进**这张表——混进来会让能力清单不再是「静态可审计」的（见 docs/14 §6.1）。
+///
+/// P0 阶段宿主尚未接线：`crates/core/src/dispatch.rs` 有 10 个分支，但每个分支都
+/// 如实返回 [`ai_ide_protocol::ErrorCode::PLUGIN_NOT_FOUND`]（6101）。先定义方法名
+/// 而不是等实现完再补，是为了让「未实现」表现为明确的业务错误，而不是 `-32601`。
+pub mod plugin {
+    /// 列已安装插件与状态。
+    pub const LIST: &str = "plugin.list";
+    /// 单个插件详情（含工具 / 命令清单与最近错误）。
+    pub const STATUS: &str = "plugin.status";
+    /// 校验并写入插件目录，不启动进程。
+    pub const INSTALL: &str = "plugin.install";
+    /// 卸载运行中的插件并删目录。
+    pub const UNINSTALL: &str = "plugin.uninstall";
+    /// 授权齐备则起子进程并握手。
+    pub const LOAD: &str = "plugin.load";
+    /// 停进程并把工具从 agent 注册表下架。
+    pub const UNLOAD: &str = "plugin.unload";
+    /// 停 + 起，用于开发调试。
+    pub const RELOAD: &str = "plugin.reload";
+    /// 调用网关：按 `plugin_id` + `method` 转发到插件进程。
+    pub const CALL: &str = "plugin.call";
+    /// 授予能力。
+    pub const GRANT: &str = "plugin.grant";
+    /// 撤销能力（关键能力则连带 unload）。
+    pub const REVOKE: &str = "plugin.revoke";
+}
+
 /// Core → Main 的通知（事件）。
 pub mod event {
     /// 内核日志转发，便于 Main 侧统一落盘。
@@ -299,6 +332,18 @@ pub const IMPLEMENTED: &[&str] = &[
     mcp::DISCONNECT,
     mcp::TOOLS,
     mcp::CALL,
+    // P0 插件协议骨架：方法名与 DTO 先行，dispatch 分支如实返回 6101。
+    // 这不算虚报——能力清单的语义是「可路由」，不是「业务已实现」。
+    plugin::LIST,
+    plugin::STATUS,
+    plugin::INSTALL,
+    plugin::UNINSTALL,
+    plugin::LOAD,
+    plugin::UNLOAD,
+    plugin::RELOAD,
+    plugin::CALL,
+    plugin::GRANT,
+    plugin::REVOKE,
 ];
 
 /// 协议面**已定义、但内核尚未接线**的方法。
@@ -320,7 +365,7 @@ mod tests {
 
     #[test]
     fn implemented_list_covers_core_m1_m2_agent_domains() {
-        assert_eq!(IMPLEMENTED.len(), 61);
+        assert_eq!(IMPLEMENTED.len(), 71);
         assert!(IMPLEMENTED.contains(&"core.ping"));
         assert!(IMPLEMENTED.contains(&"$/cancelRequest"));
         assert!(IMPLEMENTED.contains(&"workspace.read_file"));
@@ -391,6 +436,26 @@ mod tests {
         }
         assert_eq!(mcp::SERVERS, "mcp.servers");
         assert_eq!(mcp::CALL, "mcp.call");
+        // P0 插件协议骨架：10 个方法进清单（dispatch 分支统一回 6101），
+        // 而 `plugin/*` / `host/*` 这类插件包内部方法一律不进。
+        for name in [
+            plugin::LIST,
+            plugin::STATUS,
+            plugin::INSTALL,
+            plugin::UNINSTALL,
+            plugin::LOAD,
+            plugin::UNLOAD,
+            plugin::RELOAD,
+            plugin::CALL,
+            plugin::GRANT,
+            plugin::REVOKE,
+        ] {
+            assert!(IMPLEMENTED.contains(&name), "{name} 应已接线");
+        }
+        assert_eq!(plugin::LIST, "plugin.list");
+        assert_eq!(plugin::CALL, "plugin.call");
+        assert!(!IMPLEMENTED.iter().any(|name| name.starts_with("host/")));
+        assert!(!IMPLEMENTED.iter().any(|name| name.starts_with("plugin/")));
     }
 
     #[test]
@@ -420,7 +485,7 @@ mod tests {
         all.sort_unstable();
         all.dedup();
         assert_eq!(all.len(), total, "两张表不得有重叠");
-        assert_eq!(total, 61, "应恰好覆盖协议里定义的全部 61 个请求方法");
+        assert_eq!(total, 71, "应恰好覆盖协议里定义的全部 71 个请求方法");
     }
 
     #[test]

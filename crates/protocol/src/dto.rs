@@ -2589,6 +2589,308 @@ pub struct McpCallResult {
     pub structured_content: Option<serde_json::Value>,
 }
 
+// ---------------------------------------------------------------------------
+// 插件宿主（P0 协议骨架）
+//
+// P0 只定协议，不装载进程：这些类型是空分支将来要填的**形状**，现在就被 ts-rs
+// 导出成 TS，外壳可以先按它写面板骨架，不必等内核实现完再返工。
+//
+// 字段一律 snake_case（与 terminal.* / mcp.* 一致），由 serde 默认命名负责，
+// 不额外加 `rename_all`——混用两种风格是前端最容易踩的坑。
+// ---------------------------------------------------------------------------
+
+/// 插件在宿主侧的状态（docs/14 §5 状态机）。
+///
+/// `needs_grant` 单独成态而不是"未加载"：它意味着清单合法、只差用户点授权，
+/// UI 要给出「授权」按钮而不是「加载」按钮——两者的下一步完全不同。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginState {
+    /// 已安装但未加载（用户没点，或 `autoload=false`）。
+    #[default]
+    Disabled,
+    /// 清单申请的能力中有未授予项。
+    NeedsGrant,
+    /// 正在起进程 / 握手。
+    Loading,
+    /// 已握手，工具可调用。
+    Ready,
+    /// 进程崩了，工具已下架。
+    Crashed,
+}
+
+/// 插件工具的审批档位。与 Agent 的 [`ApprovalRisk`] 分开定义，是因为插件工具
+/// 的风险由**清单声明**（插件自己能填），而 `ApprovalRisk` 由内核判定。
+/// 两者在注入 agent 时映射：`read → read`、`write` / `exec → write`。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "lowercase")]
+pub enum PluginToolRisk {
+    /// 只读，免审批。
+    #[default]
+    Read,
+    /// 写盘，走审批。
+    Write,
+    /// 起进程 / 执行命令，走审批且默认拒绝。
+    Exec,
+}
+
+/// 插件摘要视图。
+///
+/// 不回传清单原文：清单里有 `entry`（可执行文件路径）与 `permissions` 细节，
+/// 渲染端不需要，回传只会把「结构契约」变成「谁都能读的内部表示」。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginSummary {
+    /// 插件 id（清单里的 `id`，全局唯一，也是 `plugin.*` 的寻址键）。
+    pub id: String,
+    /// 展示名。
+    pub name: String,
+    /// 语义化版本。
+    pub version: String,
+    /// 一句话说明（清单可缺省）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub description: Option<String>,
+    /// 当前状态。
+    pub state: PluginState,
+    /// 清单**申请**的能力（如 `fs.read`、`net.fetch`）。
+    pub capabilities: Vec<String>,
+    /// 用户**已授予**的能力；`needs_grant` 时是本集合的子集关系。
+    pub granted_capabilities: Vec<String>,
+    /// 已注册工具数（未加载时为 0）。
+    pub tool_count: u32,
+    /// 最近一次失败原因，供面板直接展示，不必让用户翻日志。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub last_error: Option<String>,
+}
+
+/// 一个插件工具的对外描述。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginToolSummary {
+    /// 插件内原始工具名（插件自己认识的那个名字）。
+    pub name: String,
+    /// 带命名空间的工具全名：`plugin__<plugin_id>__<name>`。
+    ///
+    /// 命名空间是硬约束：插件工具与核心工具、MCP 工具共处一个注册表，
+    /// 不加前缀就等着撞名（[`crate::ErrorCode::PLUGIN_TOOL_CONFLICT`] 就是为此留的）。
+    pub namespaced_name: String,
+    /// 给模型看的说明。
+    pub description: String,
+    /// 审批档位（见 [`PluginToolRisk`]）。
+    pub risk: PluginToolRisk,
+    /// JSON Schema 形式的入参定义，原样透传给模型。
+    pub input_schema: serde_json::Value,
+}
+
+/// 一个插件命令的对外描述（P5 进命令面板，P0 仅占位）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginCommandSummary {
+    /// 插件内原始命令名。
+    pub name: String,
+    /// 命令面板标题。
+    pub title: String,
+    /// 一句话说明。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub description: Option<String>,
+}
+
+/// `plugin.list` 参数：无（保留空对象，便于将来加过滤条件而不破坏兼容）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginListParams {}
+
+/// `plugin.list` 响应结果。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginListResult {
+    /// 已安装插件，按 id 升序排列，保证面板顺序稳定。
+    pub plugins: Vec<PluginSummary>,
+}
+
+/// `plugin.status` 参数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginStatusParams {
+    /// 插件 id。
+    pub plugin_id: String,
+}
+
+/// `plugin.status` 响应结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginStatusResult {
+    /// 插件摘要。
+    pub plugin: PluginSummary,
+    /// 已注册工具（未加载时为空数组）。
+    pub tools: Vec<PluginToolSummary>,
+    /// 声明的命令（未加载时为空数组）。
+    pub commands: Vec<PluginCommandSummary>,
+}
+
+/// `plugin.install` 参数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginInstallParams {
+    /// 插件包路径（目录或 `.zip`，内核自己判类型）。
+    pub path: String,
+}
+
+/// `plugin.install` 响应结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginInstallResult {
+    /// 装好的插件摘要（状态必为 `disabled` 或 `needs_grant`，安装不启动进程）。
+    pub plugin: PluginSummary,
+    /// 安装时覆盖了同 id 的旧版本。
+    pub replaced: bool,
+}
+
+/// `plugin.uninstall` 参数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginUninstallParams {
+    /// 插件 id。
+    pub plugin_id: String,
+}
+
+/// `plugin.uninstall` 响应结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginUninstallResult {
+    /// 被卸载的插件 id。
+    pub plugin_id: String,
+    /// 连带下架的工具数（卸载运行中插件时非 0）。
+    pub removed_tools: u32,
+    /// 插件目录是否已删除（目录被占用时会留残，需如实告知）。
+    pub removed_dir: bool,
+}
+
+/// `plugin.load` 参数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginLoadParams {
+    /// 插件 id。
+    pub plugin_id: String,
+}
+
+/// `plugin.load` 响应结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginLoadResult {
+    /// 加载后的插件摘要（状态 `ready`）。
+    pub plugin: PluginSummary,
+    /// 握手后注册的工具。
+    pub tools: Vec<PluginToolSummary>,
+}
+
+/// `plugin.unload` 参数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginUnloadParams {
+    /// 插件 id。
+    pub plugin_id: String,
+}
+
+/// `plugin.unload` 响应结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginUnloadResult {
+    /// 插件 id。
+    pub plugin_id: String,
+    /// 从 agent 注册表下架的工具数。
+    pub removed_tools: u32,
+}
+
+/// `plugin.reload` 参数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginReloadParams {
+    /// 插件 id。
+    pub plugin_id: String,
+}
+
+/// `plugin.reload` 响应结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginReloadResult {
+    /// 重载后的插件摘要。
+    pub plugin: PluginSummary,
+    /// 重载后注册的工具。
+    pub tools: Vec<PluginToolSummary>,
+}
+
+/// `plugin.call` 参数（docs/14 §6.3）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginCallParams {
+    /// 插件 id。
+    pub plugin_id: String,
+    /// 工具名或命令名（**只能是本插件声明的**，越权回 6106）。
+    pub method: String,
+    /// 入参，缺省视为 `{}`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub params: Option<serde_json::Value>,
+}
+
+/// `plugin.call` 响应结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginCallResult {
+    /// 插件 id（回显，便于一次并发多调用时对号）。
+    pub plugin_id: String,
+    /// 实际执行的方法名。
+    pub method: String,
+    /// 结果正文（文本化后回灌模型）。
+    pub content: String,
+    /// 正文是否被截断（超过 64 KB）。
+    pub truncated: bool,
+}
+
+/// `plugin.grant` 参数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginGrantParams {
+    /// 插件 id。
+    pub plugin_id: String,
+    /// 要授予的能力；空数组表示「授予清单申请的全部能力」。
+    pub capabilities: Vec<String>,
+}
+
+/// `plugin.grant` 响应结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginGrantResult {
+    /// 授权后的插件摘要（`granted_capabilities` 已更新）。
+    pub plugin: PluginSummary,
+}
+
+/// `plugin.revoke` 参数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginRevokeParams {
+    /// 插件 id。
+    pub plugin_id: String,
+    /// 要撤销的能力。
+    pub capabilities: Vec<String>,
+}
+
+/// `plugin.revoke` 响应结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginRevokeResult {
+    /// 撤销后的插件摘要。
+    pub plugin: PluginSummary,
+    /// 是否因撤销关键能力而连带卸载（撤销后工具已下架）。
+    pub unloaded: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2982,6 +3284,78 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&result).unwrap()["bytes"],
             serde_json::json!(11)
+        );
+    }
+
+    /// 插件状态与工具风险都必须序列化成小写字面量：TS 侧靠字面量做穷尽 switch，
+    /// 一旦变成 `NeedsGrant` 这种 PascalCase，前端所有分支都静默落空。
+    #[test]
+    fn plugin_state_and_risk_serialize_as_lower_snake() {
+        assert_eq!(
+            serde_json::to_value(PluginState::NeedsGrant).unwrap(),
+            serde_json::json!("needs_grant")
+        );
+        assert_eq!(
+            serde_json::to_value(PluginState::Ready).unwrap(),
+            serde_json::json!("ready")
+        );
+        assert_eq!(PluginState::default(), PluginState::Disabled);
+        assert_eq!(
+            serde_json::to_value(PluginToolRisk::Exec).unwrap(),
+            serde_json::json!("exec")
+        );
+        assert_eq!(PluginToolRisk::default(), PluginToolRisk::Read);
+        assert_eq!(
+            serde_json::from_value::<PluginState>(serde_json::json!("crashed")).unwrap(),
+            PluginState::Crashed
+        );
+    }
+
+    /// `plugin.call` 的 `params` 允许缺省（docs/14 §6.3 第 1 步），缺省即 `{}`；
+    /// 而 `plugin_id` / `method` 缺失必须报错——不能让空字符串混进寻址键。
+    #[test]
+    fn plugin_call_params_default_to_empty_and_require_ids() {
+        let params: PluginCallParams = serde_json::from_value(
+            serde_json::json!({ "plugin_id": "demo-hello", "method": "repo_stats" }),
+        )
+        .unwrap();
+        assert_eq!(params.plugin_id, "demo-hello");
+        assert_eq!(
+            params.params, None,
+            "缺省的 params 应是 None，由宿主补 {{}}"
+        );
+        assert!(serde_json::from_value::<PluginCallParams>(
+            serde_json::json!({ "method": "repo_stats" })
+        )
+        .is_err());
+        assert!(serde_json::from_value::<PluginCallParams>(
+            serde_json::json!({ "plugin_id": "demo-hello" })
+        )
+        .is_err());
+    }
+
+    /// 摘要视图的两个 `Option` 字段必须真的「缺省即不出现」：面板按字段存在与否
+    /// 渲染角标，序列化出一个 `"last_error": null` 会让健康的插件也显示错误点。
+    #[test]
+    fn plugin_summary_omits_optional_fields() {
+        let summary = PluginSummary {
+            id: "demo-hello".into(),
+            name: "Demo Hello".into(),
+            version: "0.1.0".into(),
+            description: None,
+            state: PluginState::Disabled,
+            capabilities: vec!["fs.read".into()],
+            granted_capabilities: vec![],
+            tool_count: 0,
+            last_error: None,
+        };
+        let json = serde_json::to_value(&summary).unwrap();
+        assert!(json.get("description").is_none(), "{json}");
+        assert!(json.get("last_error").is_none(), "{json}");
+        assert_eq!(json["state"], serde_json::json!("disabled"));
+        assert_eq!(
+            serde_json::from_value::<PluginSummary>(json).unwrap(),
+            summary
         );
     }
 }
