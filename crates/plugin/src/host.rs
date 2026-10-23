@@ -29,6 +29,11 @@ pub const LEGACY_HANDSHAKE_METHOD: &str = "plugin/initialize";
 pub const METHOD_NOT_FOUND: i64 = -32601;
 /// 握手总预算。插件拉起 + 首次握手都在这一步，给足 15 s。
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+/// 宿主 → 插件的工具调用方法名（P3 工具注入，docs/14 §6.4）。
+pub const TOOL_INVOKE_METHOD: &str = "plugin/tool-invoke";
+/// 单次工具调用预算。与清单默认值 [`crate::manifest::DEFAULT_TIMEOUT_MS`] 一致；
+/// 调用一律走这个常量，避免「插件自己声明的超时」被拿来做无限等待。
+pub const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// 同一装载会话内允许的自动重启次数（docs/14 §4.2、验收场景 11）。
 ///
 /// 「会话」从一次成功的 `load` 起算，直到这轮进程彻底停住为止：期间无论重启
@@ -189,6 +194,61 @@ pub struct Loaded {
     pub pid: Option<u32>,
     /// 本次是复用已在跑的进程（`plugin.load` 幂等）。
     pub reused: bool,
+}
+
+/// 一个**当下可路由**的插件工具，供上层注入 agent 工具表（P3）。
+///
+/// 只在插件活着时出现在 [`Host::tool_catalog`] 里：进程一死，工具就该从模型
+/// 视野里消失，否则模型会继续调用一个没有接收方的名字。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunningTool {
+    pub plugin_id: String,
+    /// 插件内 `tools[].name`，调用时原样回填给插件。
+    pub name: String,
+    /// 喂给模型/注册表的名字：`plugin__<plugin_id>__<name>`。
+    pub namespaced_name: String,
+    pub description: String,
+    pub risk: ai_ide_protocol::PluginToolRisk,
+    /// JSON Schema；插件没声明时给一个空对象 schema，避免注入出半残定义。
+    pub parameters: Value,
+}
+
+/// 一次工具调用的失败原因。`crates/core` 按它选 61xx。
+#[derive(Debug, Clone)]
+pub enum CallError {
+    /// 插件没装载，或进程已经退出（工具已不可路由）。
+    NotRunning(String),
+    /// 插件在跑，但没声明过这个工具。
+    UnknownTool(String),
+    /// 等回包超时（6105）。
+    Timeout { tool: String, timeout: Duration },
+    /// 请求途中进程没了（6102）。
+    Exited {
+        code: Option<i32>,
+        tail: Vec<String>,
+    },
+    /// 插件明确回了错误帧。
+    Plugin { code: i64, message: String },
+    /// 帧不合协议 / 装载表不可用（6106）。
+    Protocol { message: String },
+}
+
+impl std::fmt::Display for CallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotRunning(plugin_id) => write!(f, "插件未装载或已退出：{plugin_id}"),
+            Self::UnknownTool(tool) => write!(f, "插件没有声明工具：{tool}"),
+            Self::Timeout { tool, timeout } => {
+                write!(f, "调用工具 {tool} 超时（{} ms）", timeout.as_millis())
+            }
+            Self::Exited { code, .. } => match code {
+                Some(code) => write!(f, "插件进程在调用期间退出（退出码 {code}）"),
+                None => write!(f, "插件进程在调用期间退出"),
+            },
+            Self::Plugin { code, message } => write!(f, "插件回错误 {code}：{message}"),
+            Self::Protocol { message } => write!(f, "插件协议错误：{message}"),
+        }
+    }
 }
 
 /// 一次装载所需的输入。
@@ -438,6 +498,102 @@ impl Host {
         self.alive(plugin_id)
             .map(|loaded| loaded.namespaced_tools)
             .unwrap_or_default()
+    }
+
+    /// 当前所有可路由的插件工具（P3 工具注入的唯一来源）。
+    ///
+    /// 每次调用都现场扫装载表，不缓存：账本里插件状态随时会变（崩溃、卸载、
+    /// 自动重启后重新握手），缓存一份就要额外维护失效逻辑，反而更容易注出
+    /// 一个「工具在表里、插件已经不在」的幽灵工具。
+    ///
+    /// 只收进程还活着的条目；顺序按 `namespaced_name` 排定，保证同一状态下列表
+    /// 逐字稳定（注入 prompt 时不会每组轮次都抖动）。
+    pub fn tool_catalog(&self) -> Vec<RunningTool> {
+        let Ok(guard) = self.loaded.lock() else {
+            return Vec::new();
+        };
+        let mut catalog = Vec::new();
+        for (plugin_id, entry) in guard.iter() {
+            if entry.start.process.has_exited() {
+                continue;
+            }
+            for (index, tool) in entry.start.tools.iter().enumerate() {
+                let namespaced_name = match entry.start.namespaced.get(index) {
+                    Some(name) => name.clone(),
+                    None => namespaced_tool(plugin_id, &tool.name),
+                };
+                catalog.push(RunningTool {
+                    plugin_id: plugin_id.clone(),
+                    name: tool.name.clone(),
+                    namespaced_name,
+                    description: tool.description.clone().unwrap_or_default(),
+                    risk: tool.risk.unwrap_or_default(),
+                    parameters: tool
+                        .parameters
+                        .clone()
+                        .unwrap_or_else(|| json!({ "type": "object", "properties": {} })),
+                });
+            }
+        }
+        catalog.sort_by(|left, right| left.namespaced_name.cmp(&right.namespaced_name));
+        catalog
+    }
+
+    /// 调一次插件工具：`plugin/tool-invoke`，参数 `{tool, arguments}`。
+    ///
+    /// 锁只用来取一个 `Arc<PluginProcess>` 快照，取到就立刻释放——`await` 期间
+    /// 绝不能持锁，否则一个卡住的插件会把整个装载表（含所有插件的 `load` /
+    /// `unload` / 心跳）一起冻住，等于插件故障升级为内核故障。
+    pub async fn call_tool(
+        &self,
+        plugin_id: &str,
+        tool: &str,
+        args: Value,
+    ) -> Result<Value, CallError> {
+        let process = {
+            let guard = self.loaded.lock().map_err(|_| CallError::Protocol {
+                message: "插件装载表已不可用（锁中毒）".to_string(),
+            })?;
+            let Some(entry) = guard.get(plugin_id) else {
+                return Err(CallError::NotRunning(plugin_id.to_string()));
+            };
+            if entry.start.process.has_exited() {
+                return Err(CallError::NotRunning(plugin_id.to_string()));
+            }
+            if !entry.start.tools.iter().any(|item| item.name == tool) {
+                return Err(CallError::UnknownTool(tool.to_string()));
+            }
+            Arc::clone(&entry.start.process)
+        };
+
+        let params = json!({ "tool": tool, "arguments": args });
+        match process
+            .request(TOOL_INVOKE_METHOD, params, CALL_TIMEOUT)
+            .await
+        {
+            Ok(value) => Ok(value),
+            // 宿主自己的「进程没了」哨兵：按崩溃上报，而不是当成插件拒绝。
+            Err(RequestError::Plugin { code, .. }) if code == EXITED_REPLY_CODE => {
+                Err(CallError::Exited {
+                    code: exit_code(&process).await,
+                    tail: process.stderr_tail(),
+                })
+            }
+            Err(RequestError::Plugin { code, message }) => Err(CallError::Plugin { code, message }),
+            Err(RequestError::Timeout { timeout, .. }) => Err(CallError::Timeout {
+                tool: tool.to_string(),
+                timeout,
+            }),
+            Err(RequestError::Exited { tail }) => Err(CallError::Exited {
+                code: exit_code(&process).await,
+                tail,
+            }),
+            Err(RequestError::Closed) => Err(CallError::Exited {
+                code: exit_code(&process).await,
+                tail: process.stderr_tail(),
+            }),
+            Err(RequestError::Protocol(message)) => Err(CallError::Protocol { message }),
+        }
     }
 
     /// 当前所有在跑的插件 id。
@@ -742,4 +898,192 @@ fn merge_tools(manifest: &Manifest, handshake: &Handshake) -> Vec<HandshakeTool>
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::loader::{SpawnOptions, NODE_ENV};
+    use crate::manifest::ManifestTool;
+    use ai_ide_protocol::PluginToolRisk;
+    use std::process::Stdio;
+
+    /// 最小的工具调用替身：把 `params` 原样回显，并带上收到的方法名。
+    const ECHO_TOOL: &str = r#"
+        const readline = require('node:readline')
+        const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity })
+        rl.on('line', (line) => {
+          if (!line.trim()) return
+          const frame = JSON.parse(line)
+          const params = frame.params || {}
+          process.stdout.write(JSON.stringify({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { method: frame.method, tool: params.tool, echo: params.arguments }
+          }) + '\n')
+        })
+    "#;
+
+    fn node_ready() -> bool {
+        std::process::Command::new(std::env::var(NODE_ENV).unwrap_or_else(|_| "node".to_string()))
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|gap| gap.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "aiide-host-call-{tag}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        dir
+    }
+
+    fn demo_manifest() -> Manifest {
+        Manifest {
+            id: "demo".to_string(),
+            name: "示例插件".to_string(),
+            version: "0.1.0".to_string(),
+            description: None,
+            plugin_api: "1.0".to_string(),
+            main: "index.cjs".to_string(),
+            capabilities: Vec::new(),
+            tools: vec![ManifestTool {
+                name: "echo".to_string(),
+                description: Some("回显入参".to_string()),
+                risk: PluginToolRisk::Read,
+                path_field: None,
+                parameters: json!({ "type": "object", "properties": {} }),
+            }],
+            commands: Vec::new(),
+            subscriptions: Vec::new(),
+            timeout_ms: 30_000,
+        }
+    }
+
+    /// 直接按「装载成功」的成品形态塞进装载表：这里要验的是工具路径，
+    /// 不是握手判定，走一遍 `load` 只会把测试绑到清单校验的细节上。
+    async fn host_with_echo(dir: &Path, entry: &Path) -> Host {
+        let process = PluginProcess::spawn(SpawnOptions {
+            plugin_id: "demo",
+            install_dir: dir,
+            entry,
+        })
+        .await
+        .expect("起进程");
+        let tools = vec![HandshakeTool {
+            name: "echo".to_string(),
+            description: Some("回显入参".to_string()),
+            risk: Some(PluginToolRisk::Read),
+            parameters: Some(json!({ "type": "object", "properties": {} })),
+        }];
+        let start = Start {
+            handshake: Handshake {
+                plugin_api: Some(json!({ "major": 1, "minor": 0 })),
+                name: Some("demo".to_string()),
+                version: Some("0.1.0".to_string()),
+                tools: tools.clone(),
+                commands: Vec::new(),
+                subscriptions: Vec::new(),
+            },
+            tools,
+            namespaced: vec![namespaced_tool("demo", "echo")],
+            process,
+        };
+        let host = Host::new();
+        host.loaded.lock().expect("装载表").insert(
+            "demo".to_string(),
+            Entry {
+                start,
+                resume: Resume {
+                    plugin_id: "demo".to_string(),
+                    install_dir: dir.to_path_buf(),
+                    entry: entry.to_path_buf(),
+                    manifest: demo_manifest(),
+                    requested: Vec::new(),
+                    granted: Vec::new(),
+                    workspace: Value::Null,
+                },
+                restart_attempts: 0,
+            },
+        );
+        host
+    }
+
+    #[tokio::test]
+    async fn call_tool_on_unloaded_plugin_reports_not_running() {
+        let host = Host::new();
+        match host.call_tool("ghost", "echo", json!({})).await {
+            Err(CallError::NotRunning(plugin_id)) => {
+                assert_eq!(plugin_id, "ghost");
+                assert!(CallError::NotRunning("ghost".to_string())
+                    .to_string()
+                    .contains("ghost"));
+            }
+            other => panic!("未装载应报 NotRunning，实际 {other:?}"),
+        }
+        assert!(host.tool_catalog().is_empty(), "未装载时目录应为空");
+    }
+
+    #[tokio::test]
+    async fn call_tool_on_unknown_tool_reports_unknown_tool() {
+        if !node_ready() {
+            eprintln!("跳过：本机没有 node");
+            return;
+        }
+        let dir = scratch("unknown");
+        let entry = dir.join("index.cjs");
+        std::fs::write(&entry, ECHO_TOOL).expect("写脚本");
+        let host = host_with_echo(&dir, &entry).await;
+
+        match host.call_tool("demo", "no_such_tool", json!({})).await {
+            Err(CallError::UnknownTool(tool)) => {
+                assert_eq!(tool, "no_such_tool");
+                assert!(CallError::UnknownTool("no_such_tool".to_string())
+                    .to_string()
+                    .contains("no_such_tool"));
+            }
+            other => panic!("工具不存在应报 UnknownTool，实际 {other:?}"),
+        }
+
+        host.shutdown_all().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn call_tool_round_trip_returns_plugin_reply() {
+        if !node_ready() {
+            eprintln!("跳过：本机没有 node");
+            return;
+        }
+        let dir = scratch("round-trip");
+        let entry = dir.join("index.cjs");
+        std::fs::write(&entry, ECHO_TOOL).expect("写脚本");
+        let host = host_with_echo(&dir, &entry).await;
+
+        let catalog = host.tool_catalog();
+        assert_eq!(catalog.len(), 1, "应注入 1 个工具");
+        assert_eq!(catalog[0].namespaced_name, "plugin__demo__echo");
+        assert_eq!(catalog[0].plugin_id, "demo");
+        assert_eq!(catalog[0].risk, PluginToolRisk::Read);
+
+        let reply = host
+            .call_tool("demo", "echo", json!({ "text": "你好" }))
+            .await
+            .expect("调用应成功");
+        assert_eq!(reply["method"], json!(TOOL_INVOKE_METHOD));
+        assert_eq!(reply["tool"], json!("echo"));
+        assert_eq!(reply["echo"], json!({ "text": "你好" }));
+
+        host.shutdown_all().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
