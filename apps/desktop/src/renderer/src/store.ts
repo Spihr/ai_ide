@@ -33,6 +33,7 @@ export type ActivityView =
   | 'permissions'
   | 'git'
   | 'mcp'
+  | 'plugin'
 
 /** 一个打开的编辑器标签。 */
 export interface Tab {

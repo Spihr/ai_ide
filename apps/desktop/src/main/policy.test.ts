@@ -129,6 +129,40 @@ describe('checkRendererCall', () => {
   })
 
   /*
+   * P1 只放行「清单与安装」四条：装/卸/列/看详情都不执行插件代码。
+   * 加载与调用那六个方法内核还回 6101，主进程也不能提前开闸。
+   */
+  it('放行 P1 的插件安装与清单方法', () => {
+    const methods = [
+      Methods.plugin.install,
+      Methods.plugin.list,
+      Methods.plugin.status,
+      Methods.plugin.uninstall
+    ]
+
+    for (const method of methods) {
+      expect(checkRendererCall(method).allowed, `${method} 应被放行`).toBe(true)
+    }
+  })
+
+  it('不放行 P2/P4 才落地的插件方法（白名单不虚报能力）', () => {
+    const methods = [
+      Methods.plugin.load,
+      Methods.plugin.unload,
+      Methods.plugin.reload,
+      Methods.plugin.call,
+      Methods.plugin.grant,
+      Methods.plugin.revoke
+    ]
+
+    for (const method of methods) {
+      const decision = checkRendererCall(method)
+      expect(decision.allowed, `${method} 不应被放行`).toBe(false)
+      expect(decision.reason, `${method} 应当给出拒绝原因`).toBeTruthy()
+    }
+  })
+
+  /*
    * MCP 的「配置面」不进白名单：面板只能连 `mcp.json` 里已有的 Server，不能自己
    * 塞一个进去。这条用例钉的就是「UI 拿不到改配置 / 绕过已连接清单」的能力。
    */
@@ -214,6 +248,10 @@ describe('checkRendererCall', () => {
       'model.upsert',
       'permission.list',
       'permission.revoke',
+      'plugin.install',
+      'plugin.list',
+      'plugin.status',
+      'plugin.uninstall',
       'provider.delete',
       'provider.list',
       'provider.test',

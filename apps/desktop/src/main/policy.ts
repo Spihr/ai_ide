@@ -140,7 +140,25 @@ const RENDERER_ALLOWED = new Set<string>([
   Methods.mcp.connect,
   Methods.mcp.disconnect,
   Methods.mcp.tools,
-  Methods.mcp.call
+  Methods.mcp.call,
+
+  // P1：插件。四条同样是「用户显式动作」的后果——打开插件视图才 `list`、点某个插件
+  // 看详情才 `status`、填好本地包目录按「安装」才 `install`、按「卸载」才 `uninstall`。
+  //
+  // 这里要交代清楚**没放行的那六个**（`load` / `unload` / `reload` / `call` /
+  // `grant` / `revoke`）：它们在协议方法表里、也还留在 `IMPLEMENTED_METHODS` 中，
+  // 但内核侧仍是 `6101` 空分支——P1 只做「清单与安装」，起子进程、签名授权都在
+  // P2/P4。白名单一旦提前放行，UI 就能发起一个必然失败、还会被用户当成「插件坏了」
+  // 的调用。这正是设计文档 §9 要求的「能力不虚报」：**实现对齐之后再加进来**，
+  // 而不是先开闸再补实现。
+  //
+  // 已放行的四条也守住了 P1 的边界：`install` 只复制包目录与写账本（内核侧
+  // `plugin_api::install` 全程 `spawn_blocking` 拷文件，**不启动任何进程**），
+  // `uninstall` 只删账本与安装目录，两条都拿不到「执行插件代码」的能力。
+  Methods.plugin.install,
+  Methods.plugin.list,
+  Methods.plugin.status,
+  Methods.plugin.uninstall
 ])
 
 export interface PolicyDecision {

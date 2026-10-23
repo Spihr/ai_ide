@@ -25,7 +25,12 @@ const ITEMS: ActivityItem[] = [
    * MCP 排在最后：它是「配置面」而不是日常视图——只在接新 Server、排障、
    * 临时试跑工具时才会点开，放在权限之后不会挡住高频入口。
    */
-  { id: 'mcp', label: 'MCP Server', glyph: '⑃' }
+  { id: 'mcp', label: 'MCP Server', glyph: '⑃' },
+  /*
+   * 插件紧跟在 MCP 之后：同属「配置面」。P1 只有安装/卸载/看清单，
+   * 但位置先按长期形态排定，免得 P2 加「启用」时再挪一次入口。
+   */
+  { id: 'plugin', label: '插件', glyph: '⊞' }
 ]
 
 export function ActivityBar() {

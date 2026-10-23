@@ -13,6 +13,7 @@ import { FileTree } from './components/FileTree'
 import { GitPanel } from './components/GitPanel'
 import { McpPanel } from './components/McpPanel'
 import { PermissionPanel } from './components/PermissionPanel'
+import { PluginPanel } from './components/PluginPanel'
 import { SearchPanel } from './components/SearchPanel'
 import { StatusBar } from './components/StatusBar'
 import { TerminalPanel } from './components/TerminalPanel'
@@ -40,7 +41,8 @@ const SIDEBAR_TITLES: Record<ActivityView, string> = {
   git: '源代码管理',
   checkpoints: '检查点',
   permissions: '权限',
-  mcp: 'MCP Server'
+  mcp: 'MCP Server',
+  plugin: '插件'
 }
 
 export function App() {
@@ -158,7 +160,9 @@ export function App() {
             state.activity !== 'checkpoints' &&
             state.activity !== 'permissions' &&
             // MCP 的 Server 清单来自配置文件、不依赖工作区，没有工作区时照样能用。
-            state.activity !== 'mcp' && (
+            state.activity !== 'mcp' &&
+            // 插件清单同理：装在用户数据目录、按绝对路径安装，与工作区无关。
+            state.activity !== 'plugin' && (
               <p className="panel__error">{state.workspaceError}</p>
             )}
           {state.activity === 'explorer' ? (
@@ -173,6 +177,8 @@ export function App() {
             <PermissionPanel />
           ) : state.activity === 'mcp' ? (
             <McpPanel />
+          ) : state.activity === 'plugin' ? (
+            <PluginPanel />
           ) : (
             <AiPanel />
           )}

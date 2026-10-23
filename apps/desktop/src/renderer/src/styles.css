@@ -1407,3 +1407,87 @@ button {
 .mcp-args {
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
 }
+
+/*
+ * P1：插件面板。
+ *
+ * 与 MCP 面板同一套底色，只补三处它独有的东西：插件头（名字 + 版本 + 状态标记）、
+ * 6107 的逐条清单问题（`code / path / message` 三列对齐，路径用等宽字），
+ * 以及详情区分组标题。
+ */
+.plugin-item.is-active {
+  background: rgba(90, 160, 255, 0.16);
+}
+
+.plugin-item__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.plugin-item__name {
+  font-weight: 600;
+}
+
+.plugin-item__version {
+  color: #9aa3b0;
+  font-size: 12px;
+}
+
+/* 状态标记：运行中绿、待授权黄、崩溃红，其余中性灰——与状态栏同一语义色 */
+.plugin-state {
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: rgba(120, 130, 145, 0.2);
+  color: #9aa3b0;
+  font-size: 11px;
+}
+
+.plugin-state.is-ok {
+  background: rgba(60, 160, 90, 0.2);
+  color: #6fce8f;
+}
+
+.plugin-state.is-warn {
+  background: rgba(200, 160, 60, 0.2);
+  color: #e0bd6a;
+}
+
+.plugin-state.is-bad {
+  background: rgba(200, 70, 70, 0.2);
+  color: #e08a8a;
+}
+
+/* 6107 的明细：一次列全，每行「类型 | 路径 | 说明」，窄侧栏里允许换行不截断 */
+.plugin-issues {
+  margin: 6px 0;
+  padding-left: 18px;
+}
+
+.plugin-issue {
+  margin-bottom: 4px;
+  line-height: 1.5;
+}
+
+.plugin-issue__code {
+  margin-right: 6px;
+  padding: 0 4px;
+  border-radius: 6px;
+  background: rgba(120, 130, 145, 0.25);
+  font-size: 11px;
+}
+
+.plugin-issue__path {
+  margin-right: 6px;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
+  color: #8fb6e8;
+  word-break: break-all;
+}
+
+.plugin-detail__title {
+  margin: 10px 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #9aa3b0;
+}

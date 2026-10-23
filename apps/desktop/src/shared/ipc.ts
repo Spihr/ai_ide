@@ -160,3 +160,69 @@ export interface AiIdeApi {
   /** 订阅终端子进程退出（`terminal.exit`），返回取消订阅函数。 */
   onTerminalExit: (listener: (event: TerminalExitEvent) => void) => () => void
 }
+
+// ---------------------------------------------------------------------------
+// 内核错误的结构化载荷（跨 IPC 的「错误信封」）
+// ---------------------------------------------------------------------------
+
+/**
+ * 信封分隔串。
+ *
+ * IPC 抛错只序列化 `Error.message`，内核 `ErrorObject.data` 会在这一跳被丢掉——
+ * 而 `plugin.install` 的 `6107` 恰恰**只有** `data.details[]` 有价值（一次列全
+ * 所有清单问题，P1 的验收点）。所以主进程把整份载荷 JSON 追加在 message 尾部，
+ * 渲染侧按这个分隔串切回去；前面的人类可读文案一字不动，日志/旧代码照常可读。
+ *
+ * 用不可见控制字符包夹，避免出现「插件清单里的字符串恰好包含分隔串」被误切。
+ */
+export const RPC_ERROR_PAYLOAD_MARKER = '\u0000[aiide-rpc-error]\u0000'
+
+/** 内核错误的结构化载荷。 */
+export interface RpcErrorPayload {
+  /** 协议错误码，如 `6107`。 */
+  code: number
+  /** 内核原始文案（不含信封）。 */
+  message: string
+  /** 内核 `ErrorObject.data` 原样；未带 data 时为 `undefined`。 */
+  data?: unknown
+}
+
+/** 主进程侧：把内核错误打包成可跨 IPC 的 message。 */
+export function encodeRpcErrorPayload(payload: RpcErrorPayload): string {
+  return `${payload.message}${RPC_ERROR_PAYLOAD_MARKER}${JSON.stringify({
+    code: payload.code,
+    data: payload.data
+  })}`
+}
+
+/** 渲染侧：从 message 里还原载荷；不是信封（或无载荷）时返回 `null`。 */
+export function decodeRpcErrorPayload(message: string): RpcErrorPayload | null {
+  const at = message.lastIndexOf(RPC_ERROR_PAYLOAD_MARKER)
+  if (at < 0) return null
+
+  const rest = message.slice(at + RPC_ERROR_PAYLOAD_MARKER.length)
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(rest)
+  } catch {
+    // 信封坏了就当作没有：宁可少一段明细，也不要让面板显示一坨原始 JSON。
+    return null
+  }
+  if (parsed === null || typeof parsed !== 'object') return null
+
+  const record = parsed as Record<string, unknown>
+  const code = record['code']
+  if (typeof code !== 'number' || !Number.isFinite(code)) return null
+
+  return {
+    code,
+    message: message.slice(0, at),
+    ...(record['data'] === undefined ? {} : { data: record['data'] })
+  }
+}
+
+/** 渲染侧：剥掉信封，只留人类可读的那一段。 */
+export function stripRpcErrorPayload(message: string): string {
+  const at = message.lastIndexOf(RPC_ERROR_PAYLOAD_MARKER)
+  return at < 0 ? message : message.slice(0, at)
+}

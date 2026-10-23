@@ -13,7 +13,7 @@ import { app, BrowserWindow, dialog, ipcMain, safeStorage } from 'electron'
 import { dirname, join } from 'node:path'
 
 import { Methods, type HelloResult } from '@ai-ide/shared-types'
-import { CoreSupervisor } from './core-supervisor'
+import { CoreRpcError, CoreSupervisor } from './core-supervisor'
 import { CredentialVault } from './credentials'
 import { checkRendererCall } from './policy'
 import {
@@ -24,6 +24,7 @@ import {
 } from './provider-keys'
 import {
   IpcChannels,
+  encodeRpcErrorPayload,
   type AiEvent,
   type CoreLogChunk,
   type CoreStatus,
@@ -294,6 +295,26 @@ async function runPingBenchmark(sup: CoreSupervisor, count: number): Promise<Pin
 // IPC
 // ---------------------------------------------------------------------------
 
+/**
+ * 把内核错误转成「渲染进程能拿到全部信息」的 Error。
+ *
+ * `Error` 过 IPC 只保 `message`，`CoreRpcError.data` 会被剥掉。插件安装的 `6107`
+ * 偏偏要靠 `data.details[]` 才能把几条清单问题一次列全，所以对 `plugin.*` 这几个
+ * 方法（P1 目前唯一需要结构化数据的调用面）把载荷编进 message 尾部，渲染侧
+ * 按 `shared/ipc.ts` 的分隔串还原。
+ *
+ * 只对 `plugin.` 前缀生效而不是全量启用：其他面板目前只消费文案，给它们塞一段
+ * JSON 尾巴只会让错误提示变丑。等哪个面板真的需要 data，再把前缀加进来即可。
+ */
+function toRendererError(method: string, error: unknown): unknown {
+  if (!(error instanceof CoreRpcError) || !method.startsWith('plugin.')) {
+    return error
+  }
+  return new Error(
+    encodeRpcErrorPayload({ code: error.code, message: error.message, data: error.data })
+  )
+}
+
 function registerIpc(): void {
   ipcMain.handle(IpcChannels.coreStatus, async (): Promise<CoreStatus> => currentStatus)
 
@@ -313,7 +334,11 @@ function registerIpc(): void {
       // 明文密钥只在「渲染进程 → 主进程 → 内核」这条链上短暂存在：
       // 进内核之前先截住一份给托管，内核那边拿到的是同一把、但只留在内存。
       const pendingKey = extractUpsertedKey(method, params)
-      const result = await requireSupervisor().request(method, params)
+      const result = await requireSupervisor()
+        .request(method, params)
+        .catch((error: unknown) => {
+          throw toRendererError(method, error)
+        })
 
       if (pendingKey) {
         try {
