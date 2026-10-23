@@ -897,3 +897,87 @@ fn core_shutdown_leaves_no_orphan_plugin_process() {
         "插件没收到 plugin/shutdown：内核是靠强杀退出的，不是优雅关停"
     );
 }
+
+/// 内核被**强杀**（`taskkill /F`）后，插件进程也不得残留。
+///
+/// 这是 docs/14 §13 给 P2 定的第三条判定要求的另一半：上一条用例走
+/// `core.shutdown`，内核还有机会逐个通知插件；这里内核在毫秒级被操作系统干掉，
+/// 没有任何用户态代码能跑——能收尸的只有作业对象的 `KILL_ON_JOB_CLOSE`
+/// （见 `crates/plugin/src/loader.rs` 的 `job` 模块）。
+///
+/// 三条断言缺一不可：
+/// 1. 内核进程真的没了——否则「插件也没了」可能是内核还活着干的；
+/// 2. 插件进程 10 秒内消失；
+/// 3. `plugin.closed` 标记**不存在**——插件没收到 `plugin/shutdown`，
+///    排除「其实是优雅关停」这种假绿。
+///
+/// 故意只用 `/F` 不加 `/T`：`/T` 会连坐整棵进程树，那样测的就不是作业对象了。
+#[cfg(windows)]
+#[test]
+fn forced_kill_of_core_leaves_no_orphan_plugin_process() {
+    if !node_ready() {
+        eprintln!("跳过：本机没有 node");
+        return;
+    }
+    let data = TempDataDir::new("plugin-p2-kill");
+    let packages = TempDataDir::new("plugin-p2-kill-pkg");
+    let markers = TempDataDir::new("plugin-p2-kill-mark");
+    let mut core = Core::spawn(&data.root);
+
+    let pid_file = markers.root.join("plugin.pid");
+    let closed_file = markers.root.join("plugin.closed");
+    // 关键：插件必须活得比自己的 stdin 久。内核被强杀时，它持有的管道句柄
+    // 一并关闭，插件这侧的 stdin 立刻 EOF——若入口写成「读到 EOF 就自然退出」，
+    // 这条用例即使没有作业对象也会绿，测到的就只是 EOF 而不是 KILL_ON_JOB_CLOSE。
+    // 挂一个心跳定时器钉住 node 的事件循环，让「消失」只能由外部杀进程造成。
+    let script = node_script_with(
+        &["echo"],
+        "setInterval(() => {}, 1000);",
+        &pid_file,
+        &closed_file,
+    );
+    let package = write_node_package(&packages.root, "demo", "demo-p2", &["echo"], &script);
+    core.ok(
+        "plugin.install",
+        json!({ "path": package.to_string_lossy() }),
+    );
+    let loaded = core.ok("plugin.load", json!({ "plugin_id": "demo-p2" }));
+    assert_eq!(loaded["plugin"]["state"], json!("ready"), "{loaded}");
+
+    assert!(
+        wait_until(|| pid_file.exists(), Duration::from_secs(5)),
+        "插件启动时没写 pid 文件"
+    );
+    let plugin_pid: u32 = std::fs::read_to_string(&pid_file)
+        .expect("读 pid 文件")
+        .trim()
+        .parse()
+        .expect("pid 是数字");
+    assert!(
+        process_alive(plugin_pid),
+        "装载后插件进程 {plugin_pid} 应在运行"
+    );
+
+    let core_pid = core.pid();
+    let status = std::process::Command::new("taskkill")
+        .args(["/F", "/PID", &core_pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("调用 taskkill 失败");
+    assert!(status.success(), "taskkill /F {core_pid} 失败：{status}");
+
+    assert!(
+        wait_until(|| !process_alive(core_pid), Duration::from_secs(10)),
+        "内核进程 {core_pid} 未被强杀，后续断言就无从谈起"
+    );
+
+    assert!(
+        wait_until(|| !process_alive(plugin_pid), Duration::from_secs(10)),
+        "内核被强杀后插件进程 {plugin_pid} 仍活着：作业对象的 KILL_ON_JOB_CLOSE 没兜住"
+    );
+    assert!(
+        !closed_file.exists(),
+        "插件收到了 plugin/shutdown：说明内核是优雅退出，没测到强杀场景"
+    );
+}
