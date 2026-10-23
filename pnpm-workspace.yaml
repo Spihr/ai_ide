@@ -8,3 +8,6 @@ packages:
 allowBuilds:
   esbuild: true
   electron: true
+  # electron-winstaller 的 install 脚本只挑选对应架构的 7za 二进制（Squirrel 打包用），
+  # 明确放行以免 pnpm v12 的 strictDepBuilds 在安装阶段直接报 ERR_PNPM_IGNORED_BUILDS。
+  electron-winstaller: true

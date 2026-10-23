@@ -53,7 +53,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 必须显式给 version：pnpm/action-setup@v4 在既没有 version 输入、
+      # 根 package.json 也没有 packageManager 字段时会直接硬失败
+      # （Error: No pnpm version is specified）。这里锁定与本机一致的版本，
+      # 保证 --frozen-lockfile 与 pnpm-workspace.yaml 的 allowBuilds 语义一致。
       - uses: pnpm/action-setup@v4
+        with:
+          version: 12.14.0
 
       - uses: actions/setup-node@v4
         with:
