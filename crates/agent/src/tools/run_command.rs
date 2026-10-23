@@ -65,11 +65,11 @@ const SHELL_PROGRAMS: &[&str] = &["cmd", "powershell", "pwsh", "sh", "bash", "zs
 pub struct RunCommandTool;
 
 impl Tool for RunCommandTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         NAME
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "在工作区里执行一条外部命令（不经 shell），返回退出码与分流的 stdout / stderr。单条流最多 64 KiB，超时（默认 120 秒）会杀掉整棵进程树；非零退出会如实回传，不是工具错误。"
     }
 

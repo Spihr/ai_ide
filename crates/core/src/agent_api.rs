@@ -60,6 +60,7 @@ use crate::checkpoint::{CheckpointRecorder, CheckpointStore};
 use crate::context;
 use crate::dispatch::parse_params;
 use crate::llm_api::workspace_error;
+use crate::mcp_manager::McpManager;
 use crate::peer::Peer;
 use crate::permission_api;
 use crate::state::AppState;
@@ -378,6 +379,7 @@ pub async fn start(peer: &Peer, state: &AppState, req: &Request) {
         cancelled,
         cancel,
         store: state.store().cloned(),
+        mcp: state.mcp().map(Arc::clone),
     };
 
     info!(
@@ -512,6 +514,10 @@ struct RunCtx {
     /// 会话库句柄：Agent 改文件前拍的检查点要记一条审计（M5 切片五）。
     /// 启动时库没连上就是 `None`，此时只是少一条审计，不影响运行。
     store: Option<Store>,
+    /// MCP 连接管理器（M7 切片二）。每次运行**现取**一份工具快照注入注册表：
+    /// 这样「本次运行开始前刚连上的 Server」的工具立刻可用，而运行中途断连的
+    /// Server 也只会在真正调用时报 8003 / 8004，不会让整次运行崩掉。
+    mcp: Option<Arc<McpManager>>,
 }
 
 /// 跑完一次运行并把结果翻成 `agent.finished`。
@@ -628,7 +634,9 @@ async fn run_loop(
     workspace: &Workspace,
     messages: Vec<ChatMessage>,
 ) -> (AgentRunStatus, Option<String>) {
-    let registry = ToolRegistry::core();
+    // 核心八工具 + 当前已连接的 MCP 工具。注入点放在这里而不是启动时一次性建表：
+    // 连接状态是会变的，注册表若做成全局单例，新连上的 Server 就得等下次重启才生效。
+    let registry = crate::mcp_tools::inject(ToolRegistry::core(), ctx.mcp.as_ref());
     let gate = PermissionGate::with_decider(PeerDecider {
         peer: Arc::clone(&ctx.peer),
         hub: Arc::clone(&ctx.hub),

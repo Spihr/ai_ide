@@ -74,10 +74,13 @@ impl ToolOutcome {
 /// 实现者**无状态**：工作区经 [`ToolContext`] 传入，所以工具实例可以常驻注册表。
 pub trait Tool: Send + Sync {
     /// 工具名，需与协议/文档里的名字一致。
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
 
     /// 给模型看的一句话说明。
-    fn description(&self) -> &'static str;
+    ///
+    /// 返回 `&str` 而不是 `&'static str`：M7 起注册表里会有**运行期才出现**的工具
+    /// （MCP Server 发现出来的），它们的说明存在实例字段里，没有 `'static` 生命周期。
+    fn description(&self) -> &str;
 
     /// 参数 JSON Schema。
     fn parameters(&self) -> Value;
@@ -128,13 +131,23 @@ impl ToolRegistry {
         self
     }
 
+    /// 批量追加工具（M7：一次注入一个 Server 的全部 MCP 工具）。
+    ///
+    /// 重名不覆盖也不报错：注册表按名线性查找，重名只会让后注册的永远取不到。
+    /// 所以注入方必须保证名字带命名空间（`mcp__<server>__<tool>`），这里只如实全收。
+    #[must_use]
+    pub fn with_tools(mut self, tools: Vec<Box<dyn Tool>>) -> Self {
+        self.tools.extend(tools);
+        self
+    }
+
     /// 全部工具声明，按注册顺序。
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.tools.iter().map(|tool| tool.spec()).collect()
     }
 
     /// 工具名清单。
-    pub fn names(&self) -> Vec<&'static str> {
+    pub fn names(&self) -> Vec<&str> {
         self.tools.iter().map(|tool| tool.name()).collect()
     }
 
@@ -216,7 +229,8 @@ mod tests {
 
     #[test]
     fn core_registry_declares_the_eight_tools() {
-        let names = ToolRegistry::core().names();
+        let registry = ToolRegistry::core();
+        let names = registry.names();
         assert_eq!(names.len(), 8);
         for expected in [
             "read",

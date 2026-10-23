@@ -20,11 +20,11 @@ const MAX_BYTES: usize = 256 * 1024;
 pub struct EditTool;
 
 impl Tool for EditTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         NAME
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "把文件里的 old_text 替换成 new_text。old_text 必须在文件里**唯一**出现：找不到或出现多次都会失败，请补足上下文让锚点唯一。可传 expected_hash 做乐观锁。"
     }
 

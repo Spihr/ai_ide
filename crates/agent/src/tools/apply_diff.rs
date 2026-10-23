@@ -44,11 +44,11 @@ enum Mode<'a> {
 pub struct ApplyDiffTool;
 
 impl Tool for ApplyDiffTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         NAME
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "生成或应用 unified diff（不经过 shell）。给 `content` 就把它与磁盘现状的差异渲染成 unified diff 返回，不落盘；给 `patch` 就把补丁按 hunk 贴到文件上，`accept` 可只接受其中几块。上下文对不上返回 3003 冲突，且不会写出半成品。单文件上限 256 KiB。"
     }
 

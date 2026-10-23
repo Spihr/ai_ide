@@ -226,6 +226,19 @@ export type { GitCommitResult } from "./generated/GitCommitResult";
 export type { GitBranchesParams } from "./generated/GitBranchesParams";
 export type { GitBranchesResult } from "./generated/GitBranchesResult";
 export type { GitBranch } from "./generated/GitBranch";
+export type { McpServerInfo } from "./generated/McpServerInfo";
+export type { McpServersParams } from "./generated/McpServersParams";
+export type { McpServersResult } from "./generated/McpServersResult";
+export type { McpConnectParams } from "./generated/McpConnectParams";
+export type { McpConnectResult } from "./generated/McpConnectResult";
+export type { McpDisconnectParams } from "./generated/McpDisconnectParams";
+export type { McpDisconnectResult } from "./generated/McpDisconnectResult";
+export type { McpToolInfo } from "./generated/McpToolInfo";
+export type { McpToolsParams } from "./generated/McpToolsParams";
+export type { McpToolsResult } from "./generated/McpToolsResult";
+export type { McpCallParams } from "./generated/McpCallParams";
+export type { McpCallResult } from "./generated/McpCallResult";
+export type { McpContentBlock } from "./generated/McpContentBlock";
 
 // ---- 协议常量（与 Rust 侧保持一致的运行时镜像）----
 
@@ -326,6 +339,13 @@ export const Methods = {
     commit: "git.commit",
     branches: "git.branches",
   },
+  mcp: {
+    servers: "mcp.servers",
+    connect: "mcp.connect",
+    disconnect: "mcp.disconnect",
+    tools: "mcp.tools",
+    call: "mcp.call",
+  },
   event: {
     log: "core.log",
     workspaceChanged: "workspace.changed",
@@ -354,7 +374,7 @@ export const Methods = {
  * 含导出与分叉）、`checkpoint.*` 四项（快照 / 列表 / 回滚 / 删除）、
  * `permission.*` 两项（免问规则列表 / 撤销）与 `audit.list`（审计账本只读查询），
  * 再加 M6 切片一的 `terminal.*` 五项（PTY 会话的建 / 写 / 改尺寸 / 杀 / 列），
- * 共 56 项，与 Rust `methods::IMPLEMENTED` 逐项对齐。
+ * 共 61 项，与 Rust `methods::IMPLEMENTED` 逐项对齐。
  */
 export const IMPLEMENTED_METHODS = [
   Methods.core.hello,
@@ -413,6 +433,11 @@ export const IMPLEMENTED_METHODS = [
   Methods.git.stage,
   Methods.git.commit,
   Methods.git.branches,
+  Methods.mcp.servers,
+  Methods.mcp.connect,
+  Methods.mcp.disconnect,
+  Methods.mcp.tools,
+  Methods.mcp.call,
 ] as const;
 
 /**

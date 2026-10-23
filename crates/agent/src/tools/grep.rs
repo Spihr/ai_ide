@@ -17,11 +17,11 @@ const NAME: &str = "grep";
 pub struct GrepTool;
 
 impl Tool for GrepTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         NAME
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "在工作区文件内容里检索，返回 路径:行:列 + 该行预览。默认按字面量、忽略大小写；可用 includes/excludes 限定 glob。"
     }
 

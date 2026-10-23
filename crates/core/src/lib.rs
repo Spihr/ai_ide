@@ -57,6 +57,12 @@ pub mod llm_api;
 pub mod llm_runtime;
 /// 结构化日志（M5 任务 4）：JSONL 按天滚动 + 出口脱敏。
 pub mod logging;
+/// MCP 协议处理器（M7 切片二）：`mcp.servers` / `connect` / `disconnect` / `tools` / `call`。
+pub mod mcp_api;
+/// MCP 连接管理器（M7 切片二）：在 core state 里管多 Server 的活连接。
+pub mod mcp_manager;
+/// MCP 工具注入（M7 切片二）：把 Server 工具包成 `mcp__<server>__<tool>` 挂到 agent 注册表。
+pub mod mcp_tools;
 pub mod peer;
 pub mod permission_api;
 pub mod provider_api;
@@ -104,6 +110,23 @@ pub async fn run() -> Result<()> {
 
     // 启动即装载落盘目录：进程重启后 Provider 列表不丢（密钥需主进程重新注入）。
     llm_runtime::report_bootstrap(state.llm().bootstrap());
+
+    // MCP（M7 切片二）：读 `mcp.json`，把管理器交给状态。连接**是惰性的**——
+    // 这里只解析配置，不拉起任何 Server 子进程；真正的握手发生在 `mcp.connect`。
+    // 配置坏了也不致命：空表起步，`mcp.servers` 会如实汇报「没有可用 Server」。
+    match ai_ide_mcp::McpConfig::load_default() {
+        Ok(config) => {
+            let server_count = config.servers.len();
+            state.install_mcp(Arc::new(mcp_manager::McpManager::new(config)));
+            info!(servers = server_count, "MCP 管理器已就绪（连接惰性）");
+        }
+        Err(err) => {
+            warn!(error = %err, "mcp.json 解析失败，本次以空配置起步");
+            state.install_mcp(Arc::new(mcp_manager::McpManager::new(
+                ai_ide_mcp::McpConfig::default(),
+            )));
+        }
+    }
 
     // 会话库：与 `providers.json` 同目录。连不上不致命——工作区 / 模型 / Agent 能力
     // 照常可用，`session.*` 会如实返回 5002，而不是把消息悄悄丢掉。

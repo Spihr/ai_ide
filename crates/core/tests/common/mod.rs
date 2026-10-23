@@ -41,6 +41,14 @@ pub struct Core {
 impl Core {
     /// 启动内核，并把它的数据目录指到 `data_dir`。
     pub fn spawn(data_dir: &Path) -> Self {
+        Self::spawn_with_env(data_dir, &[])
+    }
+
+    /// 启动内核并追加环境变量。
+    ///
+    /// MCP 这类「配置文件路径由环境变量覆盖」的子系统必须走这条：否则内核会去读
+    /// 真实用户的 `%APPDATA%`，测试就会随开发机上的配置飘。
+    pub fn spawn_with_env(data_dir: &Path, envs: &[(&str, &str)]) -> Self {
         // 内核日志走 stderr。默认丢弃，免得污染测试输出；排查间歇性失败时，
         // 用 `AI_IDE_TEST_CORE_LOG=<文件或目录>` 把它落盘——「llm.error 到底报的是
         // 哪一类错误」这种问题，没有内核日志就只能靠反复复现去猜。
@@ -63,13 +71,16 @@ impl Core {
             None => Stdio::null(),
         };
 
-        let mut child = Command::new(env!("CARGO_BIN_EXE_ai-ide-core"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ai-ide-core"));
+        command
             .env("AI_IDE_DATA_DIR", data_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(stderr)
-            .spawn()
-            .expect("内核进程启动失败");
+            .stderr(stderr);
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        let mut child = command.spawn().expect("内核进程启动失败");
 
         let stdin = child.stdin.take().expect("stdin 可用");
         let stdout = child.stdout.take().expect("stdout 可用");

@@ -23,6 +23,8 @@ ai-ide-store = { workspace = true }
 ai-ide-terminal = { workspace = true }
 # M6 切片三：内核接线 Git（子进程在 crates/git，core 只做协议翻译与阻塞搬运）。
 ai-ide-git = { workspace = true }
+# M7 切片二：内核接线 MCP（连接管理器、`mcp.*` 处理、工具注入 agent 注册表）。
+ai-ide-mcp = { workspace = true }
 # `terminal.write` / `terminal.data` 的载荷是原始字节的 base64，core 侧负责编解码。
 base64 = { workspace = true }
 

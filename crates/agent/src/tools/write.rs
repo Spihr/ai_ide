@@ -15,11 +15,11 @@ const NAME: &str = "write";
 pub struct WriteTool;
 
 impl Tool for WriteTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         NAME
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "整体写入（覆盖）工作区内一个文件，父目录自动创建。可传 expected_hash 做乐观锁：与磁盘当前内容不一致即拒绝写入。"
     }
 

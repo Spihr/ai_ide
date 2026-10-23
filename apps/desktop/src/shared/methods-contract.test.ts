@@ -87,6 +87,11 @@ describe('协议常量', () => {
       gitStage: Methods.git.stage,
       gitCommit: Methods.git.commit,
       gitBranches: Methods.git.branches,
+      mcpServers: Methods.mcp.servers,
+      mcpConnect: Methods.mcp.connect,
+      mcpDisconnect: Methods.mcp.disconnect,
+      mcpTools: Methods.mcp.tools,
+      mcpCall: Methods.mcp.call,
       wsChanged: Methods.event.workspaceChanged,
       wsIndexed: Methods.event.workspaceIndexed,
       providerChanged: Methods.event.providerChanged,
@@ -159,6 +164,11 @@ describe('协议常量', () => {
       gitStage: 'git.stage',
       gitCommit: 'git.commit',
       gitBranches: 'git.branches',
+      mcpServers: 'mcp.servers',
+      mcpConnect: 'mcp.connect',
+      mcpDisconnect: 'mcp.disconnect',
+      mcpTools: 'mcp.tools',
+      mcpCall: 'mcp.call',
       wsChanged: 'workspace.changed',
       wsIndexed: 'workspace.indexed',
       providerChanged: 'provider.changed',
@@ -235,7 +245,12 @@ describe('协议常量', () => {
       'git.diff',
       'git.stage',
       'git.commit',
-      'git.branches'
+      'git.branches',
+      'mcp.servers',
+      'mcp.connect',
+      'mcp.disconnect',
+      'mcp.tools',
+      'mcp.call'
     ])
   })
 

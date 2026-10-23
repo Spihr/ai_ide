@@ -10,6 +10,7 @@ use crate::audit_api;
 use crate::checkpoint_api;
 use crate::git_api;
 use crate::llm_api;
+use crate::mcp_api;
 use crate::peer::Peer;
 use crate::permission_api;
 use crate::provider_api;
@@ -143,6 +144,14 @@ async fn handle_request(peer: &Peer, state: &AppState, req: Request) {
         methods::git::STAGE => git_api::stage(peer, state, &req).await,
         methods::git::COMMIT => git_api::commit(peer, state, &req).await,
         methods::git::BRANCHES => git_api::branches(peer, state, &req).await,
+
+        // MCP（M7 切片二）：连接由 core state 的管理器统一持有，每次调用现查活连接，
+        // 因此「断连后工具自动下架」不需要额外清理逻辑——查不到就是不存在。
+        methods::mcp::SERVERS => mcp_api::servers(peer, state, &req).await,
+        methods::mcp::CONNECT => mcp_api::connect(peer, state, &req).await,
+        methods::mcp::DISCONNECT => mcp_api::disconnect(peer, state, &req).await,
+        methods::mcp::TOOLS => mcp_api::tools(peer, state, &req).await,
+        methods::mcp::CALL => mcp_api::call(peer, state, &req).await,
 
         other => {
             warn!(method = %other, "未实现的方法");

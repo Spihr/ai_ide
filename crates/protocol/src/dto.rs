@@ -2389,6 +2389,206 @@ pub struct GitBranchesResult {
     pub branches: Vec<GitBranch>,
 }
 
+// ---------------------------------------------------------------------------
+// MCP（M7 切片二：`mcp.*`）
+// ---------------------------------------------------------------------------
+
+/// 一个 MCP Server 的运行期视图。
+///
+/// `configured` 与 `connected` 是两件事：`mcp.json` 里写着（可连），不等于连上了
+/// （可用）。外壳据此区分「点一下连接」和「点一下断开」。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct McpServerInfo {
+    /// Server 名（`mcp.json` 里的 key）。
+    pub name: String,
+    /// 传输类型：`stdio` / `http` / `sse`。
+    pub transport: String,
+    /// 是否在配置里（`false` 只可能出现在「配置被改掉但连接还在」的短暂状态）。
+    pub configured: bool,
+    /// 是否已连接且可用。
+    pub connected: bool,
+    /// 连接状态原样透传：`configured` / `connecting` / `ready` / `stale` / `closed`。
+    pub state: String,
+    /// 已发现的工具数量。
+    pub tool_count: u32,
+    /// 最近一次失败原因（成功则为 `null`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub last_error: Option<String>,
+}
+
+/// `mcp.servers` 参数：空对象即可，保留占位以便后续加过滤条件。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct McpServersParams {}
+
+/// `mcp.servers` 响应结果。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct McpServersResult {
+    /// 已配置 ∪ 已连接的 Server，按名字升序。
+    pub servers: Vec<McpServerInfo>,
+}
+
+/// `mcp.connect` 参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct McpConnectParams {
+    /// 要连接的 Server 名（必须是 `mcp.json` 里的 key）。
+    pub server: String,
+}
+
+/// 一个可注入 agent 的 MCP 工具。
+///
+/// `input_schema` 是 Server 的 `inputSchema` **原样**透传：它在两侧都是 JSON Schema，
+/// 任何「规整」都会让模型的入参校验与 Server 的校验错位。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct McpToolInfo {
+    /// 工具在 Server 内的原始名。
+    pub name: String,
+    /// 注入 agent 注册表时用的全名：`mcp__<server>__<tool>`。
+    pub namespaced_name: String,
+    /// 所属 Server。
+    pub server: String,
+    /// 给模型看的说明（来自 Server，可能为空）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub description: Option<String>,
+    /// 入参 JSON Schema，原样透传。
+    pub input_schema: serde_json::Value,
+}
+
+/// `mcp.connect` 响应结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct McpConnectResult {
+    /// 连上的 Server。
+    pub server: String,
+    /// 实际使用的传输类型。
+    pub transport: String,
+    /// 握手协商出的协议版本（Server 未回报时为 `null`）。
+    pub protocol_version: Option<String>,
+    /// 发现到的工具数量。
+    pub tool_count: u32,
+    /// 发现到的工具清单（已带命名空间）。
+    pub tools: Vec<McpToolInfo>,
+}
+
+/// `mcp.disconnect` 参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct McpDisconnectParams {
+    /// 要断开的 Server 名。
+    pub server: String,
+}
+
+/// `mcp.disconnect` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct McpDisconnectResult {
+    /// 被断开（或本就未连接）的 Server。
+    pub server: String,
+    /// 本次调用是否真的关掉了一条连接。
+    ///
+    /// `false` 表示「本来就是断开状态」——幂等，不当错误。
+    pub closed: bool,
+    /// 断开后从注册表下架的工具数量。
+    pub removed_tools: u32,
+}
+
+/// `mcp.tools` 参数。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct McpToolsParams {
+    /// 只看某个 Server；缺省返回全部已连接 Server 的工具。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub server: Option<String>,
+}
+
+/// `mcp.tools` 响应结果。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct McpToolsResult {
+    /// 工具清单，按 Server 名、工具名升序。
+    pub tools: Vec<McpToolInfo>,
+}
+
+/// `mcp.call` 参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct McpCallParams {
+    /// 目标 Server 名；`tool` 若已是 `mcp__<server>__<tool>` 全名则可省略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub server: Option<String>,
+    /// 工具名：原始名或带命名空间的全名都接受。
+    pub tool: String,
+    /// 入参对象；缺省为空对象。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub arguments: Option<serde_json::Value>,
+}
+
+/// MCP 工具返回的一块内容。
+///
+/// 不照搬 MCP 的带标签联合体：内核协议用「`kind` + 按需字段」的平铺形态，
+/// 外壳与 TS 侧都不必为了一个图片块去写判别式。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct McpContentBlock {
+    /// 块类型：`text` / `image` / `audio` / `resource` / `resource_link`。
+    pub kind: String,
+    /// 文本内容（`kind = text` 时）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub text: Option<String>,
+    /// base64 数据（图片 / 音频）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub data: Option<String>,
+    /// MIME 类型。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub mime_type: Option<String>,
+    /// 资源 URI（资源链接 / 内嵌资源）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub uri: Option<String>,
+    /// 展示名（资源链接）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub name: Option<String>,
+    /// 内嵌资源原文。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub resource: Option<serde_json::Value>,
+}
+
+/// `mcp.call` 响应结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct McpCallResult {
+    /// 实际执行调用的 Server。
+    pub server: String,
+    /// 工具原始名。
+    pub tool: String,
+    /// 带命名空间的工具全名。
+    pub namespaced_name: String,
+    /// 内容块，原样透传（文本 / 图片 / 资源）。
+    pub content: Vec<McpContentBlock>,
+    /// 文本块拼成的正文：与注入 agent 时回灌给模型的内容一致。
+    pub text: String,
+    /// 工具**执行**失败（不是协议失败）。这种情况仍是成功响应。
+    pub is_error: bool,
+    /// 结构化输出（Server 支持时）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub structured_content: Option<serde_json::Value>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -25,6 +25,9 @@ export default tseslint.config(
       'coverage/**',
       // ts-rs 生成物：由 scripts/gen-types.mjs 产出，禁手改，故不参与 lint
       'packages/shared-types/src/generated/**',
+      // 插件系统原型（远端 1ba344b 引入的独立 demo，尚未接线、不属产品源码），
+      // 其脚本不纳入产品门禁；正式接线时再按 packages/* 规则整改。
+      'demo-plugin-system/**',
     ],
   },
 

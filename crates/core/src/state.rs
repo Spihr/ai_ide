@@ -6,6 +6,7 @@
 use crate::agent_api::AgentHub;
 use crate::llm_api::StreamHub;
 use crate::llm_runtime::{default_store_path, LlmRuntime};
+use crate::mcp_manager::McpManager;
 use crate::peer::Peer;
 use ai_ide_git::GitService;
 use ai_ide_indexer::FileIndex;
@@ -53,6 +54,12 @@ pub struct AppState {
     /// 用 `OnceLock` 而不是 `Mutex<Option<..>>`：它只写一次，写入发生在开始读 stdin
     /// 之前；读侧因此不必上锁，`session.*` 也就不会因为拿锁而排在同一条队列里。
     store: OnceLock<Store>,
+    /// MCP 连接管理器（M7 切片二）。同样是「只装一次」的进程级资源：管理器内部
+    /// 已用 `RwLock` 管多 Server 的活连接，这里只保证句柄唯一。
+    ///
+    /// 用 `OnceLock` 而非字段直挂，是为了让「内核没装载 MCP」（单测、精简构建）
+    /// 成为一个**显式状态**：`mcp.*` 会如实回空表 / 8001，而不是 panic 或假装成功。
+    mcp: OnceLock<Arc<McpManager>>,
 }
 
 impl Default for AppState {
@@ -77,6 +84,7 @@ impl AppState {
             terminals: Arc::new(TerminalManager::new()),
             git: Arc::new(GitService::new()),
             store: OnceLock::new(),
+            mcp: OnceLock::new(),
         }
     }
 
@@ -120,6 +128,17 @@ impl AppState {
     /// 此时 `session.*` 如实返回 5002 而不是假装成功。
     pub fn store(&self) -> Option<&Store> {
         self.store.get()
+    }
+
+    /// 装上 MCP 连接管理器（M7 切片二）。重复调用保留第一次装上的那份——
+    /// 换掉它会让已建立的 Server 连接失去归属（子进程变成孤儿）。
+    pub fn install_mcp(&self, manager: Arc<McpManager>) {
+        let _ = self.mcp.set(manager);
+    }
+
+    /// MCP 连接管理器；未装载时为 `None`，此时 `mcp.*` 如实回空表或 8001。
+    pub fn mcp(&self) -> Option<&Arc<McpManager>> {
+        self.mcp.get()
     }
 
     /// 换上一个现成的模型接入运行时。

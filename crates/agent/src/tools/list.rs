@@ -17,11 +17,11 @@ const NAME: &str = "list";
 pub struct ListTool;
 
 impl Tool for ListTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         NAME
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "列出工作区内一个目录的条目（目录优先、再按名称排序）。默认只列一层，depth 可递归，上限 8 层；忽略规则命中的条目会被过滤。"
     }
 

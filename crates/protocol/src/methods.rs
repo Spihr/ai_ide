@@ -160,6 +160,26 @@ pub mod git {
     pub const BRANCHES: &str = "git.branches";
 }
 
+/// MCP 连接与工具（M7 切片二）。
+///
+/// 这一域把事情分成「连接管理」与「调用」两半：`servers` / `connect` / `disconnect` /
+/// `tools` 面向外壳的服务器面板，`call` 面向要执行工具的一方。注入 agent 的
+/// `mcp__<server>__<tool>` 工具最终也落到同一条 `tools/call` 路径上，不另开方法。
+///
+/// 不新增事件：连接状态变化由发起方（面板）在 `connect` / `disconnect` 的响应里获得。
+pub mod mcp {
+    /// 已配置 ∪ 已连接的 Server 清单与连接状态。
+    pub const SERVERS: &str = "mcp.servers";
+    /// 连接一个 `mcp.json` 里的 Server，并拉取它的工具清单。
+    pub const CONNECT: &str = "mcp.connect";
+    /// 断开一个 Server（幂等），并把它的工具从 agent 注册表下架。
+    pub const DISCONNECT: &str = "mcp.disconnect";
+    /// 列出已连接 Server 的工具（带 `mcp__<server>__<tool>` 全名）。
+    pub const TOOLS: &str = "mcp.tools";
+    /// 调用一个 MCP 工具（原始名或全名都接受）。
+    pub const CALL: &str = "mcp.call";
+}
+
 /// Core → Main 的通知（事件）。
 pub mod event {
     /// 内核日志转发，便于 Main 侧统一落盘。
@@ -273,6 +293,12 @@ pub const IMPLEMENTED: &[&str] = &[
     git::STAGE,
     git::COMMIT,
     git::BRANCHES,
+    // M7 切片二：MCP 连接与工具（实现在 `crates/mcp`，dispatch 已接线）。
+    mcp::SERVERS,
+    mcp::CONNECT,
+    mcp::DISCONNECT,
+    mcp::TOOLS,
+    mcp::CALL,
 ];
 
 /// 协议面**已定义、但内核尚未接线**的方法。
@@ -294,7 +320,7 @@ mod tests {
 
     #[test]
     fn implemented_list_covers_core_m1_m2_agent_domains() {
-        assert_eq!(IMPLEMENTED.len(), 56);
+        assert_eq!(IMPLEMENTED.len(), 61);
         assert!(IMPLEMENTED.contains(&"core.ping"));
         assert!(IMPLEMENTED.contains(&"$/cancelRequest"));
         assert!(IMPLEMENTED.contains(&"workspace.read_file"));
@@ -353,6 +379,18 @@ mod tests {
         }
         assert_eq!(git::STATUS, "git.status");
         assert_eq!(git::BRANCHES, "git.branches");
+        // M7 切片二：MCP 五个方法进清单，且不复用终端的 6xxx 段。
+        for name in [
+            mcp::SERVERS,
+            mcp::CONNECT,
+            mcp::DISCONNECT,
+            mcp::TOOLS,
+            mcp::CALL,
+        ] {
+            assert!(IMPLEMENTED.contains(&name), "{name} 应已接线");
+        }
+        assert_eq!(mcp::SERVERS, "mcp.servers");
+        assert_eq!(mcp::CALL, "mcp.call");
     }
 
     #[test]
@@ -382,7 +420,7 @@ mod tests {
         all.sort_unstable();
         all.dedup();
         assert_eq!(all.len(), total, "两张表不得有重叠");
-        assert_eq!(total, 56, "应恰好覆盖协议里定义的全部 56 个请求方法");
+        assert_eq!(total, 61, "应恰好覆盖协议里定义的全部 61 个请求方法");
     }
 
     #[test]

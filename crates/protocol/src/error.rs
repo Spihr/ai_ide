@@ -12,6 +12,7 @@
 //! | `5xxx` | 会话持久化 |
 //! | `6xxx` | 终端会话 |
 //! | `7xxx` | Git 操作 |
+//! | `8xxx` | MCP 连接与工具 |
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -93,6 +94,27 @@ impl ErrorCode {
     pub const GIT_INVALID_PARAMS: Self = Self(7004);
     /// 没有可提交的变更（暂存区为空且未 `--allow-empty`）。
     pub const GIT_NOTHING_TO_COMMIT: Self = Self(7005);
+
+    // ---------- 8xxx MCP ----------
+    /// Server 名不在 `mcp.json` 里：写错了名字，或配置文件根本没装载。
+    ///
+    /// 与 [`Self::MCP_CONNECT_FAILED`] 分开是因为处置完全不同：这一条要用户改配置，
+    /// 重连多少次都一样；那一条往往重试一次就能好。
+    pub const MCP_SERVER_UNKNOWN: Self = Self(8001);
+    /// 连接建立失败：子进程起不来、握手被拒、HTTP 非 2xx、协议版本不兼容。
+    pub const MCP_CONNECT_FAILED: Self = Self(8002);
+    /// Server 未连接（从未连、已断开、已被 `mcp.disconnect` 下线）就发起调用。
+    pub const MCP_NOT_CONNECTED: Self = Self(8003);
+    /// 工具不在该 Server 最近一次 `tools/list` 的结果里——模型编了个不存在的工具名。
+    pub const MCP_TOOL_NOT_FOUND: Self = Self(8004);
+    /// 调用失败：传输中断、Server 返回 JSON-RPC error、响应不合契约。
+    ///
+    /// 注意「工具自己执行失败」不走这里：那是 `result.is_error = true` 的正常结果。
+    pub const MCP_CALL_FAILED: Self = Self(8005);
+    /// 单次请求超时（连接或调用），`data.timeout_ms` 带预算。
+    pub const MCP_TIMEOUT: Self = Self(8006);
+    /// 参数不可用：命名空间拆不开、`arguments` 不是对象、Server 名非法。
+    pub const MCP_INVALID_PARAMS: Self = Self(8007);
 
     pub const fn as_i32(self) -> i32 {
         self.0
@@ -214,5 +236,35 @@ mod tests {
         assert!(!ErrorCode::STORE_UNAVAILABLE.is_standard());
         assert!(!ErrorCode::STORE_ERROR.is_standard());
         assert_eq!(ErrorCode::SESSION_NOT_FOUND.as_i32(), 5001);
+    }
+
+    /// MCP 错误码独立占 8xxx 段：既不能落进 JSON-RPC 标准码区间，
+    /// 也不能和终端占用的 6001-6004 撞号——前端按段分流，撞号会走错提示。
+    #[test]
+    fn mcp_error_codes_use_their_own_8xxx_band() {
+        let codes = [
+            ErrorCode::MCP_SERVER_UNKNOWN,
+            ErrorCode::MCP_CONNECT_FAILED,
+            ErrorCode::MCP_NOT_CONNECTED,
+            ErrorCode::MCP_TOOL_NOT_FOUND,
+            ErrorCode::MCP_CALL_FAILED,
+            ErrorCode::MCP_TIMEOUT,
+            ErrorCode::MCP_INVALID_PARAMS,
+        ];
+        for (index, code) in codes.iter().enumerate() {
+            let raw = code.as_i32();
+            assert!((8001..=8099).contains(&raw), "{raw} 不在 8xxx 段");
+            assert!(!code.is_standard(), "{raw} 不该被当成标准码");
+            assert!(
+                !(6001..=6004).contains(&raw),
+                "{raw} 与终端占用的 6001-6004 撞号"
+            );
+            assert!(
+                !codes[..index].contains(code),
+                "{raw} 重复定义，同段内码值必须唯一"
+            );
+        }
+        assert_eq!(ErrorCode::MCP_SERVER_UNKNOWN.as_i32(), 8001);
+        assert_eq!(ErrorCode::MCP_INVALID_PARAMS.as_i32(), 8007);
     }
 }

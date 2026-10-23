@@ -16,11 +16,11 @@ const NAME: &str = "create";
 pub struct CreateTool;
 
 impl Tool for CreateTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         NAME
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "在工作区里新建文件或目录（父目录自动补齐），已存在则报错。只建位置，不写内容；要写内容请用 write。"
     }
 

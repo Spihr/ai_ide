@@ -19,11 +19,11 @@ pub const MAX_LINES: usize = 2_000;
 pub struct ReadTool;
 
 impl Tool for ReadTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         NAME
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "读取工作区内一个文件，返回带行号的文本。单次最多 2000 行 / 256 KiB，超出会在标签上标 truncated=lines|bytes。"
     }
 
