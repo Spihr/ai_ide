@@ -606,6 +606,116 @@ impl<'a> NewPermissionRule<'a> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 插件账本
+// ---------------------------------------------------------------------------
+
+/// 插件生命周期状态取值（`plugin.status` 列）。
+///
+/// 用常量模块而不是枚举：这一列的值会落库，读到未知值（降级安装、旧版本残留）
+/// 时应当照原样展示，而不是在反序列化处直接炸掉。P1 只会写入前两档。
+pub mod plugin_status {
+    /// 已安装且能力齐备（P1 安装成功即此态，因为 P1 从不加载）。
+    pub const INSTALLED: &str = "installed";
+    /// 已装但能力有新增未授权：P2 起进程前必须让用户重新点一次（docs/14 §5.4）。
+    pub const NEEDS_GRANT: &str = "needs_grant";
+    /// 已加载运行（P2 使用）。
+    pub const READY: &str = "ready";
+    /// 曾崩溃，等待用户决定是否重启（P2 使用）。
+    pub const CRASHED: &str = "crashed";
+}
+
+/// 一行插件账本（`plugin` 表）。
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct PluginRecord {
+    /// 清单 id，兼作主键与安装目录名。
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub description: Option<String>,
+    /// 清单声明的宿主 API 版本。
+    pub plugin_api: String,
+    /// 归一化后的包内相对入口。
+    pub main: String,
+    /// 安装后的绝对目录。
+    pub install_dir: String,
+    /// 归一化清单全量 JSON。
+    pub manifest_json: String,
+    /// 能力列表 JSON（数组）。
+    pub capabilities_json: String,
+    /// 命令列表 JSON（数组）。
+    pub commands_json: String,
+    /// 事件订阅 JSON（数组）。
+    pub subscriptions_json: String,
+    /// 工具数量（列表页免解析 manifest）。
+    pub tool_count: i64,
+    /// 见 [`plugin_status`]。
+    pub status: String,
+    pub last_error: Option<String>,
+    pub restarts: i64,
+    pub installed_at: i64,
+    pub updated_at: i64,
+}
+
+impl PluginRecord {
+    /// 是否处于「装了但不能跑」的状态：需要用户补授权。
+    pub fn needs_grant(&self) -> bool {
+        self.status == plugin_status::NEEDS_GRANT
+    }
+
+    /// 是否在运行（P2 才有意义；P1 恒为 false）。
+    pub fn is_ready(&self) -> bool {
+        self.status == plugin_status::READY
+    }
+}
+
+/// 写入/更新插件的入参。
+#[derive(Debug, Clone, Copy)]
+pub struct NewPlugin<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
+    pub version: &'a str,
+    pub description: Option<&'a str>,
+    pub plugin_api: &'a str,
+    pub main: &'a str,
+    pub install_dir: &'a str,
+    pub manifest_json: &'a str,
+    pub capabilities_json: &'a str,
+    pub commands_json: &'a str,
+    pub subscriptions_json: &'a str,
+    pub tool_count: i64,
+    /// 见 [`plugin_status`]。
+    pub status: &'a str,
+    /// 显式指定安装时间（测试造数据用）；`None` 表示取 [`now_millis`]。
+    pub installed_at: Option<i64>,
+}
+
+/// 一行能力授权（`plugin_capability` 表）。
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct PluginCapability {
+    pub plugin_id: String,
+    pub capability: String,
+    /// SQLite 没有布尔类型，1/0 落地，读出来再转。
+    pub granted: i64,
+    pub granted_at: Option<i64>,
+}
+
+impl PluginCapability {
+    pub fn is_granted(&self) -> bool {
+        self.granted != 0
+    }
+}
+
+/// 写入一条能力申请的入参。
+#[derive(Debug, Clone, Copy)]
+pub struct NewPluginCapability<'a> {
+    pub plugin_id: &'a str,
+    pub capability: &'a str,
+    pub granted: bool,
+    /// 授权时间（Unix 毫秒）；未授权传 `None`。
+    pub granted_at: Option<i64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -37,6 +37,7 @@ dependencies = [
  "ai-ide-indexer",
  "ai-ide-llm",
  "ai-ide-mcp",
+ "ai-ide-plugin",
  "ai-ide-protocol",
  "ai-ide-store",
  "ai-ide-terminal",
@@ -103,6 +104,16 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ai-ide-plugin"
+version = "0.1.0"
+dependencies = [
+ "ai-ide-protocol",
+ "serde",
+ "serde_json",
  "tracing",
 ]
 

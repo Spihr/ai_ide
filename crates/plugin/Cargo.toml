@@ -1,0 +1,14 @@
+[package]
+name = "ai-ide-plugin"
+description = "插件系统 P1：清单三段校验、安装目录与包复制（不启动插件进程）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# 错误码（6104/6107/6108）直接复用协议定义，避免在插件侧再抄一份数字。
+ai-ide-protocol = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }

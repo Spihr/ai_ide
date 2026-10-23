@@ -25,6 +25,8 @@ ai-ide-terminal = { workspace = true }
 ai-ide-git = { workspace = true }
 # M7 切片二：内核接线 MCP（连接管理器、`mcp.*` 处理、工具注入 agent 注册表）。
 ai-ide-mcp = { workspace = true }
+# M8 切片一：插件系统 P1（清单校验 + 安装落盘 + 账本），不含进程管理。
+ai-ide-plugin = { workspace = true }
 # `terminal.write` / `terminal.data` 的载荷是原始字节的 base64，core 侧负责编解码。
 base64 = { workspace = true }
 

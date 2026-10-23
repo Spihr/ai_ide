@@ -31,6 +31,10 @@ pub enum StoreError {
     #[error("消息不存在或不属于该会话：{0}")]
     MessageNotFound(String),
 
+    /// 插件账本行在写入后立即读不到：只可能是并发卸载，属于真实异常而非空值。
+    #[error("插件不存在：{0}")]
+    PluginNotFound(String),
+
     /// 单次导出 / 分叉的消息数超过上限：宁可明确报错，也不静默截断历史。
     #[error("消息过多：{count} 条，单次上限 {max} 条")]
     SessionTooLarge { count: i64, max: i64 },

@@ -55,8 +55,9 @@ pub mod store;
 
 pub use error::{Result, StoreError};
 pub use model::{
-    audit_actor, audit_kind, now_millis, AuditEvent, AuditFilter, AuditQuery, ForkOutcome, Message,
-    NewAuditEvent, NewMessage, NewPermissionRule, NewSession, PermissionRule, Session,
+    audit_actor, audit_kind, now_millis, plugin_status, AuditEvent, AuditFilter, AuditQuery,
+    ForkOutcome, Message, NewAuditEvent, NewMessage, NewPermissionRule, NewPlugin,
+    NewPluginCapability, NewSession, PermissionRule, PluginCapability, PluginRecord, Session,
     SessionQuery, MAX_FORK_MESSAGES,
 };
 pub use redact::{is_sensitive_key, mask_secret, redact_text, redact_value, MASK};

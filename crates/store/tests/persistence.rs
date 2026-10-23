@@ -18,10 +18,15 @@ async fn migrations_apply_on_open_and_tables_start_empty() {
     let store = Store::open_in_memory().await.expect("打开内存库");
 
     let applied = store.applied_migrations().await.expect("读取迁移记录");
-    assert_eq!(applied.len(), 3, "当前有会话 / 审计 / 权限规则三个迁移版本");
+    assert_eq!(
+        applied.len(),
+        4,
+        "当前有会话 / 审计 / 权限规则 / 插件账本四个迁移版本"
+    );
     assert_eq!(applied[0].0, 1);
     assert_eq!(applied[1].0, 2);
     assert_eq!(applied[2].0, 3);
+    assert_eq!(applied[3].0, 4);
 
     assert_eq!(store.count_sessions(None, None).await.unwrap(), 0);
     assert_eq!(store.count_messages("whatever").await.unwrap(), 0);
@@ -29,7 +34,7 @@ async fn migrations_apply_on_open_and_tables_start_empty() {
 
     // 迁移幂等：重复执行不报错、不重复记录。
     store.migrate().await.expect("重复迁移应幂等");
-    assert_eq!(store.applied_migrations().await.unwrap().len(), 3);
+    assert_eq!(store.applied_migrations().await.unwrap().len(), 4);
 }
 
 #[tokio::test]

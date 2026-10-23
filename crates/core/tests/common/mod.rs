@@ -259,6 +259,14 @@ impl Core {
             .collect()
     }
 
+    /// 内核子进程的 pid。
+    ///
+    /// 只给「这条链路有没有起进程」的用例用（如插件的 P1 验收「安装不产生进程」）：
+    /// 状态字段是内核自己报的，进程表是操作系统的，后者骗不了人。
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// 握手，返回能力清单。
     pub fn capabilities(&mut self) -> Vec<String> {
         let hello = self.ok(

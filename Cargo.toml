@@ -10,6 +10,8 @@ members = [
     "crates/terminal",
     "crates/git",
     "crates/mcp",
+    # M8 / 插件系统 P1：清单校验、安装目录与包复制（内核侧，不启动插件进程）。
+    "crates/plugin",
     "crates/core",
 ]
 
@@ -109,6 +111,8 @@ ai-ide-terminal = { path = "crates/terminal" }
 ai-ide-git = { path = "crates/git" }
 # M7 切片一：MCP 客户端（stdio / HTTP(SSE) 传输、握手、工具发现与调用）
 ai-ide-mcp = { path = "crates/mcp" }
+# 插件系统 P1：清单三段校验 + 安装目录/包复制（纯内核逻辑，spawn 留给 P2）
+ai-ide-plugin = { path = "crates/plugin" }
 
 [profile.release]
 lto = "thin"
