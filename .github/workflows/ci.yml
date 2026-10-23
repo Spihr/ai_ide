@@ -30,7 +30,23 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: 单元测试
-        run: cargo test --workspace
+        # 内核 stderr 默认被测试脚手架丢弃，偶发失败时（如 5002「会话库未就绪」）
+        # 日志里只剩一句笼统的断言失败，根本看不出真实错误。这里显式指定落盘目录，
+        # 失败时由下一步上传——目录必须先建好，脚手架检测到是目录才会按进程分文件。
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:AI_IDE_TEST_CORE_LOG" | Out-Null
+          cargo test --workspace
+        env:
+          AI_IDE_TEST_CORE_LOG: ${{ runner.temp }}\core-logs
+
+      - name: 上传内核日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-logs
+          path: ${{ runner.temp }}/core-logs
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: 构建内核
         run: cargo build -p ai-ide-core
