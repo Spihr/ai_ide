@@ -142,23 +142,36 @@ const RENDERER_ALLOWED = new Set<string>([
   Methods.mcp.tools,
   Methods.mcp.call,
 
-  // P1：插件。四条同样是「用户显式动作」的后果——打开插件视图才 `list`、点某个插件
-  // 看详情才 `status`、填好本地包目录按「安装」才 `install`、按「卸载」才 `uninstall`。
+  // P1：插件清单与安装。四条同样是「用户显式动作」的后果——打开插件视图才 `list`、
+  // 点某个插件看详情才 `status`、填好本地包目录按「安装」才 `install`、按「卸载」才
+  // `uninstall`。这四条拿不到「执行插件代码」的能力：`install` 只复制包目录与写账本
+  // （内核侧 `plugin_api::install` 全程 `spawn_blocking` 拷文件，**不启动任何进程**），
+  // `uninstall` 只删账本与安装目录。
   //
-  // 这里要交代清楚**没放行的那六个**（`load` / `unload` / `reload` / `call` /
-  // `grant` / `revoke`）：它们在协议方法表里、也还留在 `IMPLEMENTED_METHODS` 中，
-  // 但内核侧仍是 `6101` 空分支——P1 只做「清单与安装」，起子进程、签名授权都在
-  // P2/P4。白名单一旦提前放行，UI 就能发起一个必然失败、还会被用户当成「插件坏了」
-  // 的调用。这正是设计文档 §9 要求的「能力不虚报」：**实现对齐之后再加进来**，
-  // 而不是先开闸再补实现。
+  // P2：装载与握手。三条同样是「用户显式动作」的后果——点某行的「加载」才 `load`、
+  // 点「停止」才 `unload`、点「重载」才 `reload`。内核侧（`core/src/plugin_api.rs`）
+  // 已把三条换成真实现：起子进程、stdio 帧握手、工具注册/下架、崩溃巡检落账本。
   //
-  // 已放行的四条也守住了 P1 的边界：`install` 只复制包目录与写账本（内核侧
-  // `plugin_api::install` 全程 `spawn_blocking` 拷文件，**不启动任何进程**），
-  // `uninstall` 只删账本与安装目录，两条都拿不到「执行插件代码」的能力。
+  // 放行的边界要写清楚，否则「白名单里有 load」看起来像「UI 能自己跑任意代码」：
+  //
+  // - `load` 跑的是**用户自己装进来的包**，路径来自账本里的 `install_dir`；渲染进程
+  //   不能指定可执行文件、不能传命令行参数，协议参数只有一个 `plugin_id`。
+  // - 能力闸门在内核：清单申请的能力没授齐就返回 `6103` 且**不 spawn 进程**
+  //  （docs/14 §4.2 第 4 条）。外壳不参与授权判定，也没有「跳过授权」的入参。
+  // - 崩溃后的自动重启也由内核按上限（3 次）自己控；UI 上这两个按钮只是把「用户想
+  //   重来一次」这个意思传下去，没有轮询重试的路径。
+  //
+  // 仍然**没放行的三个**：`call`（P3 的调用网关）、`grant` / `revoke`（P4 的授权面）。
+  // 它们在协议方法表里、也还留在 `IMPLEMENTED_METHODS` 中，但内核侧仍是 `6101` 空分支。
+  // 白名单一旦提前放行，UI 就能发起一个必然失败、还会被用户当成「插件坏了」的调用。
+  // 这正是设计文档 §9 要求的「能力不虚报」：**实现对齐之后再加进来**。
   Methods.plugin.install,
   Methods.plugin.list,
   Methods.plugin.status,
-  Methods.plugin.uninstall
+  Methods.plugin.uninstall,
+  Methods.plugin.load,
+  Methods.plugin.unload,
+  Methods.plugin.reload
 ])
 
 export interface PolicyDecision {

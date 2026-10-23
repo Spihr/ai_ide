@@ -5,6 +5,10 @@
  * **6107 的 details 能不能被完整拆出来**——那是 P1 的验收点（一次列全所有清单
  * 问题），面板只负责渲染，拆不出来就等于没实现。
  *
+ * P2 补的是另外两件事：装载三条（`load` / `unload` / `reload`）的参数形状，以及
+ * 6102/6103/6105/6106 这几个「装载期错误」也得有人说人话——用户在面板上点「加载」
+ * 失败时，看到的不能是裸码。
+ *
  * 样式一律不测。
  */
 
@@ -43,6 +47,9 @@ function installHarness(): Call[] {
       }
       if (method === Methods.plugin.status) return { plugin: {}, tools: [], commands: [] }
       if (method === Methods.plugin.uninstall) return { plugin_id: 'x', removed_dir: true }
+      if (method === Methods.plugin.load) return { plugin: { name: 'x' }, tools: [] }
+      if (method === Methods.plugin.reload) return { plugin: { name: 'x' }, tools: [] }
+      if (method === Methods.plugin.unload) return { plugin_id: 'x', removed_tools: 0 }
       throw new Error(`测试收到了意外方法：${method}`)
     }
   } as unknown as AiIdeApi
@@ -63,13 +70,23 @@ describe('错误码解析', () => {
     expect(pluginErrorCode('[abc] 未知')).toBeNull()
   })
 
-  it('六个 P1 相关错误码都有对应的人话', () => {
-    for (const code of [6101, 6104, 6107, 6108, 5003, -32602]) {
+  it('P1/P2 相关错误码都有对应的人话', () => {
+    for (const code of [6101, 6102, 6103, 6104, 6105, 6106, 6107, 6108, 6109, 5003, -32602]) {
       expect(pluginHintForError(code).length, `${code} 缺少提示`).toBeGreaterThan(0)
     }
     // 未知码返回空串：调用方据此回落到原文，而不是硬凑一句解释
     expect(pluginHintForError(9999)).toBe('')
     expect(pluginHintForError(null)).toBe('')
+  })
+
+  it('装载期错误各自指向不同的补救动作', () => {
+    // 三条最容易混的：没授权 / 起不来 / 超时。文案必须能区分「去找授权」
+    // 「看清单和路径」「这台机器太慢或插件卡住」。
+    expect(pluginHintForError(6103)).toContain('授权')
+    expect(pluginHintForError(6105)).toContain('超时')
+    expect(pluginHintForError(6106)).toContain('协议')
+    const hints = new Set([6103, 6105, 6106].map((code) => pluginHintForError(code)))
+    expect(hints.size).toBe(3)
   })
 
   it('describePluginError 保留原文并拼上人话', () => {
@@ -165,42 +182,59 @@ describe('状态与能力标记', () => {
 })
 
 describe('API 封装', () => {
-  it('四个方法各发各的协议名与参数', async () => {
+  it('七个方法各发各的协议名与参数', async () => {
     const calls = installHarness()
 
     await pluginApi.list()
     await pluginApi.status('hello.world')
     await pluginApi.install('E:\\my-plugins\\hello')
     await pluginApi.uninstall('hello.world')
+    await pluginApi.load('hello.world')
+    await pluginApi.unload('hello.world')
+    await pluginApi.reload('hello.world')
 
     expect(calls.map((call) => call.method)).toEqual([
       Methods.plugin.list,
       Methods.plugin.status,
       Methods.plugin.install,
-      Methods.plugin.uninstall
+      Methods.plugin.uninstall,
+      Methods.plugin.load,
+      Methods.plugin.unload,
+      Methods.plugin.reload
     ])
     // 参数用协议里的字段名（snake_case），组件不自己拼
     expect(calls[1]?.params).toEqual({ plugin_id: 'hello.world' })
     expect(calls[2]?.params).toEqual({ path: 'E:\\my-plugins\\hello' })
     expect(calls[3]?.params).toEqual({ plugin_id: 'hello.world' })
+    // 装载三条只认 plugin_id：可执行文件与参数由账本里的 install_dir 决定，
+    // 渲染进程没有机会指向别的东西。
+    expect(calls[4]?.params).toEqual({ plugin_id: 'hello.world' })
+    expect(calls[5]?.params).toEqual({ plugin_id: 'hello.world' })
+    expect(calls[6]?.params).toEqual({ plugin_id: 'hello.world' })
   })
 
-  it('不碰 load / unload / reload / call / grant / revoke', async () => {
+  it('不碰 call / grant / revoke', async () => {
     const calls = installHarness()
     const allowed = new Set<string>([
       Methods.plugin.install,
       Methods.plugin.list,
       Methods.plugin.status,
-      Methods.plugin.uninstall
+      Methods.plugin.uninstall,
+      Methods.plugin.load,
+      Methods.plugin.unload,
+      Methods.plugin.reload
     ])
 
     await pluginApi.list()
     await pluginApi.status('x.y')
     await pluginApi.install('E:\\p')
     await pluginApi.uninstall('x.y')
+    await pluginApi.load('x.y')
+    await pluginApi.unload('x.y')
+    await pluginApi.reload('x.y')
 
     for (const call of calls) {
-      expect(allowed.has(call.method), `${call.method} 不该由 P1 面板发起`).toBe(true)
+      expect(allowed.has(call.method), `${call.method} 不该由当前面板发起`).toBe(true)
     }
   })
 })

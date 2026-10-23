@@ -41,6 +41,13 @@ granted_capabilities: Array<string>,
  */
 tool_count: number, 
 /**
+ * 崩溃重启次数，供面板提示「这个插件不稳定」。
+ *
+ * 只记**崩溃后重新装载**的次数：用户手动 `unload` / `reload` 不加。停在 0 表示
+ * 装好之后一次都没崩过，不是「没重启过」。
+ */
+restarts: number, 
+/**
  * 最近一次失败原因，供面板直接展示，不必让用户翻日志。
  */
 last_error?: string, };

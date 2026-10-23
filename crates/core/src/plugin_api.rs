@@ -823,6 +823,9 @@ fn summary_from_record(
         capabilities: requested.to_vec(),
         granted_capabilities: granted.to_vec(),
         tool_count: record.tool_count.max(0) as u32,
+        // 计数只在「崩溃后重新装载成功」时 +1（见 `load_into`），面板据此分辨
+        // 「刚装好」与「崩过 N 次、可能还要崩」。
+        restarts: record.restarts.max(0) as u32,
         last_error: record.last_error.clone(),
     }
 }

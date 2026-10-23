@@ -1,15 +1,25 @@
 /**
- * 插件面板（P1 外壳侧入口）：看已装清单、按本地目录安装、卸载。
+ * 插件面板（P1/P2 外壳侧入口）：看已装清单、按本地目录安装、装载/停止/重载、卸载。
  *
  * 分工与 `McpPanel` / `PermissionPanel` 一致：状态与动作在 `plugin-store`，这里只做
  * 「用户点了什么」的转发与确认交互。
  *
- * P1 的边界写进界面本身：清单合法、包已复制、账本已记账，但**没有启动任何进程**。
- * `load` / `grant` 之类的方法内核还回 `6101`，主进程白名单也没放行，所以这里
- * 不摆那些按钮——摆一个必然失败的「加载」，用户只会以为插件坏了。
+ * 按钮按账本状态给，不给「点了必然失败」的按钮：
+ *
+ * | 状态 | 能做什么 |
+ * | --- | --- |
+ * | `disabled`（装好没跑/手动停了） | 加载、卸载 |
+ * | `ready` | 停止、重载、卸载 |
+ * | `crashed` | 加载（重试）、重载、卸载；并显示崩溃原因与重启次数 |
+ * | `needs_grant` | 只有卸载；加载按钮置灰并说明「授权在 P4」——内核会直接回 6103 且不 spawn |
+ * | `loading` | 动作全置灰，等内核落账本 |
+ *
+ * `crashed` 的展示是 P2 的验收点：光有红色标记不够，得说清**为什么崩**（`last_error`
+ * 是内核写进账本的原话）与**崩过几次**（`restarts`，只统计崩溃后重新装载成功的次数，
+ * 上限 3 次）。用户据此判断「再点一次加载」还是「这插件得修」。
  *
  * 唯一的行内二次确认是**卸载**：它会删掉账本条目与安装目录，属于不可撤销的动作，
- * 第一下只把按钮变成「确认卸载」。
+ * 第一下只把按钮变成「确认卸载」。停止（`unload`）不删文件，所以不确认。
  */
 
 import { useEffect, useState } from 'react'
@@ -25,10 +35,13 @@ import {
   dismissPluginHint,
   initPlugins,
   installPlugin,
+  loadPlugin,
   refreshPlugins,
+  reloadPlugin,
   selectPlugin,
   setInstallPath,
   uninstallPlugin,
+  unloadPlugin,
   usePlugins
 } from '../plugin-store'
 
@@ -60,8 +73,9 @@ export function PluginPanel(): React.JSX.Element {
     <div className="ai-section" data-testid="plugin-panel">
       <h3 className="ai-section__title">插件</h3>
       <div className="ai-note">
-        P1 只做「清单与安装」：安装 = 校验清单 → 复制包目录 → 记账本，<strong>全程不启动进程</strong>。
-        加载、授权与工具调用要等 P2/P4，因此这里没有「启用」按钮——不是漏了，是还没实现。
+        安装 = 校验清单 → 复制包目录 → 记账本，<strong>不启动进程</strong>；点行内「加载」才起子进程并握手，
+        成功后工具才进模型可见的工具表。授权（P4）与工具调用（P3）还没开放，所以「待授权」的插件
+        暂不能加载。
       </div>
 
       <div className="ai-note">
@@ -182,8 +196,31 @@ export function PluginPanel(): React.JSX.Element {
                     ? '（带 ? 的是尚未授予）'
                     : ''}
                 </div>
-                {plugin.last_error != null ? (
-                  <div className="ai-result ai-result--bad">{plugin.last_error}</div>
+                {plugin.last_error != null && plugin.last_error.length > 0 ? (
+                  <div
+                    className="ai-result ai-result--bad"
+                    data-testid={`plugin-last-error-${plugin.id}`}
+                  >
+                    <strong>
+                      {plugin.state === 'crashed'
+                        ? '崩溃原因：'
+                        : plugin.state === 'needs_grant'
+                          ? '未装载原因：'
+                          : '最近一次错误：'}
+                    </strong>
+                    {plugin.last_error}
+                  </div>
+                ) : null}
+                {/*
+                  `restarts` 是「崩溃后重新装载成功」的次数，不是「重启过几次」：
+                  崩溃但没起来的尝试不算，手动重载也不算。停在 `crashed` 且计数已到
+                  3 次，说明内核的自动重启到顶了，只能人工查清单/代码。
+                */}
+                {plugin.state === 'crashed' || plugin.restarts > 0 ? (
+                  <div className="ai-list__meta" data-testid={`plugin-restarts-${plugin.id}`}>
+                    崩溃后已重新加载 {plugin.restarts} 次（内核自动重启上限 3 次；到顶后停在
+                    「已崩溃」，点「加载」可再试）
+                  </div>
                 ) : null}
                 <div className="ai-row">
                   <button
@@ -195,6 +232,54 @@ export function PluginPanel(): React.JSX.Element {
                   >
                     {isSelected ? '收起详情' : '详情'}
                   </button>
+                  {/*
+                    `needs_grant` 也摆一个「加载」，但**置灰**：内核会回 6103 且不 spawn
+                    （docs/14 §4.2 第 4 条），授权入口在 P4。摆而不点，比藏起来少一次困惑。
+                  */}
+                  {plugin.state === 'needs_grant' ? (
+                    <button
+                      className="ai-button ai-button--tiny"
+                      type="button"
+                      data-testid={`plugin-load-${plugin.id}`}
+                      disabled
+                      title="清单申请的能力还没授齐：内核会拒绝装载（6103），授权面板在 P4"
+                    >
+                      加载
+                    </button>
+                  ) : null}
+                  {plugin.state === 'disabled' || plugin.state === 'crashed' ? (
+                    <button
+                      className="ai-button ai-button--tiny"
+                      type="button"
+                      data-testid={`plugin-load-${plugin.id}`}
+                      disabled={busy}
+                      onClick={() => void loadPlugin(plugin.id)}
+                    >
+                      {busy && state.busyAction === 'load' ? '加载中…' : '加载'}
+                    </button>
+                  ) : null}
+                  {plugin.state === 'ready' ? (
+                    <button
+                      className="ai-button ai-button--tiny"
+                      type="button"
+                      data-testid={`plugin-unload-${plugin.id}`}
+                      disabled={busy}
+                      onClick={() => void unloadPlugin(plugin.id)}
+                    >
+                      {busy && state.busyAction === 'unload' ? '停止中…' : '停止'}
+                    </button>
+                  ) : null}
+                  {plugin.state === 'ready' || plugin.state === 'crashed' ? (
+                    <button
+                      className="ai-button ai-button--tiny"
+                      type="button"
+                      data-testid={`plugin-reload-${plugin.id}`}
+                      disabled={busy}
+                      onClick={() => void reloadPlugin(plugin.id)}
+                    >
+                      {busy && state.busyAction === 'reload' ? '重载中…' : '重载'}
+                    </button>
+                  ) : null}
                   <button
                     className="ai-button ai-button--tiny"
                     type="button"
@@ -202,7 +287,11 @@ export function PluginPanel(): React.JSX.Element {
                     disabled={busy}
                     onClick={() => onUninstall(plugin.id)}
                   >
-                    {busy ? '处理中…' : waiting ? '确认卸载' : '卸载'}
+                    {busy && state.busyAction === 'uninstall'
+                      ? '卸载中…'
+                      : waiting
+                        ? '确认卸载'
+                        : '卸载'}
                   </button>
                   {waiting ? (
                     <button

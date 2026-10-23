@@ -130,7 +130,6 @@ describe('checkRendererCall', () => {
 
   /*
    * P1 只放行「清单与安装」四条：装/卸/列/看详情都不执行插件代码。
-   * 加载与调用那六个方法内核还回 6101，主进程也不能提前开闸。
    */
   it('放行 P1 的插件安装与清单方法', () => {
     const methods = [
@@ -145,15 +144,21 @@ describe('checkRendererCall', () => {
     }
   })
 
-  it('不放行 P2/P4 才落地的插件方法（白名单不虚报能力）', () => {
-    const methods = [
-      Methods.plugin.load,
-      Methods.plugin.unload,
-      Methods.plugin.reload,
-      Methods.plugin.call,
-      Methods.plugin.grant,
-      Methods.plugin.revoke
-    ]
+  /*
+   * P2 放行「装载与握手」三条：内核侧已是真实现（起子进程 + stdio 帧握手）。
+   * 这三条是白名单里唯一会「执行插件代码」的入口，所以放行的前提写在这里：
+   * 参数只有 `plugin_id`（不能指定可执行文件/命令行），能力闸门与重启上限都在内核。
+   */
+  it('放行 P2 的插件装载方法', () => {
+    const methods = [Methods.plugin.load, Methods.plugin.unload, Methods.plugin.reload]
+
+    for (const method of methods) {
+      expect(checkRendererCall(method).allowed, `${method} 应被放行`).toBe(true)
+    }
+  })
+
+  it('不放行 P3/P4 才落地的插件方法（白名单不虚报能力）', () => {
+    const methods = [Methods.plugin.call, Methods.plugin.grant, Methods.plugin.revoke]
 
     for (const method of methods) {
       const decision = checkRendererCall(method)
@@ -250,8 +255,11 @@ describe('checkRendererCall', () => {
       'permission.revoke',
       'plugin.install',
       'plugin.list',
+      'plugin.load',
+      'plugin.reload',
       'plugin.status',
       'plugin.uninstall',
+      'plugin.unload',
       'provider.delete',
       'provider.list',
       'provider.test',
