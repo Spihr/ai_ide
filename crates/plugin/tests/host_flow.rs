@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use ai_ide_plugin::{
-    host::{Handshake, Host, LoadError, LoadSpec},
+    host::{Handshake, Host, LoadError, LoadSpec, Restart, MAX_AUTO_RESTARTS},
     manifest::validate,
     ValidatedManifest,
 };
@@ -70,6 +70,48 @@ fn package(dir: &Path, tools: &[&str], entry_source: &str) -> ValidatedManifest 
 
 /// 一个会握手、并可选「过一会儿自己死」的插件脚本。
 fn script(tools: &[&str], api_major: u32, die_after_ms: Option<u64>) -> String {
+    let die = die_after_ms
+        .map(|ms| format!("setTimeout(() => process.exit(7), {ms});"))
+        .unwrap_or_default();
+    script_with(tools, api_major, &die)
+}
+
+/// 带「失败模式」的插件脚本：用入口目录里的 `.starts` 文件数每次启动次数，
+/// 好让测试脚本化地表达「只崩第一次」「每次起都崩」「第一次崩、之后握手漂移」。
+///
+/// - `recover`：第一次握手成功后自杀，之后正常常驻（用来验自动恢复）；
+/// - `dead`：除第一次外每次启动立刻退出（用来验重启到顶）；
+/// - `drift`：第一次握手成功后自杀，之后握手多报一个清单里没有的工具
+///   （确定性失败，用来验不重试）。
+fn stateful_script(tools: &[&str], mode: &str) -> String {
+    let head = format!(
+        r#"const fs = require('node:fs')
+const path = require('node:path')
+const MODE = {mode:?}
+const counterFile = path.join(__dirname, '.starts')
+let seen = 0
+try {{ seen = parseInt(fs.readFileSync(counterFile, 'utf8'), 10) || 0 }} catch (e) {{}}
+seen += 1
+fs.writeFileSync(counterFile, String(seen))
+if (MODE === 'dead' && seen > 1) {{ process.exit(7) }}
+"#
+    );
+    // 每次只崩第一次：握手落定后再退，崩溃检测才有机会看到「装着装着就没了」。
+    let die = "if (seen === 1) { setTimeout(() => process.exit(7), 120); }";
+    let base = script_with(tools, 1, die);
+    if mode == "drift" {
+        // 在握手回包的工具列表后面塞一个清单里没有的工具（靠追加到数组实现）。
+        let drift = base.replace(
+            "tools: TOOLS,",
+            "tools: seen > 1 ? TOOLS.concat([{ name: 'ghost', description: '清单里没有的工具', risk: 'read', parameters: { type: 'object' } }]) : TOOLS,",
+        );
+        format!("{head}{drift}")
+    } else {
+        format!("{head}{base}")
+    }
+}
+
+fn script_with(tools: &[&str], api_major: u32, die: &str) -> String {
     let tool_list = tools
         .iter()
         .map(|name| {
@@ -79,9 +121,6 @@ fn script(tools: &[&str], api_major: u32, die_after_ms: Option<u64>) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ");
-    let die = die_after_ms
-        .map(|ms| format!("setTimeout(() => process.exit(7), {ms});"))
-        .unwrap_or_default();
     format!(
         r#"
 const readline = require('node:readline')
@@ -270,6 +309,161 @@ async fn crashed_plugin_is_reaped_and_reported() {
         "下架清单要能告诉上层摘掉哪些工具"
     );
     assert!(!host.is_running("demo-node"), "崩溃后不应再算在跑");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 等宿主看到「进程已退出」，最多 ~3s；拿不到就返回空。
+async fn wait_crashed(host: &Host) -> Vec<String> {
+    for _ in 0..100 {
+        let ids = host.crashed_ids();
+        if !ids.is_empty() {
+            return ids;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    Vec::new()
+}
+
+#[tokio::test]
+async fn crash_then_auto_restart_brings_tools_back() {
+    if !node_ready() {
+        eprintln!("跳过：本机没有 node");
+        return;
+    }
+    let dir = scratch("restart-ok");
+    let validated = package(&dir, &["echo"], &stateful_script(&["echo"], "recover"));
+    let host = Host::new();
+
+    let first = host
+        .load(spec(&dir, &validated, &["fs.read"]))
+        .await
+        .expect("首装应握手成功");
+    assert!(first.pid.is_some());
+
+    let crashed = wait_crashed(&host).await;
+    assert_eq!(crashed, vec!["demo-node".to_string()], "进程应被判死");
+    // 崩溃的那一刻工具就不再可路由：这是「崩溃 → 工具立即下架」。
+    assert!(
+        host.running_tools("demo-node").is_empty(),
+        "崩溃后不应还有工具在架上"
+    );
+
+    match host.auto_restart("demo-node").await {
+        Restart::Recovered { loaded, attempts } => {
+            assert_eq!(attempts, 1, "第二次启动就成功了，只该用掉 1 次预算");
+            assert!(!loaded.reused, "自动重启是新起的进程，不是复用");
+            assert_ne!(loaded.pid, first.pid, "重启必须换一个新进程");
+            assert_eq!(
+                loaded.namespaced_tools,
+                vec!["plugin__demo-node__echo".to_string()],
+                "重启后工具要重新上架"
+            );
+        }
+        other => panic!("期望自动重启成功，实际 {other:?}"),
+    }
+    assert!(host.is_running("demo-node"), "重启成功后应算在跑");
+    assert_eq!(
+        host.running_tools("demo-node"),
+        vec!["plugin__demo-node__echo".to_string()],
+        "重启后工具应可路由"
+    );
+    assert!(host.crashed_ids().is_empty(), "恢复后不该再被判死");
+
+    host.shutdown_all().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn auto_restart_stops_at_limit_and_says_so() {
+    if !node_ready() {
+        eprintln!("跳过：本机没有 node");
+        return;
+    }
+    let dir = scratch("restart-limit");
+    let validated = package(&dir, &["echo"], &stateful_script(&["echo"], "dead"));
+    let host = Host::new();
+
+    host.load(spec(&dir, &validated, &["fs.read"]))
+        .await
+        .expect("首装应握手成功");
+    assert_eq!(
+        wait_crashed(&host).await,
+        vec!["demo-node".to_string()],
+        "进程应被判死"
+    );
+
+    match host.auto_restart("demo-node").await {
+        Restart::Exhausted {
+            attempts, message, ..
+        } => {
+            assert_eq!(attempts, MAX_AUTO_RESTARTS, "应把 3 次预算用满");
+            assert!(
+                message.contains("已达自动重启上限"),
+                "到顶原因要能直接写进 last_error，实际：{message}"
+            );
+        }
+        other => panic!("期望重试用尽，实际 {other:?}"),
+    }
+    assert!(!host.is_running("demo-node"), "到顶后应停在已崩溃");
+    assert!(
+        host.running_tools("demo-node").is_empty(),
+        "到顶后工具不能留在架上"
+    );
+    assert!(
+        host.crashed_ids().is_empty(),
+        "到顶后条目已从装载表摘除，不该再被巡检到"
+    );
+
+    // 首装 1 次 + 重试 3 次 = 4 次启动；一次都不许多。
+    let started: u32 = std::fs::read_to_string(dir.join(".starts"))
+        .expect("读启动计数")
+        .trim()
+        .parse()
+        .expect("计数应是整数");
+    assert_eq!(started, 1 + MAX_AUTO_RESTARTS, "重启次数不得越过上限");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn deterministic_handshake_failure_is_not_retried() {
+    if !node_ready() {
+        eprintln!("跳过：本机没有 node");
+        return;
+    }
+    let dir = scratch("restart-deterministic");
+    let validated = package(&dir, &["echo"], &stateful_script(&["echo"], "drift"));
+    let host = Host::new();
+
+    host.load(spec(&dir, &validated, &["fs.read"]))
+        .await
+        .expect("首装应握手成功");
+    assert_eq!(
+        wait_crashed(&host).await,
+        vec!["demo-node".to_string()],
+        "进程应被判死"
+    );
+
+    match host.auto_restart("demo-node").await {
+        Restart::Deterministic { error, attempts } => {
+            assert_eq!(attempts, 1, "确定性失败只试第一次，不该继续重试");
+            assert!(
+                matches!(error, LoadError::Protocol { .. }),
+                "工具集合与清单不一致应判为协议错误，实际 {error:?}"
+            );
+        }
+        other => panic!("期望判为确定性失败，实际 {other:?}"),
+    }
+    assert!(!host.is_running("demo-node"), "不重试就该停在已崩溃");
+
+    // 只启动过 2 次（首装 + 唯一一次重启尝试）：重启循环必须立刻刹车。
+    let started: u32 = std::fs::read_to_string(dir.join(".starts"))
+        .expect("读启动计数")
+        .trim()
+        .parse()
+        .expect("计数应是整数");
+    assert_eq!(started, 2, "确定性失败后不得再起进程");
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

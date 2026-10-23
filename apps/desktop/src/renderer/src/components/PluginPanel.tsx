@@ -10,13 +10,17 @@
  * | --- | --- |
  * | `disabled`（装好没跑/手动停了） | 加载、卸载 |
  * | `ready` | 停止、重载、卸载 |
- * | `crashed` | 加载（重试）、重载、卸载；并显示崩溃原因与重启次数 |
+ * | `crashed` | 加载（人工重来一次）、重载、卸载；并显示崩溃原因与自动重启次数 |
  * | `needs_grant` | 只有卸载；加载按钮置灰并说明「授权在 P4」——内核会直接回 6103 且不 spawn |
  * | `loading` | 动作全置灰，等内核落账本 |
  *
  * `crashed` 的展示是 P2 的验收点：光有红色标记不够，得说清**为什么崩**（`last_error`
- * 是内核写进账本的原话）与**崩过几次**（`restarts`，只统计崩溃后重新装载成功的次数，
- * 上限 3 次）。用户据此判断「再点一次加载」还是「这插件得修」。
+ * 是内核写进账本的原话）与**自动重启过几次**（`restarts`，只在崩溃后自动重启成功时 +1，
+ * 每次装载会话最多 3 次）。用户据此判断「再点一次加载」还是「这插件得修」。
+ *
+ * 面板**不参与**自动重启：崩溃巡检、重试次数、到顶判死全在内核
+ * （`crates/plugin/src/host.rs::auto_restart` + `crates/core/src/plugin_api.rs::sweep_crashed`），
+ * 外壳只在下一轮 `plugin.list` / `plugin.status` 读到落好的账本。
  *
  * 唯一的行内二次确认是**卸载**：它会删掉账本条目与安装目录，属于不可撤销的动作，
  * 第一下只把按钮变成「确认卸载」。停止（`unload`）不删文件，所以不确认。
@@ -212,14 +216,16 @@ export function PluginPanel(): React.JSX.Element {
                   </div>
                 ) : null}
                 {/*
-                  `restarts` 是「崩溃后重新装载成功」的次数，不是「重启过几次」：
-                  崩溃但没起来的尝试不算，手动重载也不算。停在 `crashed` 且计数已到
-                  3 次，说明内核的自动重启到顶了，只能人工查清单/代码。
+                  `restarts` 是「内核自动重启成功」的累计次数（`store.bump_plugin_restarts`
+                  只在自动重启成功时 +1）：崩溃后没起来的尝试不算，手动点「加载」也不算。
+                  上限 3 次是**每次装载会话**的预算——同一次装载里崩溃三次用完就停手，
+                  用户再点「加载」等于重新给一次预算。所以计数可能大于 3，而停在
+                  `crashed` 且 `last_error` 写着「已达自动重启上限」才是到顶的那一次。
                 */}
                 {plugin.state === 'crashed' || plugin.restarts > 0 ? (
                   <div className="ai-list__meta" data-testid={`plugin-restarts-${plugin.id}`}>
-                    崩溃后已重新加载 {plugin.restarts} 次（内核自动重启上限 3 次；到顶后停在
-                    「已崩溃」，点「加载」可再试）
+                    内核已自动重启 {plugin.restarts} 次（每次装载最多 3 次；到顶停在「已崩溃」，
+                    点「加载」可重新开始）
                   </div>
                 ) : null}
                 <div className="ai-row">

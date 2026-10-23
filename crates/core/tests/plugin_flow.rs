@@ -544,6 +544,17 @@ fn node_script(
     pid_file: &Path,
     closed_file: &Path,
 ) -> String {
+    let die = die_after_ms
+        .map(|ms| format!("setTimeout(() => process.exit(7), {ms});"))
+        .unwrap_or_default();
+    node_script_with(reported, &die, pid_file, closed_file)
+}
+
+/// 同 [`node_script`]，但「握手之后干什么」由调用方给一段 JS。
+///
+/// 自动重启的用例需要区分「每次启动都死」和「只死第一次」，固定一个 `die_after_ms`
+/// 表达不了这两种剧本。
+fn node_script_with(reported: &[&str], die: &str, pid_file: &Path, closed_file: &Path) -> String {
     let tools = reported
         .iter()
         .map(|name| {
@@ -553,9 +564,6 @@ fn node_script(
         })
         .collect::<Vec<_>>()
         .join(", ");
-    let die = die_after_ms
-        .map(|ms| format!("setTimeout(() => process.exit(7), {ms});"))
-        .unwrap_or_default();
     format!(
         r#"
 const fs = require('node:fs')
@@ -671,19 +679,98 @@ fn handshake_tool_set_mismatch_is_rejected_with_6106() {
     );
 }
 
-/// 崩溃后：账本转 crashed、工具已下架（unload 无可下架）、可以重新装载。
+/// 崩溃后自动重启：工具重新上架、`restarts` 记 1 次、账本回到 `ready`。
+///
+/// 剧本：只在第一次启动时自杀，之后正常活。这才能把「自动恢复」和「重启后又死」
+/// 区分开——后者走的是到顶转 crashed 的那条路。
 #[test]
-fn crashed_plugin_tools_are_deregistered_and_can_be_restarted() {
+fn crash_is_recovered_automatically_and_restart_is_counted() {
     if !node_ready() {
         eprintln!("跳过：本机没有 node");
         return;
     }
-    let data = TempDataDir::new("plugin-p2-crash");
-    let packages = TempDataDir::new("plugin-p2-crash-pkg");
-    let markers = TempDataDir::new("plugin-p2-crash-mark");
+    let data = TempDataDir::new("plugin-p2-recover");
+    let packages = TempDataDir::new("plugin-p2-recover-pkg");
+    let markers = TempDataDir::new("plugin-p2-recover-mark");
     let mut core = Core::spawn(&data.root);
 
-    // 握手成功后 120ms 自杀：装载本身要成功，崩溃发生在装载之后。
+    let pid_file = markers.root.join("plugin.pid");
+    let flag = markers.root.join("crashed-once");
+    // 第一次握手后 120ms 自杀并留下标记；重启起来看到标记就不再死。
+    let die = format!(
+        "if (!fs.existsSync({flag:?})) {{ fs.writeFileSync({flag:?}, '1'); setTimeout(() => process.exit(7), 120); }}"
+    );
+    let script = node_script_with(
+        &["echo"],
+        &die,
+        &pid_file,
+        &markers.root.join("plugin.closed"),
+    );
+    let package = write_node_package(&packages.root, "demo", "demo-p2", &["echo"], &script);
+    core.ok(
+        "plugin.install",
+        json!({ "path": package.to_string_lossy() }),
+    );
+
+    let loaded = core.ok("plugin.load", json!({ "plugin_id": "demo-p2" }));
+    assert_eq!(loaded["plugin"]["state"], json!("ready"));
+    let first_pid: u32 = std::fs::read_to_string(&pid_file)
+        .expect("插件启动时写过 pid")
+        .trim()
+        .parse()
+        .expect("pid 是数字");
+
+    // 崩溃 + 自动重启都发生在轮询之间，最终应停在 ready（而不是 crashed）。
+    assert!(
+        wait_until(
+            || {
+                let state = plugin_state(&mut core, "demo-p2");
+                state == json!("ready")
+                    && core.ok("plugin.status", json!({ "plugin_id": "demo-p2" }))["plugin"]
+                        ["restarts"]
+                        == json!(1)
+            },
+            Duration::from_secs(15)
+        ),
+        "插件自杀后应自动重启回 ready 且 restarts 记 1：{}",
+        core.ok("plugin.status", json!({ "plugin_id": "demo-p2" }))
+    );
+
+    // 重启成功 → 新进程（pid 变了），工具重新上架（幂等 load 能再列出 1 条）。
+    let second_pid: u32 = std::fs::read_to_string(&pid_file)
+        .expect("重启后应重写 pid")
+        .trim()
+        .parse()
+        .expect("pid 是数字");
+    assert_ne!(
+        first_pid, second_pid,
+        "自动重启必须拉起新进程，pid 不该复用"
+    );
+    let relisted = core.ok("plugin.load", json!({ "plugin_id": "demo-p2" }));
+    assert_eq!(relisted["plugin"]["state"], json!("ready"));
+    let tools = relisted["tools"].as_array().expect("tools 是数组");
+    assert_eq!(tools.len(), 1, "重启后工具应重新上架：{relisted}");
+    assert_eq!(tools[0]["namespaced_name"], json!("plugin__demo-p2__echo"));
+
+    // 恢复后的装载是活的：卸载要能摘下 1 条。
+    let unloaded = core.ok("plugin.unload", json!({ "plugin_id": "demo-p2" }));
+    assert_eq!(unloaded["removed_tools"], json!(1), "{unloaded}");
+}
+
+/// 每次启动都死：连试 3 次后停手，账本落 `crashed` + 「已达重启上限」，
+/// 之后人工装载会撞上 6102（进程在握手期间退出）。
+#[test]
+fn crash_loop_stops_at_restart_limit_then_reports_6102() {
+    if !node_ready() {
+        eprintln!("跳过：本机没有 node");
+        return;
+    }
+    let data = TempDataDir::new("plugin-p2-limit");
+    let packages = TempDataDir::new("plugin-p2-limit-pkg");
+    let markers = TempDataDir::new("plugin-p2-limit-mark");
+    let mut core = Core::spawn(&data.root);
+
+    // 每次握手后 120ms 自杀：装载成功、崩溃、重启、再崩溃……
     let script = node_script(
         &["echo"],
         Some(120),
@@ -695,42 +782,47 @@ fn crashed_plugin_tools_are_deregistered_and_can_be_restarted() {
         "plugin.install",
         json!({ "path": package.to_string_lossy() }),
     );
-
     let loaded = core.ok("plugin.load", json!({ "plugin_id": "demo-p2" }));
     assert_eq!(loaded["plugin"]["state"], json!("ready"));
-    let tools = loaded["tools"].as_array().expect("tools 是数组");
-    assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0]["namespaced_name"], json!("plugin__demo-p2__echo"));
 
-    // 等内核发现它死了（崩溃检测靠子进程退出，不靠主动轮询）。
     assert!(
         wait_until(
             || plugin_state(&mut core, "demo-p2") == json!("crashed"),
-            Duration::from_secs(10)
+            Duration::from_secs(30)
         ),
-        "插件自杀后账本应转为 crashed"
+        "每次启动都死的插件，3 次重启后应停在 crashed：{}",
+        core.ok("plugin.status", json!({ "plugin_id": "demo-p2" }))
     );
 
-    // 崩溃即下架：此时再 unload，装载表里已经没有东西可摘。
-    let unloaded = core.ok("plugin.unload", json!({ "plugin_id": "demo-p2" }));
+    let detail = core.ok("plugin.status", json!({ "plugin_id": "demo-p2" }));
+    let plugin = &detail["plugin"];
     assert_eq!(
-        unloaded["removed_tools"],
-        json!(0),
-        "崩溃时工具已被摘掉，卸载不该再报下架数：{unloaded}"
+        plugin["restarts"],
+        json!(3),
+        "重启次数必须正好用满 3 次：{detail}"
     );
-    assert_eq!(plugin_state(&mut core, "demo-p2"), json!("disabled"));
+    let last_error = plugin["last_error"].as_str().unwrap_or_default();
+    assert!(
+        last_error.contains("已达自动重启上限"),
+        "到顶的 last_error 要写明原因，实际：{last_error:?}"
+    );
 
-    // 还能重新拉起来：这是「崩溃不等于卸载」的关键。
-    let reloaded = core.ok("plugin.load", json!({ "plugin_id": "demo-p2" }));
-    assert_eq!(reloaded["plugin"]["state"], json!("ready"));
-    assert_eq!(reloaded["tools"].as_array().expect("tools 是数组").len(), 1);
-
-    // 活着的插件卸载才需要下架，这里能拿到 1 条。
+    // 到顶即下架：装载表里没有东西可摘。
     let unloaded = core.ok("plugin.unload", json!({ "plugin_id": "demo-p2" }));
+    assert_eq!(unloaded["removed_tools"], json!(0), "{unloaded}");
+
+    // 人工再装载：这一版入口启动就崩，握手期间进程退出 → 6102（不是 6106）。
+    std::fs::write(
+        data.root.join("plugins").join("demo-p2").join("index.cjs"),
+        "process.exit(7);\n",
+    )
+    .expect("改写入口");
+    let response = core.call("plugin.load", json!({ "plugin_id": "demo-p2" }));
+    let error = response.get("error").expect("入口即崩必须报错");
     assert_eq!(
-        unloaded["removed_tools"],
-        json!(1),
-        "在跑的插件卸载应报 1 条下架：{unloaded}"
+        error["code"],
+        json!(6102),
+        "应回 6102（崩溃），实际 {error}"
     );
 }
 

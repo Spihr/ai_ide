@@ -11,24 +11,35 @@
 //! | `plugin.uninstall` | 停进程 → 删账本 → 删目录 |
 //! | `plugin.load` | 授权齐备 → 起子进程 → 握手 → 校验工具集合 → 落 `ready`；失败按类落账本 |
 //! | `plugin.unload` | 停进程 → 工具下架 → 落 `installed` |
-//! | `plugin.reload` | 停 + 起，账本 `restarts` 不变（那计数只记崩溃重启） |
+//! | `plugin.reload` | 停 + 起，账本 `restarts` 不变（那计数只记崩溃后的自动重启） |
 //!
 //! `call` / `grant` / `revoke` 仍是 6101：它们属于 P3/P4（网关与授权面板）。
-//! 「安装全程不产生进程」这条 P1 验收仍成立——只有 `load` / `reload` 会 `spawn`。
+//! 「安装全程不产生进程」这条 P1 验收仍成立——只有 `load` / `reload` 与崩溃后的
+//! 自动重启会 `spawn`。
 //!
 //! ## 账本状态机
 //!
 //! ```text
 //! install ──► installed ──load──► ready ──unload──► installed
 //!                │                 │
-//!       缺授权   │                 │ 意外退出
+//!       缺授权   │                 │ 意外退出（工具立即下架）
 //!                ▼                 ▼
-//!           needs_grant         crashed ──load──► ready（restarts +1）
+//!           needs_grant     自动重启成功 ──► ready（restarts +1）
+//!                                  │
+//!                                  └─ 连续 3 次仍失败 ──► crashed ──load──► ready
 //! ```
 //!
-//! 崩溃巡检（[`sweep_crashed`]）把宿主判死的插件落成 `crashed` + `last_error`：
-//! 工具在宿主侧已经下架（`take_crashed` 会把它从装载表摘掉），账本只负责把这件事
-//! 记下来，面板才有东西可展示。
+//! 崩溃巡检（[`sweep_crashed`]）在宿主判定「进程已退出」后立刻做两件事：
+//!
+//! 1. 工具下架——`auto_restart` 会先把条目从装载表摘掉，摘掉的那一瞬间工具就不再
+//!    可路由，这是「崩溃 → 工具立即下架」的落点；
+//! 2. 自动重启——非确定性退出（进程自己死了 / 握手超时）才重启，同一装载会话最多
+//!    3 次；确定性失败（协议不合规、工具集合与清单不一致、`pluginApi` 不兼容、入口
+//!    丢失）一次都不重试，因为再跑一遍必然还是同一个错误。
+//!
+//! 到顶或撞上确定性失败后账本落在 `crashed`，`last_error` 里写明原因——「已达重启
+//! 上限」这句话就是面板上那句「停在已崩溃」的依据。此后只有用户显式 `load` 才会
+//! 再起进程（那是新的一次装载会话，重启预算重新给 3 次）。
 //!
 //! ## 错误码约定
 //!
@@ -42,7 +53,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use ai_ide_plugin::host::{LoadError, LoadSpec};
+use ai_ide_plugin::host::{LoadError, LoadSpec, Restart};
 use ai_ide_plugin::{details_json, install as install_package, manifest, PackageError};
 use ai_ide_protocol::dto::{
     PluginCallParams, PluginCommandSummary, PluginGrantParams, PluginInstallParams,
@@ -576,10 +587,10 @@ async fn load_into(
             // 工具明细以握手为准：清单只声明「有哪些工具」，描述/风险/schema 允许
             // 插件在运行时收窄（校验已保证名字集合一致）。
             let tools = tools_from_handshake(plugin_id, &validated.manifest, &loaded.tools);
-            // 前面记着 `crashed` 说明这是崩溃后重启，计数要跟上（面板据此提示不稳定）。
-            if record.status == plugin_status::CRASHED {
-                let _ = store.bump_plugin_restarts(plugin_id).await;
-            }
+            // 这里**不**动 `restarts`：计数只记「崩溃后的自动重启」（见
+            // `recover_crashed`）。用户手动 `load` 一次失败过的插件，是他自己按下
+            // 按钮重试，不是内核自动重启，记进同一个计数会让面板把「用户重试」
+            // 说成「内核重启了 N 次」。
             if let Err(err) = store
                 .set_plugin_status(plugin_id, plugin_status::READY, None)
                 .await
@@ -721,35 +732,82 @@ fn load_error(plugin_id: &str, error: &LoadError) -> ErrorObject {
     }
 }
 
-/// 崩溃巡检：把宿主已判死的插件落成 `crashed` + `last_error`。
+/// 崩溃巡检：宿主判死的插件先下架工具，再尝试自动重启，最后把账本写成真实状态。
 ///
-/// 工具下架由宿主内部完成（`take_crashed` 会把它们从装载表摘掉），这里只补账本。
+/// 三种结局对应的账本写法：
+///
+/// - 自动重启成功 → `ready` + `restarts + 1`（工具已重新上架，`last_error` 清空）；
+/// - 撞上确定性失败 → `crashed` + 具体错误（一次都不重试）；
+/// - 连试 3 次仍失败 → `crashed` + 「已达自动重启上限」。
+///
 /// 账本写失败只记日志：插件确实没了这个事实比账本状态更重要，不能因为写库失败
 /// 就把巡检卡住——否则每轮巡检都会重复报同一个崩溃。
 pub async fn sweep_crashed(state: &AppState, store: &Store) {
-    for crashed in state.plugins().take_crashed() {
-        let message = match crashed.exit_code {
-            Some(code) => format!("插件进程意外退出（退出码 {code}）"),
-            None => "插件进程意外退出".to_string(),
-        };
-        tracing::warn!(
-            plugin_id = %crashed.plugin_id,
-            tools = crashed.namespaced_tools.len(),
-            exit_code = ?crashed.exit_code,
-            "插件已崩溃，工具已下架"
-        );
-        if let Err(err) = store
-            .set_plugin_status(&crashed.plugin_id, plugin_status::CRASHED, Some(&message))
-            .await
-        {
-            tracing::warn!(
-                plugin_id = %crashed.plugin_id,
-                %err,
-                "崩溃状态写入账本失败"
+    for plugin_id in state.plugins().crashed_ids() {
+        recover_crashed(state, store, &plugin_id).await;
+    }
+}
+
+/// 对单个已崩插件执行「下架 → 自动重启（≤3 次）→ 落账本」。
+async fn recover_crashed(state: &AppState, store: &Store, plugin_id: &str) {
+    match state.plugins().auto_restart(plugin_id).await {
+        Restart::Recovered { attempts, .. } => {
+            let restarts = match store.bump_plugin_restarts(plugin_id).await {
+                Ok(restarts) => restarts,
+                Err(err) => {
+                    tracing::warn!(plugin_id = %plugin_id, %err, "重启计数写入账本失败");
+                    -1
+                }
+            };
+            if let Err(err) = store
+                .set_plugin_status(plugin_id, plugin_status::READY, None)
+                .await
+            {
+                tracing::warn!(plugin_id = %plugin_id, %err, "重启成功但状态写入失败");
+            }
+            tracing::info!(
+                plugin_id = %plugin_id,
+                attempt = attempts,
+                restarts,
+                "插件崩溃后自动重启成功，工具已重新上架"
             );
         }
-        // 崩了就是崩了，别留着 `ready`：账本上不写 restarts（那计数只在重启时 +1），
-        // 但「崩过」这件事必须能被下一次 load 看见。
+        Restart::Deterministic { error, attempts } => {
+            tracing::warn!(
+                plugin_id = %plugin_id,
+                attempt = attempts,
+                %error,
+                "插件重启撞上确定性失败，不再重试"
+            );
+            if let Err(err) = store
+                .set_plugin_status(plugin_id, plugin_status::CRASHED, Some(&error.to_string()))
+                .await
+            {
+                tracing::warn!(plugin_id = %plugin_id, %err, "崩溃状态写入账本失败");
+            }
+        }
+        Restart::Exhausted {
+            attempts,
+            exit_code,
+            message,
+            ..
+        } => {
+            tracing::warn!(
+                plugin_id = %plugin_id,
+                attempts,
+                exit_code = ?exit_code,
+                "插件连续崩溃，已达自动重启上限，停在 crashed"
+            );
+            if let Err(err) = store
+                .set_plugin_status(plugin_id, plugin_status::CRASHED, Some(&message))
+                .await
+            {
+                tracing::warn!(plugin_id = %plugin_id, %err, "崩溃状态写入账本失败");
+            }
+        }
+        // 装载表里已经没有它：说明这一轮巡检前被 unload / 新一轮 load 收走了，
+        // 账本状态由那条路径负责，这里不要覆盖。
+        Restart::NotLoaded => {}
     }
 }
 

@@ -42,6 +42,13 @@ pub struct ReplyError {
     pub message: String,
 }
 
+/// 宿主自己塞给等待者的「进程没了」错误码。
+///
+/// 它必须和插件真的回的 JSON-RPC 错误帧区分开：插件回错是**确定性**的（代码问题），
+/// 进程没人是**非确定性**的（值得自动重启）。两边都走 `Plugin` 分支的话，普通的崩溃
+/// 会被误判成「插件拒绝握手」，自动重启就永远不会触发。
+pub const EXITED_REPLY_CODE: i64 = -32000;
+
 /// 一次请求的失败原因。调用方按它决定回哪个 61xx。
 #[derive(Debug, Clone)]
 pub enum RequestError {
@@ -477,7 +484,7 @@ async fn pump_stdout(process: Arc<PluginProcess>, stdout: tokio::process::ChildS
     if let Ok(mut pending) = process.pending.lock() {
         for (_, sender) in pending.drain() {
             let _ = sender.send(Err(ReplyError {
-                code: -32000,
+                code: EXITED_REPLY_CODE,
                 message: "插件进程已退出".to_string(),
             }));
         }
