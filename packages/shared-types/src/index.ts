@@ -246,6 +246,8 @@ export type { PluginToolRisk } from "./generated/PluginToolRisk";
 export type { PluginSummary } from "./generated/PluginSummary";
 export type { PluginToolSummary } from "./generated/PluginToolSummary";
 export type { PluginCommandSummary } from "./generated/PluginCommandSummary";
+export type { PluginCommandParams } from "./generated/PluginCommandParams";
+export type { PluginCommandResult } from "./generated/PluginCommandResult";
 export type { PluginListParams } from "./generated/PluginListParams";
 export type { PluginListResult } from "./generated/PluginListResult";
 export type { PluginStatusParams } from "./generated/PluginStatusParams";
@@ -382,6 +384,7 @@ export const Methods = {
     unload: "plugin.unload",
     reload: "plugin.reload",
     call: "plugin.call",
+    command: "plugin.command",
     grant: "plugin.grant",
     revoke: "plugin.revoke",
   },
@@ -414,8 +417,9 @@ export const Methods = {
  * `permission.*` 两项（免问规则列表 / 撤销）与 `audit.list`（审计账本只读查询），
  * 再加 M6 切片一的 `terminal.*` 五项（PTY 会话的建 / 写 / 改尺寸 / 杀 / 列），
  * M7 的 `mcp.*` 五项（Server 清单 / 连接 / 断开 / 工具 / 调用），
- * 以及插件系统 P0 的 `plugin.*` 十项（协议骨架：能路由，但统一回 6101），
- * 共 71 项，与 Rust `methods::IMPLEMENTED` 逐项对齐。
+ * 以及插件系统 P0 的 `plugin.*` 十项（协议骨架：能路由，但统一回 6101）——
+ * P5 切片二把其中第 11 项 `plugin.command`（命令网关）补成真实现，
+ * 共 72 项，与 Rust `methods::IMPLEMENTED` 逐项对齐。
  */
 export const IMPLEMENTED_METHODS = [
   Methods.core.hello,
@@ -487,6 +491,7 @@ export const IMPLEMENTED_METHODS = [
   Methods.plugin.unload,
   Methods.plugin.reload,
   Methods.plugin.call,
+  Methods.plugin.command,
   Methods.plugin.grant,
   Methods.plugin.revoke,
 ] as const;

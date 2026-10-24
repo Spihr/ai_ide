@@ -238,6 +238,17 @@ export function dismissNotice(): void {
   set({ notice: null })
 }
 
+/**
+ * 推一条外壳提示（标题栏下方的 notice 条）。
+ *
+ * P5 的命令面板要把「插件命令没跑成」直接说给用户看，而它的错误来自 IPC，
+ * 不在任何 tab/workspace 的异步流里，因此需要一个通用的入口，而不是让面板
+ * 自己去拼 `notice` 字段。
+ */
+export function setNotice(notice: Notice): void {
+  set({ notice })
+}
+
 export async function pickAndOpenWorkspace(): Promise<void> {
   try {
     const picked = await window.aiide.pickWorkspaceDirectory()

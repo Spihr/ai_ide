@@ -1,5 +1,5 @@
 /**
- * P1/P2/P4 渲染侧 API 封装：把 `window.aiide.request` 收窄成 `plugin.*` 九个动作。
+ * P1/P2/P4/P5 渲染侧 API 封装：把 `window.aiide.request` 收窄成 `plugin.*` 十个动作。
  *
  * 与 `mcp-api.ts` / `git-api.ts` 同一套路——组件不拼方法名、不自己拼参数，
  * 错误码翻译也收在这里。内核给插件单开了一段错误码（docs/14 §6.6，
@@ -16,6 +16,8 @@
  * - `6107` 清单不合法，`data.details[]` 一次列全所有问题；
  * - `6108` 插件工具与核心工具撞名（同样只出现在 details 里）；
  * - `6109` 宿主 API 调用超配额（P3 起才会见到，先给话术免得显示裸码）；
+ * - `3001` 工具 / 命令未被放行（P5 命令面板见得到：`risk=write` 的插件命令在
+ *   执行**前**要走一次审批，用户拒了就是这一条——不是插件坏了）；
  * - `5003` 账本/磁盘读写失败（库坏了就说库坏了，与 `session.*` 同口径）。
  *
  * 6107 是 P1 的验收点：「一次列全」意味着面板**不能只显示第一条**，也不能把
@@ -33,6 +35,8 @@
 
 import {
   Methods,
+  type PluginCommandParams,
+  type PluginCommandResult,
   type PluginGrantParams,
   type PluginGrantResult,
   type PluginInstallParams,
@@ -65,8 +69,9 @@ const PLUGIN_ERROR_HINTS: Record<number, string> = {
   6107: '插件清单不合法：下面列出了全部问题，改完清单再装一次。',
   6108: '插件工具与核心工具撞名：给工具换个名字（插件工具会加命名空间，撞的是插件内原名与核心工具）。',
   6109: '插件调用宿主 API 过于频繁，本次已中止：等一会儿再试，或让作者减少批量调用。',
+  3001: '这次命令 / 工具调用没有被放行：写操作要先过审批，被拒绝就不会执行（不是插件坏了）。需要的话再执行一次并在提示里同意。',
   5003: '本地账本或安装目录读写失败：检查磁盘空间与目录权限后重试。',
-  [-32602]: '参数不合法：安装要给包目录，加载/卸载/重载/看详情要给插件 id。'
+  [-32602]: '参数不合法：安装要给包目录，加载/卸载/重载/看详情/执行命令要给插件 id（执行命令还要给命令名与合法入参）。'
 }
 
 /** 一条清单问题（对应内核 `Violation`）。 */
@@ -308,6 +313,28 @@ export const pluginApi = {
    *
    * 所以 UI 侧是两段式确认，见 `plugin-store.revokeCapability`。
    */
+  /**
+   * 执行插件声明的命令（P5 命令面板的落地通道）。
+   *
+   * 与 `plugin.call` 分开：命令带 `args`（按清单 `commands[].args` 校验，非法
+   * `-32602`）、有独立审计 kind，`risk=write` 的命令还会在执行**前**要一次审批
+   * （拒了就是 `3001`）。越权（调别的插件 / 调没声明的命令）回 `6106`，
+   * 进程不在回 `6102`，插件被卸了回 `6101`。
+   *
+   * 返回值里的 `content` 已经被内核按 64 KB 字符边界截断过，`truncated` 为真时
+   * 调用方要把「还有更多」说出来，别让用户以为命令只吐了这么点。
+   */
+  command: (
+    pluginId: string,
+    command: string,
+    args?: unknown
+  ): Promise<PluginCommandResult> =>
+    window.aiide.request(Methods.plugin.command, {
+      plugin_id: pluginId,
+      command,
+      ...(args === undefined ? {} : { args })
+    } satisfies PluginCommandParams) as Promise<PluginCommandResult>,
+
   revoke: (pluginId: string, capabilities: string[]): Promise<PluginRevokeResult> =>
     window.aiide.request(Methods.plugin.revoke, {
       plugin_id: pluginId,

@@ -187,7 +187,14 @@ const RENDERER_ALLOWED = new Set<string>([
   Methods.plugin.load,
   Methods.plugin.unload,
   Methods.plugin.reload,
+  //
+  // P5：命令面板的插件命令（`plugin.command`）。放行理由与 `plugin.call` 同源——
+  // 面板只把「用户在这一行上按了回车」翻译成一次调用，命令清单来自 `plugin.status`
+  // 里内核回的 `commands[]`，渲染进程**没有**「调一个清单外的命令」的入参（越权在
+  // 内核 `check_command` 处回 6106）。写命令（`risk=write`）走内核审批，拒绝即 3001；
+  // 参数按清单 `args` schema 校验（-32602）；配额与截断与 `call` 一致。
   Methods.plugin.call,
+  Methods.plugin.command,
   Methods.plugin.grant,
   Methods.plugin.revoke
 ])

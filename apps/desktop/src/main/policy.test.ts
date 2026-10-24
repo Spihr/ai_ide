@@ -175,14 +175,25 @@ describe('checkRendererCall', () => {
   })
 
   /*
-   * 反过来钉住「放行的都是已实现方法」：插件十条协议方法全部进白名单之后，谁再往
+   * P5 放行命令面板的插件命令（`plugin.command`）：内核侧命令网关已实现（切片二），
+   * 渲染进程只提交 `plugin_id + command + args`，命令归属、能力、路径、审批、配额
+   * 五道闸门都在内核。放行的前提是「命令清单由内核回」，面板不自己编命令名。
+   */
+  it('放行 P5 的插件命令网关', () => {
+    const decision = checkRendererCall(Methods.plugin.command)
+    expect(decision.allowed, 'plugin.command 应被放行').toBe(true)
+    expect(decision.reason).toBeUndefined()
+  })
+
+  /*
+   * 反过来钉住「放行的都是已实现方法」：插件十一条协议方法全部进白名单之后，谁再往
    * 协议表里加 `plugin.*`（比如将来的 `plugin.logs`）却没有内核实现，这条会先炸。
    */
   it('插件协议方法已全部放行', () => {
     const allowed = new Set(allowedRendererMethods())
     const pluginMethods = IMPLEMENTED_METHODS.filter((method) => method.startsWith('plugin.'))
 
-    expect(pluginMethods.length).toBe(10)
+    expect(pluginMethods.length).toBe(11)
     for (const method of pluginMethods) {
       expect(allowed.has(method), `${method} 已在内核实现，应被放行`).toBe(true)
     }
@@ -275,6 +286,7 @@ describe('checkRendererCall', () => {
       'permission.list',
       'permission.revoke',
       'plugin.call',
+      'plugin.command',
       'plugin.grant',
       'plugin.install',
       'plugin.list',

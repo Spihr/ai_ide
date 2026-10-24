@@ -124,7 +124,7 @@ function installHarness(): Harness {
                 input_schema: { type: 'object' }
               }
             ],
-            commands: [{ name: 'hello', title: '打招呼', description: '打个招呼' }]
+            commands: [{ name: 'hello', title: '打招呼', description: '打个招呼', risk: 'read' }]
           }
           return detail
         }

@@ -8,6 +8,7 @@ import { ActivityBar } from './components/ActivityBar'
 import { AiPanel } from './components/AiPanel'
 import { CheckpointPanel } from './components/CheckpointPanel'
 import { CodeEditor } from './components/CodeEditor'
+import { CommandPalette } from './components/CommandPalette'
 import { EditorTabs } from './components/EditorTabs'
 import { FileTree } from './components/FileTree'
 import { GitPanel } from './components/GitPanel'
@@ -18,6 +19,7 @@ import { SearchPanel } from './components/SearchPanel'
 import { StatusBar } from './components/StatusBar'
 import { TerminalPanel } from './components/TerminalPanel'
 import { initCheckpoints } from './checkpoint-store'
+import { togglePalette } from './command-palette-store'
 import { initGit } from './git-store'
 import { initSessions } from './session-store'
 import { initTerminalEvents, toggleTerminalPanel } from './terminal-store'
@@ -85,9 +87,14 @@ export function App() {
     const onKeyDown = (event: KeyboardEvent): void => {
       if (!event.ctrlKey && !event.metaKey) return
       const key = event.key.toLowerCase()
-      if (key === 's') {
+      if (key === 's' && !event.shiftKey) {
         event.preventDefault()
         void saveTab()
+      } else if (key === 'p' && event.shiftKey) {
+        // Ctrl/Cmd+Shift+P：全局命令面板（FR-1.7）。必须排在纯 Ctrl+P 之前，
+        // 否则 shift+p 会先被「切到搜索」吃掉——`event.key` 已经把 shift 归一成 'P'。
+        event.preventDefault()
+        togglePalette()
       } else if (key === 'p') {
         event.preventDefault()
         setActivity('search')
@@ -210,6 +217,9 @@ export function App() {
 
       {/* M6：终端是底部面板，横跨整个外壳（在 body 之外），不挤占侧栏与编辑器。 */}
       <TerminalPanel />
+
+      {/* P5：全局命令面板是浮层，放在 body 之外、notice 之前——浮层要压住所有面板。 */}
+      <CommandPalette />
 
       {state.notice && (
         <div className={`notice notice--${state.notice.kind}`} onClick={dismissNotice} role="alert">

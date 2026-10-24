@@ -100,6 +100,7 @@ describe('协议常量', () => {
       pluginUnload: Methods.plugin.unload,
       pluginReload: Methods.plugin.reload,
       pluginCall: Methods.plugin.call,
+      pluginCommand: Methods.plugin.command,
       pluginGrant: Methods.plugin.grant,
       pluginRevoke: Methods.plugin.revoke,
       wsChanged: Methods.event.workspaceChanged,
@@ -187,6 +188,7 @@ describe('协议常量', () => {
       pluginUnload: 'plugin.unload',
       pluginReload: 'plugin.reload',
       pluginCall: 'plugin.call',
+      pluginCommand: 'plugin.command',
       pluginGrant: 'plugin.grant',
       pluginRevoke: 'plugin.revoke',
       wsChanged: 'workspace.changed',
@@ -273,6 +275,7 @@ describe('协议常量', () => {
       'mcp.call',
       // 插件系统 P0：10 个方法能路由（dispatch 有分支），但统一回 6101。
       // 能力清单的语义是「可路由」而非「业务已实现」，所以这 10 项必须在内。
+      // P5 切片二补第 11 项：plugin.command 已是真实现（命令网关）。
       'plugin.list',
       'plugin.status',
       'plugin.install',
@@ -281,6 +284,7 @@ describe('协议常量', () => {
       'plugin.unload',
       'plugin.reload',
       'plugin.call',
+      'plugin.command',
       'plugin.grant',
       'plugin.revoke'
     ])
