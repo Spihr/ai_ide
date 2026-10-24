@@ -6,8 +6,9 @@
 //!   日志走 stderr（由宿主收成 `plugin.log`）；
 //! - **请求**：宿主发 `{jsonrpc,id,method,params}`，按 `id` 等回包，超时即
 //!   [`RequestError::Timeout`]，绝不无限等；
-//! - **插件反向请求**（`host/*`）：P2 一律回 `-32601`。这些方法属于 P3/P4，
-//!   装成「成功」会让插件拿着假数据继续跑，比明确拒绝更难排查；
+//! - **插件反向请求**（`host/*`）：P3.5 起转给 [`HostApi`] 实现（读侧五个方法），
+//!   宿主没接线或方法未实现时仍回 `-32601`。装成「成功」会让插件拿着假数据
+//!   继续跑，比明确拒绝更难排查；
 //! - **进程回收**：Windows 用 Job Object（`KILL_ON_JOB_CLOSE`）兜住「内核被
 //!   强杀」这条路径——句柄随进程消失而关闭，整个作业连坐；正常关停先礼后兵
 //!   （`plugin/shutdown` → 关 stdin → 超时 `kill`），最后再 terminate 作业。
@@ -24,6 +25,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
+use crate::host_api::HostApi;
 use crate::manifest::{HOST_PLUGIN_API_MAJOR, HOST_PLUGIN_API_MINOR};
 
 /// 单帧上限：1 MiB。正常工具结果远小于此，超了就是内存放大攻击或写错管道。
@@ -119,6 +121,8 @@ pub struct SpawnOptions<'a> {
     pub plugin_id: &'a str,
     pub install_dir: &'a Path,
     pub entry: &'a Path,
+    /// 宿主能力实现方（P3.5）。`None` 表示宿主没接线，`host/*` 一律回 -32601。
+    pub host: Option<Arc<dyn HostApi>>,
 }
 
 /// 一次请求的应答：等到值，或等到错误。
@@ -139,6 +143,8 @@ pub struct PluginProcess {
     /// 读线程判定协议违规时写进来的原因（只留第一条）。
     violation: Arc<Mutex<Option<String>>>,
     tail: Arc<Mutex<VecDeque<String>>>,
+    /// 插件反向请求（`host/*`）的出口。`None` 表示宿主没接线（单测/精简构建）。
+    host: Option<Arc<dyn HostApi>>,
     #[cfg(windows)]
     job: Option<job::Job>,
 }
@@ -239,6 +245,7 @@ impl PluginProcess {
             exited: Arc::new(AtomicBool::new(false)),
             violation: Arc::new(Mutex::new(None)),
             tail: Arc::new(Mutex::new(VecDeque::new())),
+            host: options.host,
             #[cfg(windows)]
             job,
         });
@@ -252,6 +259,11 @@ impl PluginProcess {
     /// 插件 id。
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// 宿主能力出口（未接线时为 `None`）。
+    pub fn host(&self) -> Option<&Arc<dyn HostApi>> {
+        self.host.as_ref()
     }
 
     /// 子进程 pid（拿不到时为 `None`）。
@@ -435,7 +447,7 @@ impl PluginProcess {
     }
 }
 
-/// stdout 泵：逐行读帧、派发响应、回绝未接线的 `host/*` 请求。
+/// stdout 泵：逐行读帧、派发响应、把 `host/*` 请求转给宿主能力实现。
 async fn pump_stdout(process: Arc<PluginProcess>, stdout: tokio::process::ChildStdout) {
     let mut lines = BufReader::new(stdout).lines();
     loop {
@@ -492,6 +504,46 @@ async fn pump_stdout(process: Arc<PluginProcess>, stdout: tokio::process::ChildS
     tracing::debug!(plugin_id = %process.id, stderr_lines = tail.len(), "插件 stdout 已关闭");
 }
 
+/// 组装一条插件反向请求的响应帧。**纯函数**：不碰 IO、不碰装载表，便于单测。
+///
+/// 三道判定按顺序：
+///
+/// 1. 命名空间——只有 `host/*` 是插件能向宿主发起的；`plugin/*` 等反向调用属于
+///    越权（docs/14 §8.2 T4），一律 `-32601`；
+/// 2. 接线——宿主没装能力实现时如实回 `-32601`，绝不假装成功（假数据会让插件
+///    带着错的假设继续跑，比明确拒绝更难排查）；
+/// 3. 转发——错误码原样透传，闸门怎么判由实现方决定。
+pub fn answer_plugin_request(
+    host: Option<&Arc<dyn HostApi>>,
+    plugin_id: &str,
+    id: &Value,
+    method: &str,
+    params: &Value,
+) -> Value {
+    let error = |code: i64, message: String| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": code, "message": message }
+        })
+    };
+
+    if !method.starts_with("host/") {
+        return error(
+            -32601,
+            format!("插件不能向宿主发起 {method}（可用命名空间只有 host/*）"),
+        );
+    }
+    let Some(host) = host else {
+        return error(-32601, format!("宿主能力尚未接线：{method}"));
+    };
+
+    match host.call(plugin_id, method, params) {
+        Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+        Err(failure) => error(failure.code, failure.message),
+    }
+}
+
 /// 处理一帧：响应回填等待者；请求回 `-32601`；通知只记日志。
 async fn dispatch_frame(process: &Arc<PluginProcess>, frame: Value) -> Result<(), String> {
     let id = frame.get("id").filter(|value| !value.is_null());
@@ -521,20 +573,18 @@ async fn dispatch_frame(process: &Arc<PluginProcess>, frame: Value) -> Result<()
             }
             Ok(())
         }
-        // 插件反向请求：P2 还没有 `host/*` 实现，明确回「方法不存在」。
+        // 插件反向请求：`host/*` 交给宿主能力实现；其余命名空间仍是「方法不存在」。
         (Some(id), Some(method)) => {
-            let error = json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": {
-                    "code": -32601,
-                    "message": format!("宿主能力尚未接线（P2 只做装载与握手）：{method}"),
-                }
-            });
+            let params = frame
+                .get("params")
+                .filter(|value| value.is_object())
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let reply = answer_plugin_request(process.host(), process.id(), id, method, &params);
             process
-                .write_frame(&error)
+                .write_frame(&reply)
                 .await
-                .map_err(|error| format!("回绝 {method} 失败：{error}"))?;
+                .map_err(|error| format!("回复 {method} 失败：{error}"))?;
             Ok(())
         }
         // 通知帧：插件日志 / 事件，P2 只落 trace。
@@ -715,6 +765,7 @@ mod tests {
             plugin_id: "demo",
             install_dir: &dir,
             entry: &entry,
+            host: None,
         })
         .await
         .expect("起进程");
@@ -755,6 +806,7 @@ mod tests {
             plugin_id: "demo",
             install_dir: &dir,
             entry: &entry,
+            host: None,
         })
         .await
         .expect("起进程");
@@ -789,6 +841,7 @@ mod tests {
             plugin_id: "demo",
             install_dir: &dir,
             entry: &entry,
+            host: None,
         })
         .await
         .expect("起进程");
@@ -835,6 +888,7 @@ mod tests {
             plugin_id: "demo",
             install_dir: &dir,
             entry: &entry,
+            host: None,
         })
         .await
         .expect("起进程");
@@ -856,5 +910,80 @@ mod tests {
         process.shutdown().await;
         assert!(process.has_exited(), "关停应杀掉装死的插件");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 假的宿主能力实现：`host/fs.read` 回显路径，`host/boom` 报 6109。
+    struct FakeHost;
+
+    impl HostApi for FakeHost {
+        fn call(
+            &self,
+            plugin_id: &str,
+            method: &str,
+            params: &Value,
+        ) -> Result<Value, crate::host_api::HostApiError> {
+            if method == "host/boom" {
+                return Err(crate::host_api::HostApiError::new(6109, "配额用尽"));
+            }
+            Ok(json!({ "pluginId": plugin_id, "path": params["path"] }))
+        }
+    }
+
+    #[test]
+    fn host_request_is_forwarded_to_api() {
+        let api: Arc<dyn HostApi> = Arc::new(FakeHost);
+        let reply = answer_plugin_request(
+            Some(&api),
+            "demo",
+            &json!(7),
+            "host/fs.read",
+            &json!({ "path": "src/main.rs" }),
+        );
+        assert_eq!(reply["id"], json!(7));
+        assert_eq!(reply["result"]["pluginId"], json!("demo"));
+        assert_eq!(reply["result"]["path"], json!("src/main.rs"));
+        assert!(reply.get("error").is_none());
+    }
+
+    #[test]
+    fn host_request_without_api_is_method_not_found() {
+        let reply = answer_plugin_request(
+            None,
+            "demo",
+            &json!(1),
+            "host/fs.read",
+            &json!({ "path": "a.txt" }),
+        );
+        assert_eq!(reply["error"]["code"], json!(-32601));
+        assert!(reply["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("宿主能力尚未接线"));
+    }
+
+    #[test]
+    fn non_host_namespace_is_rejected() {
+        let api: Arc<dyn HostApi> = Arc::new(FakeHost);
+        let reply = answer_plugin_request(
+            Some(&api),
+            "demo",
+            &json!("abc"),
+            "plugin/unload",
+            &json!({}),
+        );
+        assert_eq!(reply["error"]["code"], json!(-32601));
+        assert!(reply["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("host/*"));
+    }
+
+    #[test]
+    fn api_error_passes_through_code_and_message() {
+        let api: Arc<dyn HostApi> = Arc::new(FakeHost);
+        let reply = answer_plugin_request(Some(&api), "demo", &json!(3), "host/boom", &json!({}));
+        assert_eq!(reply["error"]["code"], json!(6109));
+        assert_eq!(reply["error"]["message"], json!("配额用尽"));
+        assert!(reply.get("result").is_none());
     }
 }

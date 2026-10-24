@@ -456,6 +456,9 @@ pub async fn unload(peer: &Peer, state: &AppState, req: &Request) {
     {
         return peer.respond_error(&req.id, &store_error(err)).await;
     }
+    // 卸载后它的 host/* 授权一并作废：进程已经没了，留着这份授权只会让下一次
+    // 同名重装继承上一轮的权限。
+    state.plugin_host().set_granted_for(&plugin_id, Vec::new());
 
     tracing::info!(plugin_id = %plugin_id, removed_tools, "插件已卸载");
     peer.respond(
@@ -604,6 +607,11 @@ async fn load_into(
             let mut fresh = record.clone();
             fresh.status = plugin_status::READY.to_string();
             fresh.last_error = None;
+            // 授权集同时塞进宿主能力层：`plugin.grant` 改的是账本，而 `host/*` 的
+            // 能力闸门要**当场**知道结果，不能每次调用都回库查一遍。
+            state
+                .plugin_host()
+                .set_granted_for(plugin_id, granted.clone());
             tracing::info!(
                 plugin_id = %plugin_id,
                 pid = ?loaded.pid,

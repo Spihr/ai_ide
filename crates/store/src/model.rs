@@ -310,6 +310,11 @@ pub mod audit_kind {
     pub const CHECKPOINT_RESTORED: &str = "checkpoint.restored";
     /// 删除检查点。
     pub const CHECKPOINT_DELETED: &str = "checkpoint.deleted";
+    /// 插件向宿主发起一次反向调用（P3.5 读侧宿主能力）。
+    ///
+    /// 每一次 `host/*` 都记一行，包括被拒（能力/路径）与配额超限——审计要能
+    /// 回答「这个插件试过什么」，而不只是「它成功读了什么」。
+    pub const PLUGIN_HOST_CALL: &str = "plugin.host_call";
 }
 
 /// 审计事件的发起方。
@@ -320,6 +325,8 @@ pub mod audit_actor {
     pub const USER: &str = "user";
     /// Agent / 模型侧发起。
     pub const AGENT: &str = "agent";
+    /// 插件进程发起（隔离进程，与内核/用户/Agent 都不能混为一谈）。
+    pub const PLUGIN: &str = "plugin";
 }
 
 /// 一条已落库的审计事件。

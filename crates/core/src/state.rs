@@ -8,6 +8,7 @@ use crate::llm_api::StreamHub;
 use crate::llm_runtime::{default_store_path, LlmRuntime};
 use crate::mcp_manager::McpManager;
 use crate::peer::Peer;
+use crate::plugin_host::FsHostApi;
 use ai_ide_git::GitService;
 use ai_ide_indexer::FileIndex;
 use ai_ide_plugin::host::Host;
@@ -68,6 +69,14 @@ pub struct AppState {
     /// 而它们的存在本身就是「装过一次」的证明。直接挂字段还换来一件事：
     /// 单测里不需要先 `install_*` 就能直接装载/卸载，少一层初始化就少一种假失败。
     plugins: Arc<Host>,
+    /// 插件的读侧宿主能力（P3.5）：`host/fs.read` 这类反向请求的资格 / 路径 /
+    /// 配额判定都在这里。
+    ///
+    /// 与 `plugins` 一样是直接字段，理由相同：它自己带锁，没有「只装一次」的
+    /// 后台资源。区别在于它**必须**在 `plugins` 建好后立刻塞进宿主——
+    /// `Host::new()` 无参、且插件随时可能在单测里被装载，晚一步就有插件跑到
+    /// 没有宿主能力的窗口里。
+    plugin_host: Arc<FsHostApi>,
 }
 
 impl Default for AppState {
@@ -78,6 +87,11 @@ impl Default for AppState {
 
 impl AppState {
     pub fn new() -> Self {
+        // 宿主能力必须先于 `Host` 挂好：插件的反向请求没有「稍后重试」这一说，
+        // 没挂上就只能回 -32601，而那时插件已经起来了。
+        let plugin_host_api = Arc::new(FsHostApi::new());
+        let plugins = Arc::new(Host::new());
+        plugins.set_api(plugin_host_api.clone());
         Self {
             started_at: Instant::now(),
             cancelled: Mutex::new(HashSet::new()),
@@ -93,7 +107,8 @@ impl AppState {
             git: Arc::new(GitService::new()),
             store: OnceLock::new(),
             mcp: OnceLock::new(),
-            plugins: Arc::new(Host::new()),
+            plugins,
+            plugin_host: plugin_host_api,
         }
     }
 
@@ -130,6 +145,9 @@ impl AppState {
     /// 装上会话库（M5）。重复调用保留第一次装上的那份——库句柄是进程级资源，
     /// 换掉它只会让已建立的连接泄漏。
     pub fn install_store(&self, store: Store) {
+        // 插件审计也写这个库：宿主能力在 `AppState::new` 就活了，库是启动后才连上的，
+        // 所以这里必须回头补一次，否则 P3.5 之前的 host/* 调用会静默丢审计。
+        self.plugin_host.set_store(store.clone());
         let _ = self.store.set(store);
     }
 
@@ -153,6 +171,12 @@ impl AppState {
     /// 插件宿主：`plugin.load` / `unload` / `reload` 与崩溃巡检都从这里进。
     pub fn plugins(&self) -> &Arc<Host> {
         &self.plugins
+    }
+
+    /// 插件的读侧宿主能力（P3.5）。工作区开关时更新根、`plugin.load` 后刷新授权，
+    /// 都靠这个句柄；测试也可以直接往里塞授权集。
+    pub fn plugin_host(&self) -> &Arc<FsHostApi> {
+        &self.plugin_host
     }
 
     /// 换上一个现成的模型接入运行时。

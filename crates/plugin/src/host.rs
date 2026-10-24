@@ -15,6 +15,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::host_api::HostApi;
 use crate::loader::{PluginProcess, RequestError, SpawnError, SpawnOptions, EXITED_REPLY_CODE};
 use crate::manifest::{
     namespaced_tool, Manifest, ManifestTool, ValidatedManifest, HOST_PLUGIN_API_MAJOR,
@@ -277,7 +278,10 @@ pub struct Crashed {
 }
 
 /// 一次装载的全部入参（宿主不查账本，自动重启时只能靠自己留的这份底稿）。
-#[derive(Debug, Clone)]
+///
+/// 不实现 `Debug`：`host` 是 `dyn HostApi`，钉不出有意义的调试串，且调试输出
+/// 里也不该出现宿主实现。
+#[derive(Clone)]
 struct Resume {
     plugin_id: String,
     install_dir: PathBuf,
@@ -287,6 +291,8 @@ struct Resume {
     requested: Vec<String>,
     granted: Vec<String>,
     workspace: Value,
+    /// 宿主能力出口；自动重启沿用它，重启后 `host/*` 才不会突然变成 -32601。
+    host: Option<Arc<dyn HostApi>>,
 }
 
 /// 起进程 + 握手 + 校验之后的成品。
@@ -326,11 +332,31 @@ pub enum Restart {
 #[derive(Default)]
 pub struct Host {
     loaded: Mutex<HashMap<String, Entry>>,
+    /// 宿主能力实现方（P3.5）。`None` 时插件反向请求一律 `-32601`。
+    ///
+    /// 不加锁读也不是问题——它只在启动装配时写一次；用 `Mutex` 只是为了让
+    /// `Host` 保持 `Sync`（`Arc<Host>` 要跨线程被 `AppState` 持有）。
+    api: Mutex<Option<Arc<dyn HostApi>>>,
 }
 
 impl Host {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 装上宿主能力实现（内核装配时调用一次）。
+    ///
+    /// 已装载的插件仍持有装载时的快照：本方法约定在 `plugin.load` 之前调用，
+    /// 这也符合实际时序（内核先装配 `FsHostApi`，再等用户点装载）。
+    pub fn set_api(&self, api: Arc<dyn HostApi>) {
+        if let Ok(mut guard) = self.api.lock() {
+            *guard = Some(api);
+        }
+    }
+
+    /// 取当前宿主能力实现（未接线为 `None`）。
+    pub fn api(&self) -> Option<Arc<dyn HostApi>> {
+        self.api.lock().ok().and_then(|guard| guard.clone())
     }
 
     /// 装载（幂等）：已装载且进程活着时直接复用，不重复起进程。
@@ -360,6 +386,7 @@ impl Host {
             requested: spec.requested.clone(),
             granted: spec.granted.clone(),
             workspace: spec.workspace.clone(),
+            host: self.api(),
         };
         let start = start(&resume).await?;
         let loaded = loaded_of(&start, false);
@@ -567,6 +594,11 @@ impl Host {
         };
 
         let params = json!({ "tool": tool, "arguments": args });
+        // 配额按「单次工具调用」计（docs/14 §8.4）：调用边界处归零，插件在一次
+        // 工具执行里反复问宿主才能被卡在 200 次。
+        if let Some(api) = process.host() {
+            api.begin_call(plugin_id);
+        }
         match process
             .request(TOOL_INVOKE_METHOD, params, CALL_TIMEOUT)
             .await
@@ -683,6 +715,7 @@ async fn start(resume: &Resume) -> Result<Start, LoadError> {
         plugin_id: &resume.plugin_id,
         install_dir: &resume.install_dir,
         entry: &resume.entry,
+        host: resume.host.clone(),
     })
     .await
     .map_err(LoadError::Spawn)?;
@@ -976,6 +1009,7 @@ mod tests {
             plugin_id: "demo",
             install_dir: dir,
             entry,
+            host: None,
         })
         .await
         .expect("起进程");
@@ -1011,6 +1045,7 @@ mod tests {
                     requested: Vec::new(),
                     granted: Vec::new(),
                     workspace: Value::Null,
+                    host: None,
                 },
                 restart_attempts: 0,
             },

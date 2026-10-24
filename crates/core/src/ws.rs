@@ -103,6 +103,10 @@ pub async fn open(peer: &Peer, state: &AppState, req: &Request) {
 
     state.set_active(&workspace.id);
 
+    // 插件的读侧宿主能力跟着活动工作区走：`host/fs.read` 的相对路径都是相对它解析的。
+    // 多工作区下后开的那个成为默认靶子，与 `workspace.tree` 的「不带 id 就取活动区」一致。
+    state.plugin_host().set_root(Some(workspace.root.clone()));
+
     if params.watch {
         start_watch(state, &workspace);
     }
@@ -148,6 +152,14 @@ pub async fn close(peer: &Peer, state: &AppState, req: &Request) {
         state.git().forget(&root);
     }
     state.clear_active(&params.workspace_id);
+
+    // 关掉活动工作区后，插件不能继续读它：要么换到还开着的那个，要么彻底关闸。
+    // 这里不保留旧根——「已关闭的工作区仍然可读」是最难解释的一种泄漏。
+    let next_root = state
+        .active_id()
+        .and_then(|id| state.workspaces().get(&id).ok())
+        .map(|workspace| workspace.root.clone());
+    state.plugin_host().set_root(next_root);
 
     info!(workspace_id = %params.workspace_id, "工作区已关闭");
     peer.respond(&req.id, &OkResult { ok: true }).await;

@@ -17,6 +17,7 @@
 //! 2. `Child::kill_on_drop`：装载器被 drop 时兜底；
 //! 3. Windows 作业对象 `KILL_ON_JOB_CLOSE`：连内核被强杀都能连坐整棵进程树。
 pub mod host;
+pub mod host_api;
 pub mod install;
 pub mod loader;
 pub mod manifest;
@@ -25,6 +26,7 @@ pub use host::{
     ApiVersion, Crashed, Handshake, HandshakeCommand, HandshakeTool, Host, LoadError, LoadSpec,
     Loaded, HANDSHAKE_METHOD, HANDSHAKE_TIMEOUT, LEGACY_HANDSHAKE_METHOD, METHOD_NOT_FOUND,
 };
+pub use host_api::{HostApi, HostApiError, SharedHostApi};
 pub use install::{
     install, installed_dir, plugins_root, remove_installed, InstalledPackage, PackageError,
 };
