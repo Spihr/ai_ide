@@ -29,6 +29,9 @@ ai-ide-mcp = { workspace = true }
 ai-ide-plugin = { workspace = true }
 # `terminal.write` / `terminal.data` 的载荷是原始字节的 base64，core 侧负责编解码。
 base64 = { workspace = true }
+# P5 切片五：`host/net.fetch` 的出站传输。用 workspace 里已钉好的 reqwest（rustls +
+# webpki 根），不给 core 单独换一套 TLS 栈。
+reqwest = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

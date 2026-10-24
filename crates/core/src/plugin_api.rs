@@ -498,6 +498,9 @@ pub async fn unload(peer: &Peer, state: &AppState, req: &Request) {
     // 卸载后它的 host/* 授权一并作废：进程已经没了，留着这份授权只会让下一次
     // 同名重装继承上一轮的权限。
     state.plugin_host().set_granted_for(&plugin_id, Vec::new());
+    // 域名清单不随授权集清空而失效（它属于清单，不属于授权），但插件已卸载，
+    // 留着就是给下一次同名重装预先开好一条网络通路——一并清掉，重装时随清单重灌。
+    state.plugin_host().clear_net_domains(&plugin_id);
 
     plugin_audit::record_user(
         store,
@@ -694,6 +697,12 @@ async fn load_into(
             state
                 .plugin_host()
                 .set_granted_for(plugin_id, granted.clone());
+            // 域名单与授权集一起灌：两份数据来源不同（名单随清单走、授权随账本走），
+            // 但生效时机是同一个——「插件起来了」的这一刻。晚一步灌，就会出现
+            // 「插件已 READY、`host/net.fetch` 却因为空名单把请求全拒」的窗口。
+            state
+                .plugin_host()
+                .set_net_domains_for(plugin_id, validated.manifest.allowed_domains.clone());
             tracing::info!(
                 plugin_id = %plugin_id,
                 pid = ?loaded.pid,

@@ -1276,6 +1276,7 @@ mod tests {
             }],
             commands: Vec::new(),
             subscriptions: Vec::new(),
+            allowed_domains: Vec::new(),
             timeout_ms: 30_000,
         }
     }

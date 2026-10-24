@@ -25,6 +25,11 @@ pub const PROGRESS_METHOD: &str = "host/progress";
 /// 命名沿用清单既有口径（`fs.read` / `search` / `workspace.info`）：取方法名去掉
 /// `host/` 的那一段，全小写、不加分隔符。授权仍是按插件一套，走 `plugin.grant`。
 pub const PROGRESS_CAPABILITY: &str = "progress";
+/// 插件 → 宿主的出站网络方法名（P5 切片五）。
+pub const NET_FETCH_METHOD: &str = "host/net.fetch";
+/// 出站网络所需的能力名。授权粒度是「按域名」：能力 + 清单 `allowedDomains`
+/// 两道都要过，缺一不可（见 docs/14 §7.1）。
+pub const NET_FETCH_CAPABILITY: &str = "net.fetch";
 
 /// 插件反向请求的失败原因。`code` 直接进错误帧的 `error.code`。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +55,11 @@ impl HostApiError {
     pub const QUOTA_EXCEEDED: i64 = 6109;
     /// 审批闸门未放行（docs/14 §8.1 ⑤：`risk=write` 且未 `always`）。
     pub const TOOL_NOT_ALLOWED: i64 = 3001;
+    /// 出站网络被拒（P5 切片五）：协议不符、域名不在清单、地址是内网/回环。
+    ///
+    /// 复用 `6103`（能力未授予）这一码：对插件作者来说「这个走法没被授权」
+    /// 才是同一件事，前端也不必再认一个新码；`message` 里写明是哪一道闸门拦的。
+    pub const NET_DENIED: i64 = Self::UNAUTHORIZED;
     /// 参数畸形（缺字段 / 类型不对）。
     pub const INVALID_PARAMS: i64 = -32602;
     /// 方法不存在（v1 未实现的宿主能力也走它）。

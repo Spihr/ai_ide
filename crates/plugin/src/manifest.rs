@@ -42,6 +42,15 @@ pub const MIN_TIMEOUT_MS: u64 = 1_000;
 /// 单次工具调用超时上限（毫秒），与 docs/14 §6.2 的 120 s 硬墙对齐。
 pub const MAX_TIMEOUT_MS: u64 = 120_000;
 
+/// 清单能声明的网络域名数量上限。
+///
+/// 32 是「够用且能一眼看完」的量级：清单是给用户审的东西，域名一多就没人看了，
+/// 而 `allowedDomains` 恰恰是出站网络唯一的边界，看不完等于没边界。
+pub const MAX_ALLOWED_DOMAINS: usize = 32;
+
+/// 单个域名的字符长度上限（DNS 全名上限 253）。
+pub const MAX_DOMAIN_LEN: usize = 253;
+
 /// 能力白名单——**这张表就是权限模型本身**（docs/14 §7.1）。
 ///
 /// 不在表里的能力一律拒载。理由不是「还没实现所以先拦着」，而是「未知能力无法被
@@ -98,6 +107,14 @@ pub struct Manifest {
     pub tools: Vec<ManifestTool>,
     pub commands: Vec<ManifestCommand>,
     pub subscriptions: Vec<String>,
+    /// 出站网络域名单（`host/net.fetch` 用，P5 切片五）。
+    ///
+    /// 与 `capabilities` 里的 `net.fetch` 是一对：能力回答「有没有资格联网」，
+    /// 这里回答「能连谁」。两个都过才发得出去（见 [`crate::host_api::NET_FETCH_METHOD`]）。
+    /// 空表示一个域名都不放行——`net.fetch` 已申请却没写清单的包在校验阶段就被拒，
+    /// 运行期再兜一次「空表全拒」。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allowed_domains: Vec<String>,
     pub timeout_ms: u64,
 }
 
@@ -252,6 +269,7 @@ pub fn validate(root: &Path, raw: &Value) -> Result<ValidatedManifest, Vec<Viola
     let capabilities = string_array(obj, "capabilities", true, &mut errors);
     let subscriptions = string_array(obj, "subscriptions", false, &mut errors).unwrap_or_default();
     let timeout_ms = optional_timeout(obj, &mut errors);
+    let allowed_domains = string_array(obj, "allowedDomains", false, &mut errors);
     let tools = parse_tools(obj, &mut errors);
     let commands = parse_commands(obj, &mut errors);
 
@@ -296,6 +314,35 @@ pub fn validate(root: &Path, raw: &Value) -> Result<ValidatedManifest, Vec<Viola
                         "pluginApi {api} 的 minor 高于宿主 {HOST_PLUGIN_API_MAJOR}.{HOST_PLUGIN_API_MINOR}，按宿主演进能力集降级运行"
                     ));
                 }
+            }
+        }
+    }
+
+    // allowedDomains：归一化（小写、去尾点）后逐条判形状。
+    // `None` 表示形状阶段已报「不是字符串数组」，不再级联。
+    let mut normalized_domains: Vec<String> = Vec::new();
+    if let Some(domains) = &allowed_domains {
+        if domains.len() > MAX_ALLOWED_DOMAINS {
+            errors.push(Violation::manifest(
+                "$.allowedDomains",
+                format!(
+                    "allowedDomains 最多 {MAX_ALLOWED_DOMAINS} 条，收到 {} 条",
+                    domains.len()
+                ),
+            ));
+        }
+        for (index, domain) in domains.iter().enumerate() {
+            let path = format!("$.allowedDomains[{index}]");
+            let normalized = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+            if !is_valid_domain(&normalized) {
+                errors.push(Violation::manifest(
+                    path,
+                    format!(
+                        "域名 {domain} 非法：只写主机名（可带 *. 前缀），不带 scheme / 端口 / 路径"
+                    ),
+                ));
+            } else if !normalized_domains.contains(&normalized) {
+                normalized_domains.push(normalized);
             }
         }
     }
@@ -451,6 +498,24 @@ pub fn validate(root: &Path, raw: &Value) -> Result<ValidatedManifest, Vec<Viola
         }
     }
 
+    // 网络：能力与域名单必须成对出现。单写一边的清单一定是作者理解偏了——
+    // 只申请 net.fetch 不写域名，运行期等于「永远拒」，装了也没用；
+    // 只写域名不申请能力，则是「以为能联网」。两种都在装载前说清楚，别留到调用时报。
+    if capabilities.is_some() {
+        let wants_net = normalized_caps.iter().any(|cap| cap == "net.fetch");
+        if wants_net && normalized_domains.is_empty() {
+            errors.push(Violation::manifest(
+                "$.allowedDomains",
+                "申请了 net.fetch 却没声明 allowedDomains：出站网络没有可连的目标",
+            ));
+        } else if !wants_net && !normalized_domains.is_empty() {
+            errors.push(Violation::manifest(
+                "$.capabilities",
+                "声明了 allowedDomains 但未申请 net.fetch：域名清单不会生效",
+            ));
+        }
+    }
+
     if !errors.is_empty() {
         return Err(errors);
     }
@@ -466,6 +531,7 @@ pub fn validate(root: &Path, raw: &Value) -> Result<ValidatedManifest, Vec<Viola
         tools,
         commands,
         subscriptions,
+        allowed_domains: normalized_domains,
         timeout_ms: timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
     };
 
@@ -560,6 +626,36 @@ fn string_array(
             None
         }
     }
+}
+
+/// 域名形状校验：允许 `example.com` / `api.example.com` / `*.example.com`。
+///
+/// 只做形状，不做「是不是公网」——那要解析 DNS，属于运行期的活（`plugin_net`）。
+/// 这里挡住的是「写错格式」这一类：`https://a.com/x`、`a.com:8443`、`a_b.com`。
+fn is_valid_domain(value: &str) -> bool {
+    if value.is_empty() || value.len() > MAX_DOMAIN_LEN {
+        return false;
+    }
+    let body = value.strip_prefix("*.").unwrap_or(value);
+    if body.is_empty() || !body.contains('.') {
+        return false;
+    }
+    let labels: Vec<&str> = body.split('.').collect();
+    let Some(last) = labels.last() else {
+        return false;
+    };
+    // 顶级标签必须带字母：`1.2.3.4` 这种 IP 字面量留给运行期地址闸门判，
+    // 清单里不鼓励写 IP（写了也放行公网 IP，但不做特殊处理）。
+    if !last.chars().any(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    labels.iter().all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
 }
 
 fn optional_timeout(obj: &Map<String, Value>, errors: &mut Vec<Violation>) -> Option<u64> {
@@ -1200,6 +1296,76 @@ mod tests {
         let errors = validate(&root, &json!([])).expect_err("数组不是清单");
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].path, "$");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    /// `allowedDomains` 归一化：大小写与结尾的点都折成同一份，重复项只留一条。
+    ///
+    /// 不归一化的话，清单里同时写 `API.Example.com.` 与 `api.example.com`，
+    /// 运行期就是「两个域名」但实际是同一台主机——审查的人会以为授权面更大。
+    #[test]
+    fn allowed_domains_are_normalized_and_deduped() {
+        let root = temp_package("domains");
+        let mut raw = legal_manifest();
+        raw["capabilities"] = json!(["fs.read", "fs.write", "net.fetch"]);
+        raw["allowedDomains"] = json!(["  API.Example.com.  ", "api.example.com", "*.other.test"]);
+        let validated = validate(&root, &raw).expect("合法域名清单应被接受");
+        assert_eq!(
+            validated.manifest.allowed_domains,
+            vec!["api.example.com".to_string(), "*.other.test".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 能力与域名清单必须成对：只写一边的清单在装载前就说清楚。
+    #[test]
+    fn net_fetch_and_allowed_domains_must_pair_up() {
+        let root = temp_package("pair");
+
+        let mut raw = legal_manifest();
+        raw["capabilities"] = json!(["fs.read", "net.fetch"]);
+        let errors = validate(&root, &raw).expect_err("申请了 net.fetch 却没写域名必须拒载");
+        assert!(errors.iter().any(|error| error.path == "$.allowedDomains"));
+
+        let mut raw = legal_manifest();
+        raw["capabilities"] = json!(["fs.read"]);
+        raw["allowedDomains"] = json!(["api.example.com"]);
+        let errors = validate(&root, &raw).expect_err("写了域名却没申请能力必须拒载");
+        assert!(errors.iter().any(|error| error.path == "$.capabilities"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 域名形状与条数上限：`scheme` / 端口 / 下划线 / 裸主机名都不是域名。
+    #[test]
+    fn allowed_domains_shape_and_count_are_bounded() {
+        let root = temp_package("domain-shape");
+        let mut raw = legal_manifest();
+        raw["capabilities"] = json!(["net.fetch"]);
+        raw["allowedDomains"] = json!([
+            "https://a.example",
+            "a.example:8443",
+            "a_b.example",
+            "localhost",
+            "*",
+            "*."
+        ]);
+        let errors = validate(&root, &raw).expect_err("非法域名必须逐条报错");
+        for index in 0..6 {
+            let path = format!("$.allowedDomains[{index}]");
+            assert!(
+                errors.iter().any(|error| error.path == path),
+                "第 {index} 条应被拒：{path}"
+            );
+        }
+
+        let mut raw = legal_manifest();
+        raw["capabilities"] = json!(["net.fetch"]);
+        let domains: Vec<String> = (0..=MAX_ALLOWED_DOMAINS)
+            .map(|index| format!("h{index}.example"))
+            .collect();
+        raw["allowedDomains"] = json!(domains);
+        let errors = validate(&root, &raw).expect_err("超过条数上限必须拒载");
+        assert!(errors.iter().any(|error| error.path == "$.allowedDomains"));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

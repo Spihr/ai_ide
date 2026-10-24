@@ -45,7 +45,8 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use ai_ide_plugin::events::{progress_payload, PLUGIN_LOG, PLUGIN_PROGRESS};
 use ai_ide_plugin::host::Host;
 use ai_ide_plugin::host_api::{
-    HostApi, HostApiError, LOG_METHOD, PROGRESS_CAPABILITY, PROGRESS_METHOD,
+    HostApi, HostApiError, LOG_METHOD, NET_FETCH_CAPABILITY, NET_FETCH_METHOD, PROGRESS_CAPABILITY,
+    PROGRESS_METHOD,
 };
 use ai_ide_store::{audit_actor, audit_kind, NewAuditEvent, Store};
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -53,6 +54,7 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 
 use crate::peer::Peer;
+use crate::plugin_net::{self, FetchPlan, NetTransport, ReqwestTransport};
 
 /// `host/fs.read` 的默认读取上限（64 KB）。
 pub const DEFAULT_READ_BYTES: u64 = 64 * 1024;
@@ -95,6 +97,9 @@ fn capability_of(method: &str) -> Option<&'static str> {
         // 写侧单列能力：docs/14 §7.1 里 `fs.write` 是独立一行，授权粒度不同
         // （读可以用一次授权覆盖全部读，写要按文件审批）。
         "host/fs.write" => Some("fs.write"),
+        // 出站网络（P5 切片五）：能力之外还要过清单 `allowedDomains`，
+        // 两道闸门都在 [`FsHostApi::call`] 里，先能力后名单。
+        "host/net.fetch" => Some("net.fetch"),
         _ => None,
     }
 }
@@ -223,6 +228,15 @@ pub struct FsHostApi {
     /// 不是插件。一个插件都没订阅时，这条通道仍然要通——所以两者不能合成一个
     /// 「投给订阅者」的动作。`None` = 没有打开的窗口（纯单测 / Core 单独跑）。
     shell: RwLock<Option<Arc<dyn ShellEvents>>>,
+    /// 按插件记的**网络域名单**（P5 切片五）：清单 `allowedDomains` 的装载副本。
+    ///
+    /// 与 `by_plugin`（能力集）分开存：能力是「有没有资格联网」，域名是
+    /// 「能连谁」。两份数据来源不同、刷新时机也不同（能力走 `plugin.grant`，
+    /// 名单只在装载/重装时随清单变），合成一张表会让撤销授权顺手把名单丢掉。
+    /// 缺省是空表 = 一个域名都不放行（fail closed）。
+    net_domains: Arc<RwLock<HashMap<String, Vec<String>>>>,
+    /// 出站传输实现（生产 reqwest，单测换假实现）。
+    transport: RwLock<Arc<dyn NetTransport>>,
 }
 
 impl Default for FsHostApi {
@@ -290,7 +304,49 @@ impl FsHostApi {
             temps: AtomicU64::new(0),
             plugins: RwLock::new(None),
             shell: RwLock::new(None),
+            net_domains: Arc::new(RwLock::new(HashMap::new())),
+            transport: RwLock::new(Arc::new(ReqwestTransport::new())),
         }
+    }
+
+    /// 记下某插件的网络域名单（装载 / 重新装载时用）。
+    ///
+    /// 覆盖而非合并：清单换了就该以新清单为准，合并会让「删掉一个域名」失效。
+    pub fn set_net_domains_for(&self, plugin_id: &str, domains: Vec<String>) {
+        if let Ok(mut map) = self.net_domains.write() {
+            map.insert(plugin_id.to_string(), domains);
+        }
+    }
+
+    /// 忘掉某插件的网络域名单（卸载 / 装载失败时用）。
+    pub fn clear_net_domains(&self, plugin_id: &str) {
+        if let Ok(mut map) = self.net_domains.write() {
+            map.remove(plugin_id);
+        }
+    }
+
+    /// 取某插件的网络域名单。没登记 = 空表 = 全拒。
+    pub fn net_domains_for(&self, plugin_id: &str) -> Vec<String> {
+        self.net_domains
+            .read()
+            .ok()
+            .and_then(|map| map.get(plugin_id).cloned())
+            .unwrap_or_default()
+    }
+
+    /// 换掉出站传输实现（单测注入假实现；生产不调）。
+    pub fn set_net_transport(&self, transport: Arc<dyn NetTransport>) {
+        if let Ok(mut slot) = self.transport.write() {
+            *slot = transport;
+        }
+    }
+
+    fn net_transport(&self) -> Arc<dyn NetTransport> {
+        self.transport
+            .read()
+            .ok()
+            .map(|slot| Arc::clone(&*slot))
+            .unwrap_or_else(|| Arc::new(ReqwestTransport::new()))
     }
 
     /// 回填装载表句柄（`AppState::new` 建好 `Host` 后调用一次）。
@@ -1112,14 +1168,41 @@ impl HostApi for FsHostApi {
 
         // 闸门 ①：能力。
         if !self.is_granted(plugin_id, capability) {
+            // 网络调用的「目标」是 url：连能力都没批就想联网，这条审计最该
+            // 留下「它想连谁」。
+            let target = net_audit_target(params);
             self.audit(
                 HostCallAudit::new(plugin_id, method, capability, &call_id, DECISION_DENY)
-                    .target(audit_target(params)),
+                    .target(target.as_deref().or_else(|| audit_target(params))),
             );
             return Err(HostApiError::unauthorized(method, capability));
         }
 
-        // 闸门 ②：路径（`workspace.info` / `search.content` 没有入参路径，
+        // 闸门 ②：网络（`host/net.fetch` 专属）。顺序是「协议 → 域名清单 →
+        // 地址」，三步都在**发起连接之前**；名单先于地址解析，是刻意的：
+        // 清单外的域名连 DNS 都不该问一次（否则「谁被查过」就成了信息外泄口）。
+        //
+        // 这一道与闸门 ③（路径）互斥：网络请求没有工作区路径，也就没有越界概念
+        // ——它的「边界」是域名清单，判定在 [`crate::plugin_net::guard_url`] 里。
+        let mut fetch_plan: Option<FetchPlan> = None;
+        if capability == NET_FETCH_CAPABILITY {
+            let domains = self.net_domains_for(plugin_id);
+            match plugin_net::plan_fetch(params, &domains) {
+                Ok(plan) => fetch_plan = Some(plan),
+                Err(err) => {
+                    // 这里记 url 而不是 `None`：被域名清单 / 地址闸门拒掉时，
+                    // 「想连谁但没连成」正是审计要回答的问题。
+                    let target = net_audit_target(params);
+                    self.audit(
+                        HostCallAudit::new(plugin_id, method, capability, &call_id, DECISION_DENY)
+                            .target(target.as_deref().or_else(|| audit_target(params))),
+                    );
+                    return Err(err);
+                }
+            }
+        }
+
+        // 闸门 ③：路径（`workspace.info` / `search.content` 没有入参路径，
         // 搜索的遍历范围就是工作区根，越界问题由遍历本身保证）。
         let path_method = matches!(
             method,
@@ -1145,7 +1228,7 @@ impl HostApi for FsHostApi {
             }
         };
 
-        // 闸门 ③：审批（写侧专属）。顺序是「参数解码 → 目标形状 → 审批」：
+        // 闸门 ④：审批（写侧专属）。顺序是「参数解码 → 目标形状 → 审批」：
         // 先问用户、再发现参数畸形，等于拿审批弹窗当校验器，白打扰一次；
         // 而路径必须更早过闸门，否则弹窗就成了「这个路径敏不敏感」的探测器。
         let mut scope_key: Option<String> = None;
@@ -1176,7 +1259,7 @@ impl HostApi for FsHostApi {
             }
         }
 
-        // 闸门 ④：配额（200 次/工具调用）。
+        // 闸门 ⑤：配额（200 次/工具调用）。
         if !self.take_quota(plugin_id) {
             self.audit(
                 HostCallAudit::new(
@@ -1195,9 +1278,12 @@ impl HostApi for FsHostApi {
             ));
         }
 
-        let target = match abs.as_deref() {
-            Some(path) => Some(self.display_path(path)),
-            None => audit_target(params).map(str::to_string),
+        let target = match (&fetch_plan, abs.as_deref()) {
+            // 网络的「目标」就是 url，但落审计时要去掉 query / fragment：
+            // 查询串里常带签名或令牌，写进审计库等于二次留存。
+            (Some(plan), _) => Some(plugin_net::audit_url(plan.url.as_str())),
+            (None, Some(path)) => Some(self.display_path(path)),
+            (None, None) => audit_target(params).map(str::to_string),
         };
         let outcome = match (abs.as_deref(), method) {
             (Some(path), "host/fs.read") => self.fs_read(path, params),
@@ -1213,15 +1299,26 @@ impl HostApi for FsHostApi {
             },
             (None, "host/workspace.info") => self.workspace_info(),
             (None, "host/search.content") => self.search_content(params),
+            (None, NET_FETCH_METHOD) => match fetch_plan {
+                Some(plan) => plugin_net::execute(self.net_transport(), &plan),
+                // 走不到：网络闸门通过后一定会备好 plan。
+                None => Err(HostApiError::new(
+                    HostApiError::METHOD_NOT_FOUND,
+                    "网络请求参数缺失",
+                )),
+            },
             (_, other) => Err(HostApiError::new(
                 HostApiError::METHOD_NOT_FOUND,
                 format!("v1 未实现该宿主能力：{other}"),
             )),
         };
-        let decision = if outcome.is_ok() {
-            DECISION_ALLOW
-        } else {
-            DECISION_ERROR
+        // 6103 记 `deny` 而不是 `error`：网络逐跳校验在 `execute` 里做，跳转出白名单
+        // 时闸门已经放行过首跳，但语义上仍是「拒绝」，不是「执行失败」。审计区分这两者，
+        // 才看得出「插件是不是在试着往清单外跳」。
+        let decision = match &outcome {
+            Ok(_) => DECISION_ALLOW,
+            Err(err) if err.code == HostApiError::NET_DENIED => DECISION_DENY,
+            Err(_) => DECISION_ERROR,
         };
         self.audit(
             HostCallAudit::new(plugin_id, method, capability, &call_id, decision)
@@ -1351,6 +1448,19 @@ impl ShellEvents for StdioShellEvents {
         self.handle
             .spawn(async move { peer.notify(&event, &payload).await });
     }
+}
+
+/// 网络调用专用的审计 `target`：只留 `scheme://host[:port]/path`。
+///
+/// 不并进 [`audit_target`] 是因为返回值要 owned（query 得剥掉），而且它只对
+/// `host/net.fetch` 有意义——其它方法的 `url` 参数不该被顺手记进审计。
+fn net_audit_target(params: &Value) -> Option<String> {
+    let raw = params.get("url").and_then(|value| value.as_str())?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(plugin_net::audit_url(raw))
 }
 
 /// 审计 `target`：有路径就记路径，搜索记查询词（路径无关）。
@@ -1491,6 +1601,8 @@ fn preview(line: &str) -> String {
 mod tests {
     use super::*;
     use ai_ide_plugin::events::{MAX_PROGRESS_MESSAGE_CHARS, MAX_PROGRESS_TOKEN_CHARS};
+
+    use crate::plugin_net::{NetReply, OfflineTransport};
 
     fn sandbox(tag: &str) -> PathBuf {
         let unique = std::time::SystemTime::now()
@@ -2172,7 +2284,10 @@ mod tests {
         let root = sandbox("unimpl");
         let (api, store) = api_with_store(&root, &["fs.read"], "unimpl").await;
 
-        for method in ["host/net.fetch", "host/llm.chat", "host/progress"] {
+        // `host/net.fetch` 已在本切片接线（未授权时回 6103），所以只剩这两项：
+        // 一张「还没接线」的表必须随着接线一条条变短，否则它会从「进度看板」
+        // 退化成「谎话看板」。
+        for method in ["host/llm.chat", "host/progress"] {
             let err = api
                 .call("demo", method, &json!({ "path": "a.txt" }))
                 .expect_err("v1 未实现");
@@ -2358,6 +2473,267 @@ mod tests {
             shell.taken().is_empty(),
             "日志走插件订阅通道，不进外壳的进度口"
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+    // ---------------------------------------------------------------
+    // P5 切片五：`host/net.fetch` 出站网络
+    // ---------------------------------------------------------------
+
+    /// 单测用的「公网主机」：直接写 IP，免得单测依赖 DNS。
+    ///
+    /// `93.184.216.34` 是 example.com 的经典地址，属公网段，地址闸门会放行；
+    /// 写成域名就得真解析一次，CI 里一断 DNS 这组测试就变成「测网络」了。
+    const PUBLIC_HOST: &str = "93.184.216.34";
+
+    /// 造一个只关心网络的宿主：授权 `net.fetch`、给定域名单、注入离线传输。
+    fn net_api(
+        root: &Path,
+        domains: &[&str],
+        replies: Vec<Result<NetReply, HostApiError>>,
+    ) -> (FsHostApi, Arc<OfflineTransport>) {
+        let api = api_with(root, &["net.fetch"]);
+        api.set_net_domains_for(
+            "demo",
+            domains.iter().map(|domain| domain.to_string()).collect(),
+        );
+        let transport = Arc::new(OfflineTransport::new(replies));
+        api.set_net_transport(transport.clone());
+        (api, transport)
+    }
+
+    fn ok_reply(status: u16, body: &[u8]) -> Result<NetReply, HostApiError> {
+        Ok(NetReply {
+            status,
+            location: None,
+            content_type: Some("text/plain".to_string()),
+            body: body.to_vec(),
+            truncated: false,
+        })
+    }
+
+    /// ① 未授权：能力闸门在碰网络之前就回 6103，传输实现一次都不该被调到。
+    #[test]
+    fn net_fetch_without_capability_is_denied_before_any_request() {
+        let root = sandbox("net-unauth");
+        let api = api_with(&root, &[]);
+        // 名单给全了也没用：能力才是第一道闸门。
+        api.set_net_domains_for("demo", vec![PUBLIC_HOST.to_string()]);
+        let transport = Arc::new(OfflineTransport::new(vec![ok_reply(200, b"hi")]));
+        api.set_net_transport(transport.clone());
+
+        let err = api
+            .call(
+                "demo",
+                "host/net.fetch",
+                &json!({ "url": format!("https://{PUBLIC_HOST}/") }),
+            )
+            .expect_err("没有 net.fetch 能力");
+        assert_eq!(err.code, HostApiError::UNAUTHORIZED);
+        assert!(err.message.contains("net.fetch"), "{}", err.message);
+        assert!(transport.sent().is_empty(), "未授权不该发出任何请求");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ② 域名单外：清单只写了公网主机，`evil.test` 连解析都不该走到。
+    ///
+    /// 顺手验 deny 审计的 target：被拒时最需要知道的就是「它想连谁」，而且
+    /// 这个 target 同样要去 query（`?token=1` 不能进审计库）。
+    #[tokio::test]
+    async fn net_fetch_rejects_domain_outside_manifest() {
+        let root = sandbox("net-domain");
+        let (api, store) = api_with_store(&root, &["net.fetch"], "netdeny").await;
+        api.set_net_domains_for("demo", vec![PUBLIC_HOST.to_string()]);
+        let transport = Arc::new(OfflineTransport::new(vec![ok_reply(200, b"hi")]));
+        api.set_net_transport(transport.clone());
+
+        let err = api
+            .call(
+                "demo",
+                "host/net.fetch",
+                &json!({ "url": "https://evil.test/steal?token=1" }),
+            )
+            .expect_err("清单外域名必须拒");
+        assert_eq!(err.code, HostApiError::NET_DENIED);
+        assert!(err.message.contains("不在清单"), "{}", err.message);
+        assert!(transport.sent().is_empty(), "清单外不该发起连接");
+
+        let rows = FsHostApi::wait_audit(&store, |_| true).await;
+        let detail = &rows.first().expect("应有审计").detail;
+        assert_eq!(detail["decision"], DECISION_DENY);
+        assert_eq!(detail["target"], "https://evil.test/steal");
+        assert!(
+            !detail["target"].as_str().unwrap_or("").contains("token"),
+            "deny 审计也不该带查询串：{detail}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ③ 内网 / 回环：域名白名单放过了本机名，地址闸门还要再拦一次。
+    #[test]
+    fn net_fetch_rejects_loopback_and_private_addresses() {
+        for (domain, url, hint) in [
+            ("127.0.0.1", "http://127.0.0.1:8080/admin", "回环"),
+            ("localhost", "http://localhost/secret", "回环"),
+            ("10.0.0.5", "https://10.0.0.5/meta", "内网"),
+            (
+                "169.254.169.254",
+                "http://169.254.169.254/latest/meta-data",
+                "链路本地",
+            ),
+        ] {
+            // IPv6 字面量不在这里：`allowedDomains` 只收域名，`[::1]` 走不到地址闸门
+            // （会在域名清单就被拒），IPv6 的回环/链路本地判定由 plugin_net 单测覆盖。
+            let root = sandbox("net-internal");
+            let (api, transport) = net_api(&root, &[domain], vec![ok_reply(200, b"leak")]);
+            let err = api
+                .call("demo", "host/net.fetch", &json!({ "url": url }))
+                .expect_err("内网地址必须拒");
+            assert_eq!(err.code, HostApiError::NET_DENIED, "{url}");
+            assert!(err.message.contains(hint), "{url} → {}", err.message);
+            assert!(transport.sent().is_empty(), "内网地址不该发起连接：{url}");
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// ④ 超限截断：`maxBytes` 之外的字节不进结果，且 `truncated` 必须为真。
+    #[test]
+    fn net_fetch_truncates_body_and_marks_it() {
+        let root = sandbox("net-trunc");
+        let (api, _transport) = net_api(&root, &[PUBLIC_HOST], vec![ok_reply(200, &[b'x'; 4096])]);
+
+        let result = api
+            .call(
+                "demo",
+                "host/net.fetch",
+                &json!({ "url": format!("https://{PUBLIC_HOST}/big"), "maxBytes": 64 }),
+            )
+            .expect("应成功并截断");
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["bytes"], 64);
+        assert_eq!(result["body"].as_str().unwrap_or("").len(), 64);
+        assert_eq!(result["status"], 200);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ⑤ 超时：传输卡住时由宿主预算收尾，插件拿到 1005 而不是干等。
+    #[test]
+    fn net_fetch_times_out_when_transport_stalls() {
+        let root = sandbox("net-timeout");
+        let api = api_with(&root, &["net.fetch"]);
+        api.set_net_domains_for("demo", vec![PUBLIC_HOST.to_string()]);
+        api.set_net_transport(Arc::new(
+            OfflineTransport::new(vec![ok_reply(200, b"late")])
+                .with_delay(std::time::Duration::from_millis(800)),
+        ));
+
+        let err = api
+            .call(
+                "demo",
+                "host/net.fetch",
+                &json!({ "url": format!("https://{PUBLIC_HOST}/slow"), "timeoutMs": 200 }),
+            )
+            .expect_err("必须超时");
+        assert_eq!(err.code, HostApiError::IO);
+        assert!(err.message.contains("超时"), "{}", err.message);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ⑥ 成功路径：回包形状 + 审计（目标去 query，凭据不进审计库）。
+    #[tokio::test]
+    async fn net_fetch_success_is_audited_without_query_string() {
+        let root = sandbox("net-ok");
+        let (api, store) = api_with_store(&root, &["net.fetch"], "netok").await;
+        api.set_net_domains_for("demo", vec![PUBLIC_HOST.to_string()]);
+        api.set_net_transport(Arc::new(OfflineTransport::new(vec![ok_reply(
+            200,
+            b"{\"ok\":true}",
+        )])));
+
+        let result = api
+            .call(
+                "demo",
+                "host/net.fetch",
+                &json!({
+                    "url": format!("https://{PUBLIC_HOST}/api?token=secret"),
+                    "headers": { "accept": "application/json" }
+                }),
+            )
+            .expect("应成功");
+        assert_eq!(result["status"], 200);
+        assert_eq!(result["body"], "{\"ok\":true}");
+        assert_eq!(result["truncated"], false);
+        assert_eq!(result["redirects"], 0);
+        assert_eq!(result["contentType"], "text/plain");
+
+        let rows = FsHostApi::wait_audit(&store, |_| true).await;
+        let detail = &rows.first().expect("应有审计").detail;
+        assert_eq!(detail["capability"], "net.fetch");
+        assert_eq!(detail["decision"], DECISION_ALLOW);
+        assert_eq!(detail["target"], format!("https://{PUBLIC_HOST}/api"));
+        assert!(
+            !detail["target"].as_str().unwrap_or("").contains("secret"),
+            "审计目标不该带查询串：{detail}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ⑦ 重定向逐跳校验：跳到清单外域名，第二跳不发出，且拒的那次也落审计。
+    #[tokio::test]
+    async fn net_fetch_denies_redirect_leaving_whitelist() {
+        let root = sandbox("net-redirect");
+        let (api, store) = api_with_store(&root, &["net.fetch"], "netrd").await;
+        api.set_net_domains_for("demo", vec![PUBLIC_HOST.to_string()]);
+        let transport = Arc::new(OfflineTransport::new(vec![Ok(NetReply {
+            status: 302,
+            location: Some("https://evil.test/x".to_string()),
+            content_type: None,
+            body: Vec::new(),
+            truncated: false,
+        })]));
+        api.set_net_transport(transport.clone());
+
+        let err = api
+            .call(
+                "demo",
+                "host/net.fetch",
+                &json!({ "url": format!("https://{PUBLIC_HOST}/go") }),
+            )
+            .expect_err("跳转出去必须拒");
+        assert_eq!(err.code, HostApiError::NET_DENIED);
+        assert_eq!(transport.sent().len(), 1, "第二跳不该发出去");
+
+        let rows = FsHostApi::wait_audit(&store, |_| true).await;
+        let detail = &rows.first().expect("应有审计").detail;
+        assert_eq!(detail["decision"], DECISION_DENY);
+        assert_eq!(detail["capability"], "net.fetch");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ⑧ 插件不能覆盖决定「连谁」的请求头。
+    #[test]
+    fn net_fetch_rejects_forbidden_headers() {
+        let root = sandbox("net-header");
+        let (api, transport) = net_api(&root, &[PUBLIC_HOST], vec![ok_reply(200, b"hi")]);
+
+        let err = api
+            .call(
+                "demo",
+                "host/net.fetch",
+                &json!({
+                    "url": format!("https://{PUBLIC_HOST}/"),
+                    "headers": { "host": "internal.test" }
+                }),
+            )
+            .expect_err("Host 头必须拒");
+        assert_eq!(err.code, HostApiError::NET_DENIED);
+        assert!(transport.sent().is_empty());
 
         std::fs::remove_dir_all(&root).ok();
     }
