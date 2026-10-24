@@ -25,7 +25,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
-use crate::host_api::HostApi;
+use crate::host_api::{HostApi, LOG_METHOD, PROGRESS_METHOD};
 use crate::manifest::{HOST_PLUGIN_API_MAJOR, HOST_PLUGIN_API_MINOR};
 
 /// 单帧上限：1 MiB。正常工具结果远小于此，超了就是内存放大攻击或写错管道。
@@ -626,6 +626,8 @@ async fn dispatch_frame(process: &Arc<PluginProcess>, frame: Value) -> Result<()
 ///
 /// - `host/log`、`host/progress`：旁路遥测，交 [`HostApi::notify`] 转成
 ///   `plugin.log` / `plugin.progress` 事件，`pluginId` 由宿主填；
+///   `host/progress` 另需 `progress` 能力，未授权由宿主拒——这里只丢这一帧，
+///   不连坐：进度上报失败不该让插件停摆；
 /// - `plugin/*`：越权（docs/14 §8.2 T4）。事件是宿主 → 插件单向的，
 ///   `plugin.state_changed` 尤其只能由宿主生成——插件冒用它就是伪造状态，
 ///   按协议违规处理（`Err` 会让帧泵记违规并停掉该进程），而不是静默忽略。
@@ -639,7 +641,7 @@ async fn handle_notification(
             "插件不能发送 {method}（事件只允许宿主 → 插件单向投递）"
         ));
     }
-    if method != "host/log" && method != "host/progress" {
+    if method != LOG_METHOD && method != PROGRESS_METHOD {
         tracing::debug!(plugin_id = %process.id, %method, "忽略未知的插件通知");
         return Ok(());
     }
@@ -661,7 +663,8 @@ async fn handle_notification(
     match host.notify(process.id(), method, &stamped) {
         Ok(()) => Ok(()),
         Err(error) => {
-            // 遥测本身不是能力调用：被拒只说明宿主不接这条路，不该连坐插件。
+            // 被拒只说明这一帧不被接受（`host/log` 是宿主没接线，`host/progress`
+            // 是没这个能力）：丢一条遥测比停掉插件合理，所以不连坐。
             tracing::debug!(
                 plugin_id = %process.id,
                 %method,

@@ -40,6 +40,19 @@ function callHost(method, params) {
   })
 }
 
+/**
+ * 上报长任务进度：`host.progress({ token, message, percent? })`。
+ *
+ * 通知帧（无 `id`），发出即忘：进度不该占住调用链等回包。`token` 把同一次
+ * 长任务的多次上报串起来；`percent` 省略时不带这个键，宿主也不会替我们编一个。
+ * 需要清单里申请 `progress` 能力，否则宿主按未授权丢掉这一帧（不连坐插件）。
+ */
+function progress(token, message, percent) {
+  const params = { token, message }
+  if (typeof percent === 'number' && Number.isFinite(percent)) params.percent = percent
+  send({ jsonrpc: '2.0', method: 'host/progress', params })
+}
+
 // ── 工具实现 ──────────────────────────────────────────────────────────────
 
 async function repoStats() {
@@ -52,6 +65,8 @@ async function repoStats() {
   const walk = async (dir, depth) => {
     if (depth > 4) return
     const { entries } = await callHost('host/fs.list', { path: dir })
+    // 每进一层报一次进度：遍历是这次调用里最慢的一段，用户该看到它在动。
+    progress('repo-stats', `扫描 ${dir}`, Math.min(90, depth * 25))
     for (const entry of entries) {
       // 点开头目录自己先跳过：即便不跳，PathGuard 也会拦（escape_probe 证明了这点）
       if (entry.kind === 'dir') {
@@ -67,6 +82,7 @@ async function repoStats() {
     }
   }
   await walk('.', 0)
+  progress('repo-stats', '统计完成', 100)
 
   const top = [...extCount.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5)
   const lines = [

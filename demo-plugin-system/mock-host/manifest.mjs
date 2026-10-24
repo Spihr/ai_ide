@@ -16,6 +16,7 @@ export const CAPABILITIES = new Set([
   'fs.read',
   'fs.write',
   'search',
+  'progress',
   'net.fetch',
   'process.exec',
   'llm.invoke',

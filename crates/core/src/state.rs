@@ -228,6 +228,9 @@ impl AppState {
 
     /// 注入对端句柄；注入后事件才能推给主进程。
     pub fn attach_peer(&self, peer: Arc<Peer>) {
+        // 插件遥测（`plugin.progress`）的收件人是「当前这个窗口」，所以顺手把
+        // 外壳通道接到同一个 peer 上：不多开一条连接，关窗时它跟着一起失效。
+        self.plugin_host.attach_shell_events(Arc::clone(&peer));
         if let Ok(mut slot) = self.peer.lock() {
             *slot = Some(peer);
         }

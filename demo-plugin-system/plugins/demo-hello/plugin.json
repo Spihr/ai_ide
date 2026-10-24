@@ -5,7 +5,7 @@
   "description": "演示插件：工作区统计、写笔记、闸门探针、崩溃恢复",
   "pluginApi": "1.0",
   "main": "index.mjs",
-  "capabilities": ["fs.read", "fs.write", "search"],
+  "capabilities": ["fs.read", "fs.write", "search", "progress"],
   "tools": [
     {
       "name": "repo_stats",

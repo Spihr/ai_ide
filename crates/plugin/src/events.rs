@@ -34,8 +34,17 @@ pub const SESSION_ENDED: &str = "session.ended";
 pub const PLUGIN_STATE_CHANGED: &str = "plugin.state_changed";
 /// 插件日志（由 `host/log` 转成）。载荷 `{pluginId,level,message}`。
 pub const PLUGIN_LOG: &str = "plugin.log";
-/// 插件长任务进度（由 `host/progress` 转成）。载荷 `{pluginId,progress}`。
+/// 插件长任务进度（由 `host/progress` 转成）。
+/// 载荷 `{pluginId,token,message,percent,truncated}`，见 [`progress_payload`]。
 pub const PLUGIN_PROGRESS: &str = "plugin.progress";
+
+/// `host/progress` 单条消息的字符上限。
+///
+/// 200 足够写「正在扫描 src/components，第 3/8 个包」，又短到让一条进度帧
+/// 永远撑不成数据通道——进度是「有事在发生」的提示，不是往外搬东西的路。
+pub const MAX_PROGRESS_MESSAGE_CHARS: usize = 200;
+/// `host/progress` 的 `token` 字符上限：它只用来把同一次长任务的多次上报串起来。
+pub const MAX_PROGRESS_TOKEN_CHARS: usize = 64;
 
 /// 每个插件的事件队列上限。
 ///
@@ -106,6 +115,46 @@ pub fn session_payload(session_id: &str) -> Value {
 /// 所以「伪造别人挂掉」这条路在协议层就不存在。
 pub fn state_changed_payload(plugin_id: &str, state: &str) -> Value {
     json!({ "pluginId": plugin_id, "state": state })
+}
+
+/// `plugin.progress` 的载荷：`{pluginId,token,message,percent,truncated}`。
+///
+/// 只认这三样 + 宿主盖的 `pluginId`：进度是**只读遥测**，不是往外搬文件内容
+/// 的旁路，所以这里连一个透传 `extra` 的口子都不开（`host/log` 还有 `fields`，
+/// 这里没有）。超上限按字符截断并置 `truncated: true`——与 `host/fs.read`
+/// 的截断标记同一口径，收件方不必为「是不是被切了」另写一套判断。
+pub fn progress_payload(
+    plugin_id: &str,
+    token: Option<&str>,
+    message: Option<&str>,
+    percent: Option<f64>,
+) -> Value {
+    let mut truncated = false;
+    let token = token.map(|text| cap_chars(text, MAX_PROGRESS_TOKEN_CHARS, &mut truncated));
+    let message = message.map(|text| cap_chars(text, MAX_PROGRESS_MESSAGE_CHARS, &mut truncated));
+    // NaN / ±inf 不是百分比：`serde_json` 会把它们写成 `null`，不如自己先归零，
+    // 免得「插件报了个 NaN」变成「这一帧载荷形状不一致」。
+    let percent = percent
+        .filter(|value| value.is_finite())
+        .map(|value| value.clamp(0.0, 100.0));
+    json!({
+        "pluginId": plugin_id,
+        "token": token,
+        "message": message,
+        "percent": percent,
+        "truncated": truncated,
+    })
+}
+
+/// 按**字符**截到 `limit`（不是字节）：中文消息按字节切会切出半个字。
+fn cap_chars(text: &str, limit: usize, truncated: &mut bool) -> String {
+    match text.char_indices().nth(limit) {
+        Some((index, _)) => {
+            *truncated = true;
+            text[..index].to_string()
+        }
+        None => text.to_string(),
+    }
 }
 
 /// 入队结果。`Coalesced` / `Dropped` 不是错误，只是「这条没占新位置」。
@@ -333,6 +382,76 @@ mod tests {
     fn state_changed_payload_is_host_generated_with_plugin_id() {
         let payload = state_changed_payload("demo", "ready");
         assert_eq!(payload, json!({ "pluginId": "demo", "state": "ready" }));
+    }
+
+    /// 进度载荷只带白名单四样：插件塞进来的内容字段一律到不了事件里。
+    #[test]
+    fn progress_payload_carries_nothing_but_progress() {
+        let payload = progress_payload("demo", Some("42"), Some("扫描 src"), Some(30.0));
+        assert_eq!(
+            payload,
+            json!({
+                "pluginId": "demo",
+                "token": "42",
+                "message": "扫描 src",
+                "percent": 30.0,
+                "truncated": false,
+            })
+        );
+        let object = payload.as_object().expect("对象");
+        assert_eq!(
+            object.keys().collect::<Vec<_>>(),
+            vec!["message", "percent", "pluginId", "token", "truncated"],
+            "进度载荷的键是闭集"
+        );
+        assert!(object.get("content").is_none());
+        assert!(object.get("files").is_none());
+        assert!(object.get("path").is_none());
+    }
+
+    /// 超上限按字符截断并置 `truncated`；中文不能被切出半个字。
+    #[test]
+    fn progress_payload_truncates_and_marks() {
+        let long_message = "进".repeat(MAX_PROGRESS_MESSAGE_CHARS + 40);
+        let long_token = "t".repeat(MAX_PROGRESS_TOKEN_CHARS + 8);
+        let payload = progress_payload("demo", Some(&long_token), Some(&long_message), Some(88.0));
+
+        let message = payload["message"].as_str().expect("字符串");
+        assert_eq!(message.chars().count(), MAX_PROGRESS_MESSAGE_CHARS);
+        assert!(message.chars().all(|item| item == '进'), "要按字符切");
+        assert_eq!(
+            payload["token"].as_str().map(|text| text.chars().count()),
+            Some(MAX_PROGRESS_TOKEN_CHARS)
+        );
+        assert_eq!(payload["truncated"], json!(true));
+    }
+
+    /// 百分比归一到 0–100；NaN / 缺省不伪装成数字。
+    #[test]
+    fn progress_percent_is_clamped_and_non_finite_dropped() {
+        assert_eq!(
+            progress_payload("demo", None, None, Some(130.0))["percent"],
+            json!(100.0)
+        );
+        assert_eq!(
+            progress_payload("demo", None, None, Some(-5.0))["percent"],
+            json!(0.0)
+        );
+        assert_eq!(
+            progress_payload("demo", None, None, Some(f64::NAN))["percent"],
+            Value::Null,
+            "NaN 不是进度"
+        );
+        assert_eq!(
+            progress_payload("demo", None, None, None),
+            json!({
+                "pluginId": "demo",
+                "token": null,
+                "message": null,
+                "percent": null,
+                "truncated": false,
+            })
+        );
     }
 
     #[test]

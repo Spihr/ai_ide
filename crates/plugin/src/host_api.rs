@@ -14,7 +14,17 @@
 
 use std::sync::Arc;
 
-use serde_json::Value;
+use serde_json::{json, Value};
+
+/// 插件 → 宿主的日志通知方法名（通知帧：没有 `id`，不等回包）。
+pub const LOG_METHOD: &str = "host/log";
+/// 插件 → 宿主的进度上报方法名（P5 切片四，转 `plugin.progress` 事件）。
+pub const PROGRESS_METHOD: &str = "host/progress";
+/// 进度上报所需的能力名。
+///
+/// 命名沿用清单既有口径（`fs.read` / `search` / `workspace.info`）：取方法名去掉
+/// `host/` 的那一段，全小写、不加分隔符。授权仍是按插件一套，走 `plugin.grant`。
+pub const PROGRESS_CAPABILITY: &str = "progress";
 
 /// 插件反向请求的失败原因。`code` 直接进错误帧的 `error.code`。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,9 +127,11 @@ pub trait HostApi: Send + Sync {
 
     /// 处理一条插件通知帧（无 `id`，插件不等回包）。
     ///
-    /// P5 只开放两个：`host/log` 与 `host/progress`。它们不是能力，是**旁路
-    /// 遥测**——宿主把它们转成 `plugin.log` / `plugin.progress` 事件，`pluginId`
-    /// 由宿主填。默认实现回「方法不存在」，等于「实现方不打算收遥测」。
+    /// P5 只开放两个：`host/log` 与 `host/progress`。两者都不是「取数据」的
+    /// 通道，而是**旁路遥测**——宿主把它们转成 `plugin.log` / `plugin.progress`
+    /// 事件，`pluginId` 由宿主填。区别在闸门：`host/log` 不要能力（写日志没有
+    /// 额外信息面），`host/progress` 要 [`PROGRESS_CAPABILITY`]（它会被推给外壳
+    /// 窗口，等于一条向用户表态的通道）。默认实现回「方法不存在」。
     fn notify(&self, plugin_id: &str, method: &str, params: &Value) -> Result<(), HostApiError> {
         let _ = (plugin_id, params);
         Err(HostApiError::method_not_found(method))
@@ -128,3 +140,59 @@ pub trait HostApi: Send + Sync {
 
 /// 实现方的共享句柄。
 pub type SharedHostApi = Arc<dyn HostApi>;
+
+/// 插件侧 SDK 的 `host.progress({ token, message, percent? })` 在宿主这边的等价位：
+/// 拼一帧通知参数（**不含 `pluginId`**，那个由宿主盖）。
+///
+/// SDK 层就把「进度里能带什么」收窄成白名单：只有这三个键会进参数对象，
+/// `None` 的键干脆不出现。插件作者即便想顺手捎一段文件内容也没有入口——
+/// 想传别的东西得先改这里的代码，改不了就等于传不出去。
+pub fn progress_params(token: Option<&str>, message: Option<&str>, percent: Option<f64>) -> Value {
+    let mut params = serde_json::Map::new();
+    if let Some(token) = token {
+        params.insert("token".into(), json!(token));
+    }
+    if let Some(message) = message {
+        params.insert("message".into(), json!(message));
+    }
+    if let Some(percent) = percent {
+        params.insert("percent".into(), json!(percent));
+    }
+    Value::Object(params)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SDK 封装只产出白名单键：`pluginId` 不能由插件自带（否则可冒充别人）。
+    #[test]
+    fn progress_params_only_carries_whitelisted_keys() {
+        let full = progress_params(Some("42"), Some("扫描 src"), Some(30.0));
+        assert_eq!(
+            full,
+            json!({ "token": "42", "message": "扫描 src", "percent": 30.0 })
+        );
+        assert!(full.get("pluginId").is_none(), "pluginId 由宿主盖");
+
+        let minimal = progress_params(None, Some("扫描 src"), None);
+        assert_eq!(minimal, json!({ "message": "扫描 src" }));
+
+        assert_eq!(progress_params(None, None, None), json!({}));
+    }
+
+    /// 默认实现不认遥测：换实现方时不会「悄悄接受」一个没被处理的通知。
+    #[test]
+    fn default_notify_rejects_everything() {
+        struct Bare;
+        impl HostApi for Bare {
+            fn call(&self, _: &str, _: &str, _: &Value) -> Result<Value, HostApiError> {
+                Err(HostApiError::method_not_found("x"))
+            }
+        }
+        let error = Bare
+            .notify("demo", PROGRESS_METHOD, &json!({ "message": "x" }))
+            .expect_err("默认不接");
+        assert_eq!(error.code, HostApiError::METHOD_NOT_FOUND);
+    }
+}

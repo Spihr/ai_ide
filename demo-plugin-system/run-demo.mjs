@@ -117,6 +117,15 @@ async function main() {
     approver
   })
   host.on('log', (entry) => hostLogs.push(entry))
+  // `host/progress` 转成窗口侧的 `plugin.progress`：demo 里收进 hostLogs，便于
+  // 在 04 之后核对「进度确实推到了窗口，且没带任何文件内容」。
+  host.on('progress', (entry) =>
+    hostLogs.push({
+      pluginId: entry.pluginId,
+      level: 'progress',
+      message: `${entry.token ?? '-'} ${entry.percent ?? '-'}% ${entry.message}`
+    })
+  )
   host.on('state', (payload) => hostLogs.push({ pluginId: payload.pluginId, level: 'state', message: `${payload.event} ${JSON.stringify(payload.payload)}` }))
 
   // ── 01 清单校验 ─────────────────────────────────────────────────────────
@@ -152,7 +161,7 @@ async function main() {
 
   // ── 03 授权 + 加载 + 握手 ───────────────────────────────────────────────
   await step('03', '授予能力后加载成功，握手注册 6 个工具', async () => {
-    host.grant('demo-hello', ['fs.read', 'fs.write', 'search'])
+    host.grant('demo-hello', ['fs.read', 'fs.write', 'search', 'progress'])
     const entry = await host.load(PLUGIN_DIR)
     if (entry.state !== PLUGIN_STATE.READY) throw new Error(`期望 ready，实际 ${entry.state}`)
     const tools = host.listTools()

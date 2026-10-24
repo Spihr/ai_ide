@@ -53,6 +53,9 @@ pub const ALLOWED_CAPABILITIES: &[&str] = &[
     "workspace.info",
     "net.fetch",
     "llm.chat",
+    // 进度上报（P5 切片四）：`host/progress` 的能力名，沿用「方法名去掉 `host/`」
+    // 的既有口径。它不读不写，只影响「插件能不能往进度条上说话」。
+    "progress",
 ];
 
 /// 拒绝清单：出现在清单里即拒载，不是「暂不支持」。
@@ -1001,6 +1004,24 @@ mod tests {
                 "plugin__demo-hello__write_note".to_string()
             ]
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `progress` 在能力白名单里（`host/progress` 的闸门靠这条才能过）。
+    #[test]
+    fn progress_capability_is_allowlisted() {
+        let root = temp_package("progress");
+        let mut raw = legal_manifest();
+        raw["capabilities"] = json!(["fs.read", "fs.write", "progress"]);
+        let validated = validate(&root, &raw).expect("progress 应在白名单内");
+        assert!(validated
+            .manifest
+            .capabilities
+            .contains(&"progress".to_string()));
+        // 拼错一个字母仍然是拒载，而不是「差不多就行」。
+        raw["capabilities"] = json!(["progress.report"]);
+        let errors = validate(&root, &raw).expect_err("未登记的能力名必须拒载");
+        assert_eq!(errors[0].path, "$.capabilities[0]");
         let _ = std::fs::remove_dir_all(&root);
     }
 

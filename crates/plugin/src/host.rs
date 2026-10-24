@@ -1211,8 +1211,8 @@ fn merge_tools(manifest: &Manifest, handshake: &Handshake) -> Vec<HandshakeTool>
 mod tests {
     use super::*;
     use crate::events::{
-        file_saved_payload, session_payload, workspace_changed_payload, FILE_SAVED,
-        SESSION_STARTED, WORKSPACE_CHANGED,
+        file_saved_payload, progress_payload, session_payload, workspace_changed_payload,
+        FILE_SAVED, PLUGIN_PROGRESS, SESSION_STARTED, WORKSPACE_CHANGED,
     };
     use crate::loader::{SpawnOptions, NODE_ENV};
     use crate::manifest::ManifestTool;
@@ -1445,7 +1445,7 @@ mod tests {
         process.stdout.write(JSON.stringify({
           jsonrpc: '2.0',
           method: 'host/progress',
-          params: { progress: 0.5, message: '半程', pluginId: 'forged' }
+          params: { token: 'scan', message: '半程', percent: 50, pluginId: 'forged' }
         }) + '\n')
         const readline = require('node:readline')
         const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity })
@@ -1752,9 +1752,82 @@ mod tests {
             json!("alpha"),
             "pluginId 由宿主覆盖，插件伪造无效"
         );
-        assert_eq!(seen[0].2["progress"], json!(0.5));
+        // 帧要过一遍 `JSON.stringify`，整数值的浮点在线上会掉成 `50`，
+        // 所以按数值比而不是按 `json!` 字面量比。
+        assert_eq!(seen[0].2["percent"].as_f64(), Some(50.0));
+        assert_eq!(seen[0].2["token"], json!("scan"));
 
         host.shutdown_all().await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `plugin.progress` 走切片一的同一套投递：订阅了的收，没订阅的一个字节都
+    /// 收不到（也就没被唤醒）。
+    ///
+    /// 与 `workspace.changed` 分开断言的理由：进度是宿主高频产出的遥测，一旦
+    /// 退化成「谁都推」，用户没订阅的插件会被每一条进度戳醒——这条测试就是
+    /// 「未订阅不得收、不得唤醒」在 progress 通道上的落点。
+    #[tokio::test]
+    async fn progress_event_reaches_subscriber_only() {
+        if !node_ready() {
+            eprintln!("跳过：本机没有 node");
+            return;
+        }
+        let (alpha_dir, alpha) = event_entry(
+            "progress-alpha",
+            "alpha",
+            &[PLUGIN_PROGRESS],
+            EVENT_RECORDER,
+            None,
+        )
+        .await;
+        let (beta_dir, beta) =
+            event_entry("progress-beta", "beta", &[], EVENT_RECORDER, None).await;
+        let host = Host::new();
+        {
+            let mut guard = host.loaded.lock().expect("装载表");
+            guard.insert("alpha".to_string(), alpha);
+            guard.insert("beta".to_string(), beta);
+        }
+
+        let payload = progress_payload("alpha", Some("scan"), Some("正在扫描"), Some(30.0));
+        let delivered = host.publish(PLUGIN_PROGRESS, payload.clone());
+        assert_eq!(delivered, 1, "只有 alpha 声明了 plugin.progress");
+
+        let text = wait_for_lines(&alpha_dir.join("events.jsonl"))
+            .await
+            .expect("alpha 应收到进度帧");
+        let frames: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("事件行是 JSON"))
+            .collect();
+        assert_eq!(frames.len(), 1, "一条进度只写一帧");
+        assert_eq!(frames[0]["event"], json!(PLUGIN_PROGRESS));
+        assert_eq!(frames[0]["payload"]["token"], json!("scan"));
+        assert_eq!(frames[0]["payload"]["message"], json!("正在扫描"));
+        assert_eq!(frames[0]["payload"]["pluginId"], json!("alpha"));
+        assert_eq!(frames[0]["payload"]["truncated"], json!(false));
+        // 帧过 `JSON.stringify`，整数值浮点会掉成 `30`，按数值比。
+        assert_eq!(frames[0]["payload"]["percent"].as_f64(), Some(30.0));
+        assert_eq!(
+            frames[0]["payload"]
+                .as_object()
+                .expect("载荷是对象")
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["message", "percent", "pluginId", "token", "truncated"],
+            "载荷只有进度字段，没有文件内容的位置"
+        );
+
+        assert!(
+            !beta_dir.join("events.jsonl").exists(),
+            "未订阅的插件不该收到进度帧"
+        );
+        assert_eq!(host.pending_events("beta"), 0);
+        assert!(host.is_running("beta"), "不投递 ≠ 杀进程：beta 仍在跑");
+
+        host.shutdown_all().await;
+        let _ = std::fs::remove_dir_all(&alpha_dir);
+        let _ = std::fs::remove_dir_all(&beta_dir);
     }
 }

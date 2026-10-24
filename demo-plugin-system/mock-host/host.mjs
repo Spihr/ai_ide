@@ -317,7 +317,24 @@ export class PluginHost extends EventEmitter {
       return null
     }
     if (method === Methods.host.PROGRESS) {
-      this.emit('progress', { pluginId: entry.id, ...params })
+      // 内核侧口径（P5 切片四）：`host/progress` 要 `progress` 能力，且载荷只留
+      // 白名单键——插件塞的 `content` / `path` 不能借进度条外流，这里严格照抄。
+      if (!this.grants.has(entry.id, 'progress')) {
+        this._audit({ pluginId: entry.id, action: 'deny', method, reason: '缺能力 progress' })
+        throw new PluginError(ErrorCodes.CAPABILITY_DENIED, '未授予能力 progress', {
+          capability: 'progress'
+        })
+      }
+      const message = typeof params.message === 'string' ? params.message : ''
+      if (!message) {
+        throw new PluginError(ErrorCodes.INVALID_PARAMS, 'host/progress 需要 message')
+      }
+      this.emit('progress', {
+        pluginId: entry.id,
+        token: typeof params.token === 'string' ? params.token : null,
+        message,
+        percent: typeof params.percent === 'number' ? Math.min(100, Math.max(0, params.percent)) : null
+      })
       return null
     }
 

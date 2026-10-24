@@ -4,8 +4,10 @@
 //!
 //! 这一层是 [`ai_ide_plugin::host_api::HostApi`] 的内核侧实现：`crates/plugin`
 //! 只负责把插件进程发出的 `host/*` 帧转过来，**资格判定、路径判定、审批判定、
-//! 用量判定全在这里**。网络（`net.fetch`）、模型（`llm.chat`）、进度（`progress`）
-//! 明确留给后续切片，一律回 `-32601`。
+//! 用量判定全在这里**。遥测走 [`HostApi::notify`] 这条旁路：`host/log` 无条件
+//! 收（写日志没有额外信息面），`host/progress` 要 `progress` 能力，转成
+//! `plugin.progress` 推给外壳窗口与订阅了它的插件（P5 切片四）。网络
+//! （`net.fetch`）、模型（`llm.chat`）明确留给后续切片，一律回 `-32601`。
 //!
 //! 闸门严格按 docs/14 §8.1 的顺序，且**顺序不可交换**：
 //!
@@ -40,13 +42,17 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
-use ai_ide_plugin::events::{PLUGIN_LOG, PLUGIN_PROGRESS};
+use ai_ide_plugin::events::{progress_payload, PLUGIN_LOG, PLUGIN_PROGRESS};
 use ai_ide_plugin::host::Host;
-use ai_ide_plugin::host_api::{HostApi, HostApiError};
+use ai_ide_plugin::host_api::{
+    HostApi, HostApiError, LOG_METHOD, PROGRESS_CAPABILITY, PROGRESS_METHOD,
+};
 use ai_ide_store::{audit_actor, audit_kind, NewAuditEvent, Store};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use serde_json::{json, Value};
+
+use crate::peer::Peer;
 
 /// `host/fs.read` 的默认读取上限（64 KB）。
 pub const DEFAULT_READ_BYTES: u64 = 64 * 1024;
@@ -211,6 +217,12 @@ pub struct FsHostApi {
     /// 存 `Weak` 而不是 `Arc`：`Host` 持有本结构，本结构再持 `Arc<Host>` 会成环，
     /// 进程退出时释放不掉。`AppState::new` 建好 `Host` 后立刻回填。
     plugins: RwLock<Option<Weak<Host>>>,
+    /// 外壳窗口的事件出口（P5 切片四）。
+    ///
+    /// 与 `plugins` 分开：`plugin.progress` 的主收件人是**用户看到的窗口**，
+    /// 不是插件。一个插件都没订阅时，这条通道仍然要通——所以两者不能合成一个
+    /// 「投给订阅者」的动作。`None` = 没有打开的窗口（纯单测 / Core 单独跑）。
+    shell: RwLock<Option<Arc<dyn ShellEvents>>>,
 }
 
 impl Default for FsHostApi {
@@ -277,6 +289,7 @@ impl FsHostApi {
             calls: AtomicU64::new(0),
             temps: AtomicU64::new(0),
             plugins: RwLock::new(None),
+            shell: RwLock::new(None),
         }
     }
 
@@ -284,6 +297,30 @@ impl FsHostApi {
     pub fn set_plugins(&self, plugins: &Arc<Host>) {
         if let Ok(mut slot) = self.plugins.write() {
             *slot = Some(Arc::downgrade(plugins));
+        }
+    }
+
+    /// 装上外壳窗口的事件出口（`AppState::attach_peer` 调一次）。
+    ///
+    /// 后装覆盖先装：外壳是「当前连着的那个窗口」，旧窗口关了就该失效，留着
+    /// 一条指向它的通道只会把事件投进空气。
+    pub fn set_shell_events(&self, sink: Arc<dyn ShellEvents>) {
+        if let Ok(mut slot) = self.shell.write() {
+            *slot = Some(sink);
+        }
+    }
+
+    /// 直接拿外壳的 stdio 对端接线（`AppState::attach_peer` 的便捷入口）。
+    ///
+    /// 不在 Tokio 运行时里时返回 `false`（纯单测常见）：外壳通道缺席不影响
+    /// 插件订阅投递，所以这里只是「没接上」，不是错误。
+    pub fn attach_shell_events(&self, peer: Arc<Peer>) -> bool {
+        match StdioShellEvents::new(peer) {
+            Some(sink) => {
+                self.set_shell_events(Arc::new(sink));
+                true
+            }
+            None => false,
         }
     }
 
@@ -297,6 +334,18 @@ impl FsHostApi {
         match host {
             Some(host) => host.publish(event, payload),
             None => 0,
+        }
+    }
+
+    /// 把一条宿主事件投给外壳窗口（没接线时静默跳过）。
+    ///
+    /// 与 [`Self::publish_event`] 是两条独立的路：前者是「给订阅了的插件」，
+    /// 后者是「给用户眼前的窗口」。`plugin.progress` 两边都走，但出口不同，
+    /// 少任何一条都不该拖住另一条。
+    fn emit_shell(&self, event: &str, payload: Value) {
+        let sink = self.shell.read().ok().and_then(|slot| slot.clone());
+        if let Some(sink) = sink {
+            sink.emit(event, payload);
         }
     }
 
@@ -1188,13 +1237,23 @@ impl HostApi for FsHostApi {
         }
     }
 
-    /// `host/log` / `host/progress`：旁路遥测，不走能力闸门（它们不是能力）。
+    /// `host/log` / `host/progress`：旁路遥测。
+    ///
+    /// 两者都不是「取数据」的通道，闸门却不一样：`host/log` 不要能力（写日志没有
+    /// 额外信息面）；`host/progress` 要 `progress` 能力——它会推给**外壳窗口**
+    /// （以及订阅 `plugin.progress` 的插件），是一条能让插件在用户眼前说话的
+    /// 通道，未授权的插件不该有它，所以照样走 §8.1 ③ 的能力闸门（6103）。
+    ///
+    /// 载荷在这一层重新拼，不沿用 `params`：进度只允许 `{pluginId,token,message,
+    /// percent,truncated}`，超上限截断并标记（见 [`progress_payload`]）。插件往
+    /// `params` 里塞的任何别的键（`content` / `fields` / `path`）都到不了事件里——
+    /// 「进度是只读遥测、不是文件内容出口」这条约束落在这里，而不是靠插件自觉。
     ///
     /// `pluginId` 一律用这里的 `plugin_id`（来自进程句柄，装载时确定）覆盖插件
     /// 自报的值：载荷里的身份只能是宿主认定的那一个，插件改不了。
     fn notify(&self, plugin_id: &str, method: &str, params: &Value) -> Result<(), HostApiError> {
-        let payload = match method {
-            "host/log" => {
+        match method {
+            LOG_METHOD => {
                 let level = params
                     .get("level")
                     .and_then(Value::as_str)
@@ -1220,37 +1279,77 @@ impl HostApi for FsHostApi {
                     }
                 }
                 tracing::debug!(plugin_id, %method, "插件日志");
-                payload
+                self.publish_event(PLUGIN_LOG, payload);
+                Ok(())
             }
-            "host/progress" => {
-                let percent = params
-                    .get("percent")
-                    .and_then(Value::as_f64)
-                    .map(|value| value.clamp(0.0, 100.0));
-                let message = params
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                let token = params
-                    .get("token")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                json!({
-                    "pluginId": plugin_id,
-                    "percent": percent,
-                    "message": message,
-                    "token": token,
-                })
+            PROGRESS_METHOD => {
+                if !self.is_granted(plugin_id, PROGRESS_CAPABILITY) {
+                    return Err(HostApiError::unauthorized(method, PROGRESS_CAPABILITY));
+                }
+                let message = params.get("message").and_then(Value::as_str);
+                if message.is_none() {
+                    // 没有消息的进度条对用户毫无信息量，也会让收件方分不清
+                    // 「插件没说话」和「插件报了空」。空串按「没写」处理。
+                    return Err(HostApiError::new(
+                        HostApiError::INVALID_PARAMS,
+                        "host/progress 需要 message",
+                    ));
+                }
+                let payload = progress_payload(
+                    plugin_id,
+                    params.get("token").and_then(Value::as_str),
+                    message,
+                    params.get("percent").and_then(Value::as_f64),
+                );
+                let forwarded = self.publish_event(PLUGIN_PROGRESS, payload.clone());
+                // 订阅是插件之间的事，用户看到的进度条不依赖它：外壳窗口是主路径，
+                // 一条订阅都没有时也照推（`delivered` 为 0 只是「没插件要」）。
+                self.emit_shell(PLUGIN_PROGRESS, payload);
+                tracing::debug!(plugin_id, forwarded, "插件进度");
+                Ok(())
             }
-            _ => return Err(HostApiError::method_not_found(method)),
-        };
-        let event = if method == "host/log" {
-            PLUGIN_LOG
-        } else {
-            PLUGIN_PROGRESS
-        };
-        self.publish_event(event, payload);
-        Ok(())
+            _ => Err(HostApiError::method_not_found(method)),
+        }
+    }
+}
+
+/// 外壳窗口的事件出口。
+///
+/// 插件事件有两个收件人：订阅了的插件（`plugin/event` 帧）与**已打开的外壳
+/// 窗口**（`plugin.progress` 这类要给人看的东西）。后者与 `subscriptions` 无关
+/// ——一个插件都没订阅时，进度条也得动。
+///
+/// 实现方必须**立即返回**：`emit` 跑在插件 stdout 的帧泵里，阻塞等于卡死该
+/// 插件的所有回包（一条慢的窗口写会把工具调用拖到 120 s 硬墙）。所以异步写出
+/// 由实现方负责，本 trait 只保证「投出去」这一件事。
+pub trait ShellEvents: Send + Sync {
+    fn emit(&self, event: &str, payload: Value);
+}
+
+/// 写到外壳 stdio 的 [`ShellEvents`] 实现（`AppState::attach_peer` 装一次）。
+///
+/// 拿住 `Handle` 而不是在 `emit` 里现找运行时：调用点在插件的 Tokio 任务里没错，
+/// 但把「有没有运行时」这件事留到运行期判断，会让失败变成静默丢事件。
+pub struct StdioShellEvents {
+    peer: Arc<Peer>,
+    handle: tokio::runtime::Handle,
+}
+
+impl StdioShellEvents {
+    /// 当前运行时下建一个；不在 Tokio 运行时里（纯单测）返回 `None`。
+    pub fn new(peer: Arc<Peer>) -> Option<Self> {
+        tokio::runtime::Handle::try_current()
+            .ok()
+            .map(|handle| Self { peer, handle })
+    }
+}
+
+impl ShellEvents for StdioShellEvents {
+    fn emit(&self, event: &str, payload: Value) {
+        let peer = Arc::clone(&self.peer);
+        let event = event.to_string();
+        self.handle
+            .spawn(async move { peer.notify(&event, &payload).await });
     }
 }
 
@@ -1391,6 +1490,7 @@ fn preview(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ai_ide_plugin::events::{MAX_PROGRESS_MESSAGE_CHARS, MAX_PROGRESS_TOKEN_CHARS};
 
     fn sandbox(tag: &str) -> PathBuf {
         let unique = std::time::SystemTime::now()
@@ -2086,6 +2186,178 @@ mod tests {
             .await
             .unwrap_or_default();
         assert!(rows.is_empty(), "不该落审计");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ---------------------------------------------------------------
+    // P5 切片四：`host/progress` 进度上报通道
+    // ---------------------------------------------------------------
+
+    /// 外壳窗口替身：把投到窗口的事件按顺序记下来。
+    #[derive(Default)]
+    struct RecordingShell {
+        events: Mutex<Vec<(String, Value)>>,
+    }
+
+    impl RecordingShell {
+        fn taken(&self) -> Vec<(String, Value)> {
+            self.events
+                .lock()
+                .map(|list| list.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    impl ShellEvents for RecordingShell {
+        fn emit(&self, event: &str, payload: Value) {
+            if let Ok(mut list) = self.events.lock() {
+                list.push((event.to_string(), payload));
+            }
+        }
+    }
+
+    /// 有 `progress` 能力 → 转成 `plugin.progress`，并且**只**带白名单键。
+    ///
+    /// 插件塞进来的 `content` / `path` 不能出现在载荷里：进度是只读遥测，不是
+    /// 往外搬文件内容的旁路，这条靠宿主重拼载荷来保证，不靠插件自觉。
+    #[test]
+    fn progress_is_forwarded_as_plugin_progress() {
+        let root = sandbox("progress-fwd");
+        let api = api_with(&root, &["progress"]);
+        let shell = Arc::new(RecordingShell::default());
+        api.set_shell_events(shell.clone());
+
+        api.notify(
+            "demo",
+            "host/progress",
+            &json!({
+                "token": "scan",
+                "message": "正在扫描 src/components",
+                "percent": 42,
+                "content": "秘密文件内容",
+                "path": "src/secret.ts",
+                "pluginId": "forged",
+            }),
+        )
+        .expect("有 progress 能力就该放行");
+
+        let seen = shell.taken();
+        assert_eq!(seen.len(), 1, "外壳窗口应收到一条：{seen:?}");
+        assert_eq!(seen[0].0, "plugin.progress");
+        let payload = &seen[0].1;
+        assert_eq!(payload["pluginId"], json!("demo"), "身份由宿主认定");
+        assert_eq!(payload["token"], json!("scan"));
+        assert_eq!(payload["message"], json!("正在扫描 src/components"));
+        assert_eq!(payload["percent"], json!(42.0));
+        assert_eq!(payload["truncated"], json!(false));
+        assert!(
+            payload.get("content").is_none() && payload.get("path").is_none(),
+            "进度不得携带文件内容：{payload}"
+        );
+        assert_eq!(
+            payload.as_object().map(|object| object.len()),
+            Some(5),
+            "载荷只有白名单的五个键：{payload}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 没 `progress` 能力 → 6103，且一个字都不投（外壳不收、插件也不收）。
+    #[test]
+    fn progress_needs_the_capability() {
+        let root = sandbox("progress-unauth");
+        let api = api_with(&root, &["fs.read"]);
+        let shell = Arc::new(RecordingShell::default());
+        api.set_shell_events(shell.clone());
+
+        let err = api
+            .notify(
+                "demo",
+                "host/progress",
+                &json!({ "message": "偷偷报个进度", "percent": 10 }),
+            )
+            .expect_err("没有 progress 能力");
+        assert_eq!(err.code, HostApiError::UNAUTHORIZED);
+        assert!(err.message.contains(PROGRESS_CAPABILITY), "{}", err.message);
+        assert!(shell.taken().is_empty(), "被拒的上报不得外泄");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 超上限截断并打标，`percent` 归一到 0–100。
+    #[test]
+    fn progress_truncates_over_long_message_and_clamps_percent() {
+        let root = sandbox("progress-trunc");
+        let api = api_with(&root, &["progress"]);
+        let shell = Arc::new(RecordingShell::default());
+        api.set_shell_events(shell.clone());
+
+        api.notify(
+            "demo",
+            "host/progress",
+            &json!({
+                "token": "t".repeat(MAX_PROGRESS_TOKEN_CHARS + 10),
+                "message": "长".repeat(MAX_PROGRESS_MESSAGE_CHARS + 50),
+                "percent": 250,
+            }),
+        )
+        .expect("截断不是错误");
+
+        let seen = shell.taken();
+        assert_eq!(seen.len(), 1);
+        let payload = &seen[0].1;
+        assert_eq!(payload["truncated"], json!(true), "截断要打标");
+        assert_eq!(
+            payload["message"].as_str().unwrap_or("").chars().count(),
+            MAX_PROGRESS_MESSAGE_CHARS,
+            "消息按字符截到上限，不留半个汉字"
+        );
+        assert_eq!(
+            payload["token"].as_str().unwrap_or("").chars().count(),
+            MAX_PROGRESS_TOKEN_CHARS
+        );
+        assert_eq!(payload["percent"], json!(100.0), "超过 100 归到 100");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 没有 `message` 的进度是空帧，直接按参数错误拒，不往窗口推空条。
+    #[test]
+    fn progress_without_message_is_rejected() {
+        let root = sandbox("progress-empty");
+        let api = api_with(&root, &["progress"]);
+        let shell = Arc::new(RecordingShell::default());
+        api.set_shell_events(shell.clone());
+
+        let err = api
+            .notify("demo", "host/progress", &json!({ "percent": 5 }))
+            .expect_err("缺 message");
+        assert_eq!(err.code, HostApiError::INVALID_PARAMS);
+        assert!(shell.taken().is_empty());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `host/log` 仍然不要能力：同一份授权表下，日志能过、进度不能过。
+    #[test]
+    fn log_stays_free_while_progress_is_gated() {
+        let root = sandbox("progress-vs-log");
+        let api = api_with(&root, &[]);
+        let shell = Arc::new(RecordingShell::default());
+        api.set_shell_events(shell.clone());
+
+        api.notify("demo", "host/log", &json!({ "message": "hi" }))
+            .expect("日志不需要能力");
+        let denied = api
+            .notify("demo", "host/progress", &json!({ "message": "hi" }))
+            .expect_err("进度需要能力");
+        assert_eq!(denied.code, HostApiError::UNAUTHORIZED);
+        assert!(
+            shell.taken().is_empty(),
+            "日志走插件订阅通道，不进外壳的进度口"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
