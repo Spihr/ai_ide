@@ -157,13 +157,34 @@ describe('checkRendererCall', () => {
     }
   })
 
-  it('不放行 P3/P4 才落地的插件方法（白名单不虚报能力）', () => {
+  /*
+   * P3/P4 放行「调用网关」与「授权面」三条：内核侧三条都已从 `6101` 空分支换成
+   * 真实现，白名单才跟着放行（设计文档 §9：实现对齐之后再放，不虚报能力）。
+   * 放行边界：`call` 只能调插件自己声明过的方法（内核六步定序 + 64 KB 截断），
+   * `grant` / `revoke` 只能改本机已装插件的授权位（能力名按清单校验），三者都没有
+   * 「指定可执行文件 / 任意协议帧 / 给未安装插件开权限」的入参。
+   */
+  it('放行 P3/P4 的插件调用与授权方法', () => {
     const methods = [Methods.plugin.call, Methods.plugin.grant, Methods.plugin.revoke]
 
     for (const method of methods) {
       const decision = checkRendererCall(method)
-      expect(decision.allowed, `${method} 不应被放行`).toBe(false)
-      expect(decision.reason, `${method} 应当给出拒绝原因`).toBeTruthy()
+      expect(decision.allowed, `${method} 应被放行`).toBe(true)
+      expect(decision.reason, `${method} 放行时不应带拒绝原因`).toBeUndefined()
+    }
+  })
+
+  /*
+   * 反过来钉住「放行的都是已实现方法」：插件十条协议方法全部进白名单之后，谁再往
+   * 协议表里加 `plugin.*`（比如将来的 `plugin.logs`）却没有内核实现，这条会先炸。
+   */
+  it('插件协议方法已全部放行', () => {
+    const allowed = new Set(allowedRendererMethods())
+    const pluginMethods = IMPLEMENTED_METHODS.filter((method) => method.startsWith('plugin.'))
+
+    expect(pluginMethods.length).toBe(10)
+    for (const method of pluginMethods) {
+      expect(allowed.has(method), `${method} 已在内核实现，应被放行`).toBe(true)
     }
   })
 
@@ -253,10 +274,13 @@ describe('checkRendererCall', () => {
       'model.upsert',
       'permission.list',
       'permission.revoke',
+      'plugin.call',
+      'plugin.grant',
       'plugin.install',
       'plugin.list',
       'plugin.load',
       'plugin.reload',
+      'plugin.revoke',
       'plugin.status',
       'plugin.uninstall',
       'plugin.unload',

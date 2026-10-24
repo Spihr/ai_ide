@@ -164,17 +164,32 @@ const RENDERER_ALLOWED = new Set<string>([
   //   「已达自动重启上限」写进 `last_error`。UI 上这两个按钮只是把「用户想重来一次」
   //   这个意思传下去，外壳没有轮询重试的路径。
   //
-  // 仍然**没放行的三个**：`call`（P3 的调用网关）、`grant` / `revoke`（P4 的授权面）。
-  // 它们在协议方法表里、也还留在 `IMPLEMENTED_METHODS` 中，但内核侧仍是 `6101` 空分支。
-  // 白名单一旦提前放行，UI 就能发起一个必然失败、还会被用户当成「插件坏了」的调用。
-  // 这正是设计文档 §9 要求的「能力不虚报」：**实现对齐之后再加进来**。
+  // P3 与 P4 的另外三条，此前一直刻意留在白名单外（内核当时是 `6101` 空分支，提前
+  // 放行只会让 UI 发起一个必然失败、还被用户当成「插件坏了」的调用）。现在内核侧
+  // 三条都已换成真实现，按设计文档 §9「能力不虚报」的口径——实现对齐之后再放行。
+  //
+  // - `plugin.call`（P3 调用网关）：参数只有 `plugin_id` + `method` + `params`，且
+  //   内核 `check_call` 六步定序（`-32602` 参数 → `6101` 无此插件 → `6102` 未就绪 →
+  //   `6106` 未声明该方法 → 转发 `plugin/tool-invoke` → 64 KB 按字符边界截断）。
+  //   也就是说 UI 只能调到**插件自己在清单里声明过**的方法，转发目标由内核决定，
+  //   渲染进程既不能指定进程、也不能塞任意协议帧。每次调用（含每种拒绝）都落审计行。
+  // - `plugin.grant` / `plugin.revoke`（P4 授权面）：只改**本机账本里已安装插件**的
+  //   能力授权位，能力名由内核按插件清单校验（清单外的能力 `-32602`）；没有
+  //   「授权任意插件」或「给不存在的插件开权限」的入参。授权即时生效、撤销同样即时
+  //   收窄（下一次 `host/*` 即 `6103`），撤 `fs.write` / `net.fetch` / `llm.chat`
+  //   这类关键能力时进程在跑就连带 `unload`——这是内核行为，不需要 UI 二次确认兜底。
+  //   UI 侧仍按「放行边界 = 用户显式动作」自控：撤销是两段式、关键能力撤销会先说明
+  //   「连带卸载」，用户在面板上看得到影响再点第二下。
   Methods.plugin.install,
   Methods.plugin.list,
   Methods.plugin.status,
   Methods.plugin.uninstall,
   Methods.plugin.load,
   Methods.plugin.unload,
-  Methods.plugin.reload
+  Methods.plugin.reload,
+  Methods.plugin.call,
+  Methods.plugin.grant,
+  Methods.plugin.revoke
 ])
 
 export interface PolicyDecision {
