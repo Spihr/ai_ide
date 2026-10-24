@@ -38,6 +38,8 @@ impl HostApiError {
     pub const IO: i64 = 1005;
     /// 单次调用宿主 API 次数超限（docs/14 §8.1 ⑥）。
     pub const QUOTA_EXCEEDED: i64 = 6109;
+    /// 审批闸门未放行（docs/14 §8.1 ⑤：`risk=write` 且未 `always`）。
+    pub const TOOL_NOT_ALLOWED: i64 = 3001;
     /// 参数畸形（缺字段 / 类型不对）。
     pub const INVALID_PARAMS: i64 = -32602;
     /// 方法不存在（v1 未实现的宿主能力也走它）。
@@ -83,9 +85,20 @@ impl HostApiError {
     pub fn path_denied(path: &str) -> Self {
         Self::new(Self::PATH_DENIED, format!("拒绝访问敏感路径：{path}"))
     }
+
+    /// 写侧审批未通过。
+    ///
+    /// 走 `3001 TOOL_NOT_ALLOWED`（docs/14 §8.1 ⑤）：这一码在协议层已经登记为
+    /// 「权限策略不放行」，和 Agent 侧拒绝工具调用是同一类，前端不必再认新码。
+    pub fn tool_not_allowed(method: &str, scope_key: &str) -> Self {
+        Self::new(
+            Self::TOOL_NOT_ALLOWED,
+            format!("{method} 未获审批：{scope_key}"),
+        )
+    }
 }
 
-/// 宿主能力实现方（P3.5 只有读侧；写侧留给 P4）。
+/// 宿主能力实现方（P3.5 读侧五方法；P4 起含写侧 `host/fs.write`）。
 ///
 /// `call` 是同步的：读文件、列目录都不长，实现方内部若需要等就更不该把
 /// 帧泵（`pump_stdout`）拖成异步——一条慢请求会堵住该插件所有回包。

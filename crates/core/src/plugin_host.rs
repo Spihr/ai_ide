@@ -1,36 +1,49 @@
-//! 读侧宿主能力（插件系统 P3.5）：`host/fs.read` / `host/fs.list` /
-//! `host/fs.stat` / `host/search.content` / `host/workspace.info` 的真实实现。
+//! 宿主能力（插件系统 P3.5 读侧 + P4 切片二写侧）：`host/fs.read` /
+//! `host/fs.list` / `host/fs.stat` / `host/search.content` / `host/workspace.info`
+//! 与 `host/fs.write` 的真实实现。
 //!
 //! 这一层是 [`ai_ide_plugin::host_api::HostApi`] 的内核侧实现：`crates/plugin`
-//! 只负责把插件进程发出的 `host/*` 帧转过来，**资格判定、路径判定、用量判定
-//! 全在这里**。写侧（`fs.write`）、网络（`net.fetch`）、模型（`llm.chat`）、
-//! 进度（`progress`）明确留给 P4，一律回 `-32601`。
+//! 只负责把插件进程发出的 `host/*` 帧转过来，**资格判定、路径判定、审批判定、
+//! 用量判定全在这里**。网络（`net.fetch`）、模型（`llm.chat`）、进度（`progress`）
+//! 明确留给后续切片，一律回 `-32601`。
 //!
-//! 三道闸门严格按 docs/14 §8.1 的顺序，且**顺序不可交换**：
+//! 闸门严格按 docs/14 §8.1 的顺序，且**顺序不可交换**：
 //!
-//! 1. **能力闸门**（6103）：账本里没有 `fs.read` / `search` 就直接拒；
+//! 1. **能力闸门**（6103）：账本里没有 `fs.read` / `fs.write` / `search` 就直接拒；
 //! 2. **路径闸门**（1002 越界 / 1003 敏感）：只收相对路径，`..`、盘符、UNC、
 //!    NUL 一律拒；`.git` / `.ssh` / `.aws` / `.kube` / `.env` 任意层级硬拒；
 //!    规范化（含符号链接解析）后必须落在规范化的工作区根之内；
-//! 3. **配额闸门**（6109）：一次工具调用内 ≤ 200 次，计数由
+//! 3. **审批闸门**（3001）：写侧专属。`scope_key` 是**规范化绝对路径**，
+//!    命中「已 always」的键就不问；否则交出 [`WriteApprover`] 裁决，
+//!    没答复 / 明确拒绝一律 3001 —— 写盘这件事的默认值只能是「不写」；
+//! 4. **配额闸门**（6109）：一次工具调用内 ≤ 200 次，计数由
 //!    [`HostApi::begin_call`] 在工具调用边界归零。
 //!
 //! 能力必须排在配额前面：反过来的话，未授权插件会先撞「次数超了」，
 //! 用户看到的提示指错方向，而且白送了一个「本插件有没有被授权」的探测口。
+//! 审批排在配额前面同理：被拒的写请求连额度都不该消耗。
 //!
-//! 每次调用（含被拒与超配额）都落一行 `plugin.host_call` 审计。审计是异步写的：
-//! 这条路径跑在插件 stdout 的帧泵里，同步 `await` 一次写库会堵住该插件的所有
-//! 回包，所以拿不到 Tokio 运行时（纯单测）或没有库时就**跳过**，绝不 `block_on`。
+//! 写盘用「同目录临时文件 → `fsync` → `rename`」：`rename` 在同卷上是替换语义
+//! （Windows 走 `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`），掉电最多丢掉这次
+//! 写入，绝不会给用户留半个文件。
+//!
+//! 每次调用（含被拒、被驳回与超配额）都落一行 `plugin.host_call` 审计。审计是
+//! 异步写的：这条路径跑在插件 stdout 的帧泵里，同步 `await` 一次写库会堵住该
+//! 插件的所有回包，所以拿不到 Tokio 运行时（纯单测）或没有库时就**跳过**，
+//! 绝不 `block_on`。
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use ai_ide_plugin::host_api::{HostApi, HostApiError};
 use ai_ide_store::{audit_actor, audit_kind, NewAuditEvent, Store};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use serde_json::{json, Value};
 
 /// `host/fs.read` 的默认读取上限（64 KB）。
@@ -50,10 +63,18 @@ const SENSITIVE_SEGMENTS: &[&str] = &[".git", ".ssh", ".aws", ".kube", ".env"];
 pub const DECISION_ALLOW: &str = "allow";
 /// 审计 `decision` 取值：被闸门拒（能力 / 路径 / 参数）。
 pub const DECISION_DENY: &str = "deny";
+/// 审计 `decision` 取值：写侧审批当场获准（一次或总是）。
+pub const DECISION_APPROVE: &str = "approve";
+/// 审计 `decision` 取值：写侧审批被驳回 / 无人裁决。
+pub const DECISION_REJECT: &str = "reject";
 /// 审计 `decision` 取值：配额超限。
 pub const DECISION_QUOTA_EXCEEDED: &str = "quota_exceeded";
 /// 审计 `decision` 取值：闸门放行但执行失败（文件不存在、IO 错）。
 pub const DECISION_ERROR: &str = "error";
+
+/// 临时文件前缀：写盘先落到目标**同目录**（跨目录就不是同卷，rename 会失效），
+/// 名字带进程号与自增序号，避免两个插件同时写同一目标时互相踩。
+const WRITE_TEMP_PREFIX: &str = ".aiide-write";
 
 /// 方法 → 所需能力。返回 `None` 的方法就是「v1 未实现」，回 `-32601`。
 ///
@@ -63,7 +84,65 @@ fn capability_of(method: &str) -> Option<&'static str> {
     match method {
         "host/fs.read" | "host/fs.list" | "host/fs.stat" | "host/workspace.info" => Some("fs.read"),
         "host/search.content" => Some("search"),
+        // 写侧单列能力：docs/14 §7.1 里 `fs.write` 是独立一行，授权粒度不同
+        // （读可以用一次授权覆盖全部读，写要按文件审批）。
+        "host/fs.write" => Some("fs.write"),
         _ => None,
+    }
+}
+
+/// 写侧审批结论。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteApproval {
+    /// 只放行这一次。
+    AllowOnce,
+    /// 放行并记住 `scope_key`，同一目标的后续写入不再打扰用户。
+    AllowAlways,
+    /// 明确拒绝。
+    Reject,
+}
+
+/// 一次写侧审批请求。
+///
+/// `scope_key` 是**规范化绝对路径**（正斜杠、Windows 下统一小写），它同时是
+/// 「总是允许」的落键粒度（docs/14 §7.1：按文件）与审计里可对账的标识；
+/// `path` 只是给用户看的相对路径，不参与任何判定。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteApprovalRequest {
+    pub plugin_id: String,
+    pub method: String,
+    pub path: String,
+    pub scope_key: String,
+}
+
+/// 写侧审批的裁决方。
+///
+/// 同步签名是刻意的：判定跑在插件 stdout 的帧泵上，异步等一个 UI 回执会把该
+/// 插件的所有回包一起堵住。实现方要接 UI，就自己用带超时的同步等待（超时返回
+/// `None` = 不表态 = 拒），绝不能在这里 `block_on` 一个无限期的等待。
+///
+/// 返回 `None` 按「拒绝」处理：审批链断了的时候，默认值必须是「不写」。
+pub trait WriteApprover: Send + Sync {
+    fn decide(&self, request: &WriteApprovalRequest) -> Option<WriteApproval>;
+}
+
+/// 写侧的 `scope_key`：规范化绝对路径。
+///
+/// 三条归一：反斜杠统一成正斜杠、Windows 下转小写（文件系统大小写不敏感，
+/// 不折小写就能用 `A.txt` / `a.txt` 把「按文件审批」变成「每条路径问一次」）、
+/// 去掉尾部斜杠。不用 `canonicalize`：它要求路径已存在，而写侧大量是新建文件。
+pub fn write_scope_key(abs: &Path) -> String {
+    let text = abs.to_string_lossy().replace('\\', "/");
+    let trimmed = text.trim_end_matches('/');
+    let key = if trimmed.is_empty() {
+        text
+    } else {
+        trimmed.to_string()
+    };
+    if cfg!(windows) {
+        key.to_ascii_lowercase()
+    } else {
+        key
     }
 }
 
@@ -83,13 +162,70 @@ pub struct FsHostApi {
     store: RwLock<Option<Store>>,
     /// 每插件在当前工具调用内的宿主调用计数。
     quota: Mutex<HashMap<String, usize>>,
+    /// 写侧审批裁决方。没装 = 没人能批准 = 写请求一律 3001（fail closed）。
+    approver: RwLock<Option<Arc<dyn WriteApprover>>>,
+    /// 已「总是允许」的写侧 `scope_key` 集合（规范化绝对路径）。
+    ///
+    /// 与账本里的免问规则同粒度：一条规则 = 一个文件的绝对路径。装载时用
+    /// [`FsHostApi::seed_write_always`] 从库里灌回来，撤销时用同一入口覆盖。
+    /// 落库持久化留给审批链路接线（切片三）：当前只在进程内生效，重启即忘，
+    /// 也就是「重启后重新问一次」——偏保守的那一侧，不会变成静默放行。
+    write_always: RwLock<HashSet<String>>,
     /// 审计 `callId` 的自增序号（进程内唯一即可，不跨进程对齐）。
     calls: AtomicU64,
+    /// 临时文件名里的自增序号（不复用 `calls`：临时文件与审计编号没有关系，
+    /// 混用会让 callId 出现「跳过」的假象）。
+    temps: AtomicU64,
 }
 
 impl Default for FsHostApi {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// 落一行 `plugin.host_call` 所需的原料。
+///
+/// 收成结构体而不是七个位置参数：调用处几乎都是 `Option` 字段，位置参数一多
+/// 就分不清「这个 `None` 是 target 还是 scope_key」。用 [`Self::new`] 起头，
+/// 再用 `target` / `scope_key` 按需补，读起来跟审计字段一一对应。
+struct HostCallAudit<'a> {
+    plugin_id: &'a str,
+    method: &'a str,
+    capability: &'a str,
+    call_id: &'a str,
+    decision: &'a str,
+    target: Option<&'a str>,
+    scope_key: Option<&'a str>,
+}
+
+impl<'a> HostCallAudit<'a> {
+    fn new(
+        plugin_id: &'a str,
+        method: &'a str,
+        capability: &'a str,
+        call_id: &'a str,
+        decision: &'a str,
+    ) -> Self {
+        Self {
+            plugin_id,
+            method,
+            capability,
+            call_id,
+            decision,
+            target: None,
+            scope_key: None,
+        }
+    }
+
+    fn target(mut self, target: Option<&'a str>) -> Self {
+        self.target = target;
+        self
+    }
+
+    fn scope_key(mut self, scope_key: Option<&'a str>) -> Self {
+        self.scope_key = scope_key;
+        self
     }
 }
 
@@ -101,8 +237,49 @@ impl FsHostApi {
             by_plugin: Arc::new(RwLock::new(HashMap::new())),
             store: RwLock::new(None),
             quota: Mutex::new(HashMap::new()),
+            approver: RwLock::new(None),
+            write_always: RwLock::new(HashSet::new()),
             calls: AtomicU64::new(0),
+            temps: AtomicU64::new(0),
         }
+    }
+
+    /// 装上写侧审批裁决方（`AppState` 接线 / 单测注入）。
+    pub fn set_write_approver(&self, approver: Arc<dyn WriteApprover>) {
+        if let Ok(mut slot) = self.approver.write() {
+            *slot = Some(approver);
+        }
+    }
+
+    /// 用一份完整的「总是允许」集合覆盖当前集合（装载 / 撤销后刷新用）。
+    ///
+    /// 覆盖而不是追加：撤销一条规则后必须能真的忘掉，追加语义做不到这一点。
+    pub fn seed_write_always(&self, keys: Vec<String>) {
+        if let Ok(mut slot) = self.write_always.write() {
+            *slot = keys
+                .into_iter()
+                .map(|key| write_scope_key(Path::new(&key)))
+                .collect();
+        }
+    }
+
+    /// 记一条「总是允许」的写侧范围。
+    pub fn remember_write_always(&self, scope_key: &str) {
+        if let Ok(mut slot) = self.write_always.write() {
+            slot.insert(scope_key.to_string());
+        }
+    }
+
+    /// 该 `scope_key` 是否已被「总是允许」。
+    pub fn is_write_always(&self, scope_key: &str) -> bool {
+        self.write_always
+            .read()
+            .map(|slot| slot.contains(scope_key))
+            .unwrap_or(false)
+    }
+
+    fn approver_snapshot(&self) -> Option<Arc<dyn WriteApprover>> {
+        self.approver.read().ok().and_then(|slot| slot.clone())
     }
 
     /// 装上会话库（`AppState::install_store` 调一次）。审计全靠它，没装就静默跳过。
@@ -187,31 +364,38 @@ impl FsHostApi {
     ///
     /// `session_id` 暂为空：P3.5 的宿主调用发生在插件工具执行内部，这条路径上
     /// 拿不到「当前会话 id」（工具上下文里没有它），编一个假 id 比留空更坏。
-    fn audit(
-        &self,
-        plugin_id: &str,
-        method: &str,
-        capability: &str,
-        target: Option<&str>,
-        decision: &str,
-        call_id: &str,
-    ) {
+    fn audit(&self, entry: HostCallAudit<'_>) {
         let Some(store) = self.store_snapshot() else {
             return;
         };
-        let event = NewAuditEvent::by(
-            audit_actor::PLUGIN,
-            audit_kind::PLUGIN_HOST_CALL,
-            format!("插件 {plugin_id} 调用 {method}：{decision}"),
-        )
-        .with_detail(json!({
+        let HostCallAudit {
+            plugin_id,
+            method,
+            capability,
+            call_id,
+            decision,
+            target,
+            scope_key,
+        } = entry;
+        let mut detail = json!({
             "pluginId": plugin_id,
             "method": method,
             "capability": capability,
             "target": target,
             "decision": decision,
             "callId": call_id,
-        }));
+        });
+        // 写侧才带 `scopeKey`：读侧没有「按文件授权」这回事，塞一个空字段
+        // 只会让审计查询多一个永远为 null 的列。
+        if let Some(key) = scope_key {
+            detail["scopeKey"] = json!(key);
+        }
+        let event = NewAuditEvent::by(
+            audit_actor::PLUGIN,
+            audit_kind::PLUGIN_HOST_CALL,
+            format!("插件 {plugin_id} 调用 {method}：{decision}"),
+        )
+        .with_detail(detail);
 
         // 异步落库。拿不到运行时（同步单测、非 Tokio 线程）就跳过：这条路径上
         // 绝不能 `block_on`，那会把插件的帧泵连同回包一起卡住。
@@ -269,13 +453,7 @@ impl FsHostApi {
             )
         })?;
         let joined = root_abs.join(trimmed);
-        let abs = if joined.exists() {
-            joined
-                .canonicalize()
-                .unwrap_or_else(|_| normalize_lexically(&joined))
-        } else {
-            normalize_lexically(&joined)
-        };
+        let abs = canonicalize_lenient(&joined);
 
         if !within(&root_abs, &abs) {
             return Err(HostApiError::path_out_of_workspace(
@@ -387,6 +565,160 @@ impl FsHostApi {
             "size": meta.len(),
             "mtime": mtime,
             "dir": meta.is_dir(),
+        }))
+    }
+
+    /// 写侧审批闸门（docs/14 §8.1 ⑤）。
+    ///
+    /// 命中「总是允许」不打搅用户；否则交给 [`WriteApprover`] 当场裁决。
+    /// 裁决方缺失、没答复、明确拒绝，一律 3001——写盘的默认值只能是「不写」。
+    fn approve_write(
+        &self,
+        plugin_id: &str,
+        method: &str,
+        path: &str,
+        scope_key: &str,
+        call_id: &str,
+    ) -> Result<(), HostApiError> {
+        if self.is_write_always(scope_key) {
+            // 之前已经批过这个文件：不再打扰用户，也不重复记 `approve`
+            // （审计里那一条 approve 已经存在，重复记会让「批过几次」失真）。
+            return Ok(());
+        }
+        let request = WriteApprovalRequest {
+            plugin_id: plugin_id.to_string(),
+            method: method.to_string(),
+            path: path.to_string(),
+            scope_key: scope_key.to_string(),
+        };
+        let decision = self
+            .approver_snapshot()
+            .and_then(|approver| approver.decide(&request));
+        // 写侧审计行形状固定（capability 恒为 fs.write，target 与 scopeKey 恒有值），
+        // 只有 decision 不同；用嵌套 fn 而不是闭包，是因为这里要显式声明
+        // 「返回值的生命周期跟着入参走」，闭包写不出这个约束。
+        fn approval_audit<'a>(
+            plugin_id: &'a str,
+            method: &'a str,
+            path: &'a str,
+            scope_key: &'a str,
+            call_id: &'a str,
+            decision: &'a str,
+        ) -> HostCallAudit<'a> {
+            HostCallAudit::new(plugin_id, method, "fs.write", call_id, decision)
+                .target(Some(path))
+                .scope_key(Some(scope_key))
+        }
+        match decision {
+            Some(WriteApproval::AllowAlways) => {
+                self.remember_write_always(scope_key);
+                self.audit(approval_audit(
+                    plugin_id,
+                    method,
+                    path,
+                    scope_key,
+                    call_id,
+                    DECISION_APPROVE,
+                ));
+                Ok(())
+            }
+            Some(WriteApproval::AllowOnce) => {
+                self.audit(approval_audit(
+                    plugin_id,
+                    method,
+                    path,
+                    scope_key,
+                    call_id,
+                    DECISION_APPROVE,
+                ));
+                Ok(())
+            }
+            Some(WriteApproval::Reject) | None => {
+                self.audit(approval_audit(
+                    plugin_id,
+                    method,
+                    path,
+                    scope_key,
+                    call_id,
+                    DECISION_REJECT,
+                ));
+                Err(HostApiError::tool_not_allowed(method, scope_key))
+            }
+        }
+    }
+
+    /// 把 `content` + `encoding` 解成待写字节。
+    ///
+    /// 这一段的错误全是 `-32602`，且它必须在审批之前跑完：否则一个畸形请求也会
+    /// 弹出审批框，用户批了才发现参数根本不对——白打扰一次。
+    fn write_payload(params: &Value) -> Result<Vec<u8>, HostApiError> {
+        let content = match params.get("content") {
+            Some(Value::String(text)) => text,
+            None | Some(Value::Null) => {
+                return Err(HostApiError::invalid_params("缺少 content 参数"))
+            }
+            Some(_) => return Err(HostApiError::invalid_params("content 必须是字符串")),
+        };
+        let encoding = match params.get("encoding") {
+            None | Some(Value::Null) => "utf8",
+            Some(Value::String(text)) => text.as_str(),
+            Some(_) => return Err(HostApiError::invalid_params("encoding 必须是字符串")),
+        };
+        match encoding.to_ascii_lowercase().as_str() {
+            "utf8" | "utf-8" => Ok(content.as_bytes().to_vec()),
+            // 插件写二进制（图片、导出包）不该被迫做十六进制，给 base64 就够：
+            // 帧是 JSON，塞不下裸字节。
+            "base64" => BASE64.decode(content).map_err(|err| {
+                HostApiError::invalid_params(format!("content 不是合法 base64：{err}"))
+            }),
+            other => Err(HostApiError::invalid_params(format!(
+                "不支持的 encoding：{other}（支持 utf8 / base64）"
+            ))),
+        }
+    }
+
+    /// `host/fs.write`：临时文件 → `fsync` → `rename`。
+    ///
+    /// `rename` 只在同卷上原子，所以临时文件必须落在**目标同目录**；先 `fsync`
+    /// 是为了让「rename 成功」真的等于「内容已经落盘」，否则掉电后可能留下一个
+    /// 名字对、内容为空的文件——比半个文件更难查。
+    ///
+    /// 参数解码与「目标是目录」的检查都在审批之前做完（见 [`Self::write_payload`]
+    /// 与 `call` 里的写侧闸门），进到这里的只剩「真的要落盘」这一件事。
+    fn fs_write(&self, abs: &Path, bytes: &[u8], existed: bool) -> Result<Value, HostApiError> {
+        let display = self.display_path(abs);
+        let parent = abs.parent().ok_or_else(|| {
+            HostApiError::new(HostApiError::IO, format!("{display} 没有可写入的父目录"))
+        })?;
+        // 目录不存在就补建：v1 没有 `fs.mkdir`，不补建的话插件连新建目录下的
+        // 第一个文件都写不了。范围已经过路径闸门，建目录不会越出工作区。
+        std::fs::create_dir_all(parent).map_err(|err| write_error(&display, &err))?;
+
+        let seq = self.temps.fetch_add(1, Ordering::Relaxed) + 1;
+        let temp = parent.join(format!(
+            "{WRITE_TEMP_PREFIX}-{}-{seq}.tmp",
+            std::process::id()
+        ));
+        let written = (|| -> std::io::Result<()> {
+            let mut file = File::create(&temp)?;
+            file.write_all(bytes)?;
+            file.sync_all()
+        })();
+        if let Err(err) = written {
+            remove_temp(&temp);
+            return Err(write_error(&display, &err));
+        }
+        if let Err(err) = std::fs::rename(&temp, abs) {
+            // 失败就别把临时文件留给用户：否则工作区里会慢慢堆出
+            // `.aiide-write-*.tmp`，而且 `fs.list` 会把它们当正常文件报出去。
+            remove_temp(&temp);
+            return Err(write_error(&display, &err));
+        }
+
+        Ok(json!({
+            "path": display,
+            "bytes": bytes.len(),
+            "created": !existed,
         }))
     }
 
@@ -535,19 +867,19 @@ impl HostApi for FsHostApi {
         // 闸门 ①：能力。
         if !self.is_granted(plugin_id, capability) {
             self.audit(
-                plugin_id,
-                method,
-                capability,
-                audit_target(params),
-                DECISION_DENY,
-                &call_id,
+                HostCallAudit::new(plugin_id, method, capability, &call_id, DECISION_DENY)
+                    .target(audit_target(params)),
             );
             return Err(HostApiError::unauthorized(method, capability));
         }
 
         // 闸门 ②：路径（`workspace.info` / `search.content` 没有入参路径，
         // 搜索的遍历范围就是工作区根，越界问题由遍历本身保证）。
-        let resolved = if matches!(method, "host/fs.read" | "host/fs.list" | "host/fs.stat") {
+        let path_method = matches!(
+            method,
+            "host/fs.read" | "host/fs.list" | "host/fs.stat" | "host/fs.write"
+        );
+        let resolved = if path_method {
             match params.get("path") {
                 Some(Value::String(raw)) => self.resolve(raw).map(Some),
                 None | Some(Value::Null) => Err(HostApiError::invalid_params("缺少 path 参数")),
@@ -560,26 +892,56 @@ impl HostApi for FsHostApi {
             Ok(abs) => abs,
             Err(err) => {
                 self.audit(
-                    plugin_id,
-                    method,
-                    capability,
-                    audit_target(params),
-                    DECISION_DENY,
-                    &call_id,
+                    HostCallAudit::new(plugin_id, method, capability, &call_id, DECISION_DENY)
+                        .target(audit_target(params)),
                 );
                 return Err(err);
             }
         };
 
-        // 闸门 ③：配额（200 次/工具调用）。
+        // 闸门 ③：审批（写侧专属）。顺序是「参数解码 → 目标形状 → 审批」：
+        // 先问用户、再发现参数畸形，等于拿审批弹窗当校验器，白打扰一次；
+        // 而路径必须更早过闸门，否则弹窗就成了「这个路径敏不敏感」的探测器。
+        let mut scope_key: Option<String> = None;
+        let mut write_payload: Option<(Vec<u8>, bool)> = None;
+        if method == "host/fs.write" {
+            if let Some(path) = abs.as_deref() {
+                let display = self.display_path(path);
+                // 写侧所有「还没到审批就失败」的分支，审计形状都一样：记 deny +
+                // 目标路径，好让审计里能看出「这次为什么没问用户」。
+                let deny = |err: HostApiError| -> HostApiError {
+                    self.audit(
+                        HostCallAudit::new(plugin_id, method, capability, &call_id, DECISION_DENY)
+                            .target(Some(&display)),
+                    );
+                    err
+                };
+                let bytes = Self::write_payload(params).map_err(deny)?;
+                if path.is_dir() {
+                    return Err(deny(HostApiError::new(
+                        HostApiError::IO,
+                        format!("{display} 是目录，不能按文件写入"),
+                    )));
+                }
+                let key = write_scope_key(path);
+                self.approve_write(plugin_id, method, &display, &key, &call_id)?;
+                scope_key = Some(key);
+                write_payload = Some((bytes, path.exists()));
+            }
+        }
+
+        // 闸门 ④：配额（200 次/工具调用）。
         if !self.take_quota(plugin_id) {
             self.audit(
-                plugin_id,
-                method,
-                capability,
-                audit_target(params),
-                DECISION_QUOTA_EXCEEDED,
-                &call_id,
+                HostCallAudit::new(
+                    plugin_id,
+                    method,
+                    capability,
+                    &call_id,
+                    DECISION_QUOTA_EXCEEDED,
+                )
+                .target(audit_target(params))
+                .scope_key(scope_key.as_deref()),
             );
             return Err(HostApiError::new(
                 HostApiError::QUOTA_EXCEEDED,
@@ -595,6 +957,14 @@ impl HostApi for FsHostApi {
             (Some(path), "host/fs.read") => self.fs_read(path, params),
             (Some(path), "host/fs.list") => self.fs_list(path),
             (Some(path), "host/fs.stat") => self.fs_stat(path),
+            (Some(path), "host/fs.write") => match write_payload {
+                Some((bytes, existed)) => self.fs_write(path, &bytes, existed),
+                // 走不到：写侧的 payload 在上面的闸门里已经备好。
+                None => Err(HostApiError::new(
+                    HostApiError::METHOD_NOT_FOUND,
+                    "写侧参数缺失",
+                )),
+            },
             (None, "host/workspace.info") => self.workspace_info(),
             (None, "host/search.content") => self.search_content(params),
             (_, other) => Err(HostApiError::new(
@@ -608,12 +978,9 @@ impl HostApi for FsHostApi {
             DECISION_ERROR
         };
         self.audit(
-            plugin_id,
-            method,
-            capability,
-            target.as_deref(),
-            decision,
-            &call_id,
+            HostCallAudit::new(plugin_id, method, capability, &call_id, decision)
+                .target(target.as_deref())
+                .scope_key(scope_key.as_deref()),
         );
         outcome
     }
@@ -680,6 +1047,48 @@ fn normalize_lexically(path: &Path) -> PathBuf {
         out.push(part.as_os_str());
     }
     out
+}
+
+/// 规范化一个「可能还不存在」的路径。
+///
+/// `canonicalize` 只认已存在的路径，而写侧大量是新建文件，所以分两段：目标
+/// 存在就直接规范化；不存在就把**最深的已存在祖先**规范化，再把剩余段拼回去。
+/// 只对整串做词法规范化是不够的——父目录是符号链接、指向工作区外时，
+/// 词法路径看着干净，实际写出去就出界了。
+fn canonicalize_lenient(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    let mut probe = path.to_path_buf();
+    let mut rest: Vec<OsString> = Vec::new();
+    while let Some(name) = probe.file_name().map(|name| name.to_os_string()) {
+        rest.push(name);
+        if !probe.pop() {
+            break;
+        }
+        if probe.exists() {
+            let mut base = probe.canonicalize().unwrap_or_else(|_| probe.clone());
+            for part in rest.iter().rev() {
+                base.push(part);
+            }
+            return normalize_lexically(&base);
+        }
+    }
+    normalize_lexically(path)
+}
+
+/// 写盘失败的错误码：父目录不存在给 1004，其余（权限、占用、跨卷）给 1005。
+fn write_error(display: &str, err: &std::io::Error) -> HostApiError {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        return HostApiError::new(HostApiError::NOT_FOUND, format!("路径不存在：{display}"));
+    }
+    HostApiError::new(HostApiError::IO, format!("写入 {display} 失败：{err}"))
+}
+
+/// 收拾临时文件。删不掉也不算错：这次写入本来就要报错了，把临时文件的
+/// 错误盖到写入错误上，用户看到的原因会跑偏。
+fn remove_temp(temp: &Path) {
+    let _ = std::fs::remove_file(temp);
 }
 
 /// 把 IO 错误翻译成协议错误码：不存在给 1004，其余（权限 / 设备）给 1005。
@@ -935,18 +1344,473 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// 假审批器：答复固定结论，并记下问过几次、问了什么。
+    struct StubApprover {
+        reply: Option<WriteApproval>,
+        seen: Mutex<Vec<WriteApprovalRequest>>,
+    }
+
+    impl StubApprover {
+        fn answering(reply: Option<WriteApproval>) -> Arc<Self> {
+            Arc::new(Self {
+                reply,
+                seen: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn asked(&self) -> Vec<WriteApprovalRequest> {
+            self.seen
+                .lock()
+                .map(|rows| rows.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    impl WriteApprover for StubApprover {
+        fn decide(&self, request: &WriteApprovalRequest) -> Option<WriteApproval> {
+            if let Ok(mut rows) = self.seen.lock() {
+                rows.push(request.clone());
+            }
+            self.reply
+        }
+    }
+
+    /// 工作区根目录里的临时文件（`.aiide-write-*.tmp`），用来断言「没留垃圾」。
+    fn temp_files(root: &Path) -> Vec<String> {
+        std::fs::read_dir(root)
+            .map(|items| {
+                items
+                    .flatten()
+                    .map(|item| item.file_name().to_string_lossy().to_string())
+                    .filter(|name| name.starts_with(WRITE_TEMP_PREFIX))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 拒绝审批时必须 3001，且**文件一个都不能出现**（连临时文件都不许留）。
+    #[test]
+    fn fs_write_rejection_leaves_no_file() {
+        let root = sandbox("write-reject");
+        let api = api_with(&root, &["fs.write"]);
+        let approver = StubApprover::answering(Some(WriteApproval::Reject));
+        api.set_write_approver(approver.clone());
+
+        let err = api
+            .call(
+                "demo",
+                "host/fs.write",
+                &json!({ "path": "note.txt", "content": "hello" }),
+            )
+            .expect_err("被驳回的写必须失败");
+        assert_eq!(err.code, HostApiError::TOOL_NOT_ALLOWED);
+        assert!(
+            !root.join("note.txt").exists(),
+            "审批拒绝后文件不能产生：{:?}",
+            std::fs::read_dir(&root)
+                .map(|it| it.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+        );
+        assert!(temp_files(&root).is_empty(), "临时文件也必须收拾干净");
+        assert_eq!(approver.asked().len(), 1, "应该只问一次");
+        assert_eq!(
+            api.quota_used("demo"),
+            0,
+            "审批排在配额前面：被驳回的写不该消耗额度"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 没有装裁决方 = 无人能批准 = 拒（fail closed），文件同样不许出现。
+    #[test]
+    fn fs_write_without_approver_is_rejected() {
+        let root = sandbox("write-noapprover");
+        let api = api_with(&root, &["fs.write"]);
+
+        let err = api
+            .call(
+                "demo",
+                "host/fs.write",
+                &json!({ "path": "orphan.txt", "content": "x" }),
+            )
+            .expect_err("没人批准就写不了");
+        assert_eq!(err.code, HostApiError::TOOL_NOT_ALLOWED);
+        assert!(!root.join("orphan.txt").exists(), "不能落盘");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 一次授权只管一次：第二次写还得再问。
+    #[test]
+    fn fs_write_allow_once_asks_every_time() {
+        let root = sandbox("write-once");
+        let api = api_with(&root, &["fs.write"]);
+        let approver = StubApprover::answering(Some(WriteApproval::AllowOnce));
+        api.set_write_approver(approver.clone());
+
+        for content in ["first", "second"] {
+            api.call(
+                "demo",
+                "host/fs.write",
+                &json!({ "path": "note.txt", "content": content }),
+            )
+            .expect("一次授权放行一次");
+        }
+        assert_eq!(approver.asked().len(), 2, "AllowOnce 不该被记住");
+        assert_eq!(
+            std::fs::read_to_string(root.join("note.txt")).expect("读回"),
+            "second",
+            "后写覆盖前写"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `always` 按规范化绝对路径记账：同一文件不再问，换文件、换插件都重新问。
+    #[test]
+    fn fs_write_allow_always_is_remembered_per_file() {
+        let root = sandbox("write-always");
+        std::fs::create_dir_all(root.join("sub")).expect("建子目录");
+        let api = api_with(&root, &["fs.write"]);
+        let approver = StubApprover::answering(Some(WriteApproval::AllowAlways));
+        api.set_write_approver(approver.clone());
+
+        // 同一个文件的另一种写法（`./` 前缀、反斜杠分隔），都是同一个 scope_key。
+        api.call(
+            "demo",
+            "host/fs.write",
+            &json!({ "path": "note.txt", "content": "a" }),
+        )
+        .expect("首次写入");
+        api.call(
+            "demo",
+            "host/fs.write",
+            &json!({ "path": "./note.txt", "content": "b" }),
+        )
+        .expect("同路径换写法也该免问");
+        assert_eq!(approver.asked().len(), 1, "同一文件只问一次");
+
+        api.call(
+            "demo",
+            "host/fs.write",
+            &json!({ "path": "sub/other.txt", "content": "c" }),
+        )
+        .expect("换文件");
+        assert_eq!(approver.asked().len(), 2, "换了文件必须重新问");
+
+        // 大小写不同也算同一个文件：Windows 文件系统不区分大小写，
+        // 不折小写就等于把「按文件审批」变成「每条路径问一次」。
+        api.call(
+            "demo",
+            "host/fs.write",
+            &json!({ "path": "NOTE.TXT", "content": "d" }),
+        )
+        .expect("同文件换大小写");
+        assert_eq!(
+            approver.asked().len(),
+            2,
+            "Windows 下大小写不构成新文件：{:?}",
+            approver
+                .asked()
+                .iter()
+                .map(|row| row.scope_key.clone())
+                .collect::<Vec<_>>()
+        );
+
+        // 账本里存的键是规范化绝对路径（正斜杠 + 小写），撤销时才能对上。
+        let key = write_scope_key(&root.canonicalize().expect("规范化根").join("note.txt"));
+        assert!(api.is_write_always(&key), "always 应落在规范化绝对路径上");
+        assert!(!key.contains('\\'), "scope_key 必须是正斜杠：{key}");
+        assert_eq!(key, key.to_ascii_lowercase(), "Windows 下应折小写：{key}");
+
+        // 覆盖式刷新能把它真的忘掉（撤销规则后必须立刻生效）。
+        api.seed_write_always(Vec::new());
+        assert!(!api.is_write_always(&key), "撤销后应忘掉");
+        api.call(
+            "demo",
+            "host/fs.write",
+            &json!({ "path": "note.txt", "content": "e" }),
+        )
+        .expect("重新批准");
+        assert_eq!(approver.asked().len(), 3, "撤销后必须重新问");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 写盘是原子的：覆盖后内容整体替换，且不留下临时文件。
+    #[test]
+    fn fs_write_replaces_atomically_without_temp_leftovers() {
+        let root = sandbox("write-atomic");
+        std::fs::write(root.join("note.txt"), "old-content").expect("预置文件");
+        let api = api_with(&root, &["fs.write"]);
+        api.set_write_approver(StubApprover::answering(Some(WriteApproval::AllowOnce)));
+
+        let written = api
+            .call(
+                "demo",
+                "host/fs.write",
+                &json!({ "path": "note.txt", "content": "brand new" }),
+            )
+            .expect("写入应成功");
+        assert_eq!(written["path"], "note.txt");
+        assert_eq!(written["bytes"], 9);
+        assert_eq!(written["created"], false, "已存在的文件不算新建");
+        assert_eq!(
+            std::fs::read_to_string(root.join("note.txt")).expect("读回"),
+            "brand new"
+        );
+        assert!(temp_files(&root).is_empty(), "rename 之后不该留住临时文件");
+
+        // 多层新目录 + base64 内容：目录要能自动补建，字节要按解码后算。
+        let nested = api
+            .call(
+                "demo",
+                "host/fs.write",
+                &json!({
+                    "path": "a/b/c.bin",
+                    "content": BASE64.encode([0u8, 1, 2, 3]),
+                    "encoding": "base64",
+                }),
+            )
+            .expect("建目录 + 写二进制");
+        assert_eq!(nested["created"], true, "新文件要报 created");
+        assert_eq!(nested["bytes"], 4, "bytes 按解码后的字节数算");
+        assert_eq!(
+            std::fs::read(root.join("a/b/c.bin")).expect("读回字节"),
+            vec![0u8, 1, 2, 3],
+            "base64 必须如实解码落盘"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 参数不对就别写：缺 content、encoding 不认识、目标是目录。
+    #[test]
+    fn fs_write_validates_params_before_touching_disk() {
+        let root = sandbox("write-params");
+        std::fs::create_dir_all(root.join("adir")).expect("建目录");
+        let api = api_with(&root, &["fs.write"]);
+        let approver = StubApprover::answering(Some(WriteApproval::AllowOnce));
+        api.set_write_approver(approver.clone());
+
+        let missing = api
+            .call("demo", "host/fs.write", &json!({ "path": "x.txt" }))
+            .expect_err("缺 content");
+        assert_eq!(missing.code, HostApiError::INVALID_PARAMS);
+
+        let bad_encoding = api
+            .call(
+                "demo",
+                "host/fs.write",
+                &json!({ "path": "x.txt", "content": "x", "encoding": "gbk" }),
+            )
+            .expect_err("不认识的 encoding");
+        assert_eq!(bad_encoding.code, HostApiError::INVALID_PARAMS);
+
+        let dir_target = api
+            .call(
+                "demo",
+                "host/fs.write",
+                &json!({ "path": "adir", "content": "x" }),
+            )
+            .expect_err("目录不能当文件写");
+        assert_eq!(dir_target.code, HostApiError::IO);
+        assert!(!root.join("x.txt").exists(), "参数错误不该留下文件");
+        assert!(
+            approver.asked().is_empty(),
+            "参数 / 目标形状没过关就不该问用户"
+        );
+
+        // 反证：参数对了才会走到审批，也只问这一次。
+        api.call(
+            "demo",
+            "host/fs.write",
+            &json!({ "path": "x.txt", "content": "ok" }),
+        )
+        .expect("合法请求应写入");
+        assert_eq!(approver.asked().len(), 1, "只有通过校验的那次才该去审批");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 写侧的路径闸门：越界 / 敏感一律在审批之前拒掉，别让弹窗变成探测器。
+    #[test]
+    fn fs_write_path_gate_rejects_before_approval() {
+        let root = sandbox("write-path");
+        let api = api_with(&root, &["fs.write"]);
+        let approver = StubApprover::answering(Some(WriteApproval::AllowAlways));
+        api.set_write_approver(approver.clone());
+
+        let cases = [
+            ("../escape.txt", HostApiError::PATH_OUT_OF_WORKSPACE),
+            ("C:/Windows/evil.txt", HostApiError::PATH_OUT_OF_WORKSPACE),
+            (".env", HostApiError::PATH_DENIED),
+            (".git/config", HostApiError::PATH_DENIED),
+        ];
+        for (path, code) in cases {
+            let err = api
+                .call(
+                    "demo",
+                    "host/fs.write",
+                    &json!({ "path": path, "content": "x" }),
+                )
+                .expect_err("必须拒");
+            assert_eq!(err.code, code, "{path}");
+        }
+        assert!(approver.asked().is_empty(), "路径没过闸门就不该问用户");
+        assert!(
+            !root.join("escape.txt").exists(),
+            "越界路径不能在工作区里留下东西"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 写侧审批被驳回要落 `reject` 行；成功则先 `approve` 再 `allow`，且都带 scopeKey。
+    #[tokio::test]
+    async fn fs_write_audits_approve_reject_and_allow() {
+        let root = sandbox("write-audit");
+        let (api, store) = api_with_store(&root, &["fs.write"], "write").await;
+
+        let rejecter = StubApprover::answering(Some(WriteApproval::Reject));
+        api.set_write_approver(rejecter);
+        api.call(
+            "demo",
+            "host/fs.write",
+            &json!({ "path": "denied.txt", "content": "x" }),
+        )
+        .expect_err("被驳回");
+
+        let rows =
+            FsHostApi::wait_audit(&store, |row| row.detail["decision"] == DECISION_REJECT).await;
+        let rejected = rows
+            .iter()
+            .find(|row| row.detail["decision"] == DECISION_REJECT)
+            .expect("应有一行 reject");
+        assert_eq!(rejected.detail["capability"], "fs.write");
+        assert_eq!(rejected.detail["target"], "denied.txt");
+        assert_eq!(rejected.detail["pluginId"], "demo");
+        assert!(
+            rejected.detail["scopeKey"]
+                .as_str()
+                .unwrap_or("")
+                .ends_with("/denied.txt"),
+            "审计要带规范化绝对路径：{}",
+            rejected.detail
+        );
+
+        // 换成放行，再写一次：应出现 approve 与 allow 两行，且共用同一个 callId。
+        api.set_write_approver(StubApprover::answering(Some(WriteApproval::AllowOnce)));
+        api.call(
+            "demo",
+            "host/fs.write",
+            &json!({ "path": "ok.txt", "content": "y" }),
+        )
+        .expect("放行后写入成功");
+
+        let rows =
+            FsHostApi::wait_audit(&store, |row| row.detail["decision"] == DECISION_ALLOW).await;
+        let allowed = rows
+            .iter()
+            .find(|row| row.detail["decision"] == DECISION_ALLOW)
+            .expect("应有一行 allow");
+        assert_eq!(allowed.detail["method"], "host/fs.write");
+        assert_eq!(allowed.detail["target"], "ok.txt");
+        let call_id = allowed.detail["callId"].as_str().unwrap_or("").to_string();
+        let approve = rows
+            .iter()
+            .find(|row| row.detail["decision"] == DECISION_APPROVE)
+            .expect("应有一行 approve");
+        assert_eq!(approve.detail["callId"], call_id, "同一调用要能对账");
+        assert_eq!(approve.detail["target"], "ok.txt");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 写侧也吃同一份配额：第 201 次写先被审批挡，再被配额挡（审批在前）。
+    #[tokio::test]
+    async fn fs_write_shares_the_quota_and_audits_overflow() {
+        let root = sandbox("write-quota");
+        let (api, store) = api_with_store(&root, &["fs.write"], "write-quota").await;
+        api.set_write_approver(StubApprover::answering(Some(WriteApproval::AllowAlways)));
+        api.begin_call("demo");
+
+        for index in 0..QUOTA_PER_CALL {
+            api.call(
+                "demo",
+                "host/fs.write",
+                &json!({ "path": "loop.txt", "content": format!("{index}") }),
+            )
+            .unwrap_or_else(|err| panic!("第 {index} 次不该失败：{err:?}"));
+        }
+        let denied = api
+            .call(
+                "demo",
+                "host/fs.write",
+                &json!({ "path": "loop.txt", "content": "overflow" }),
+            )
+            .expect_err("第 201 次必须超配额");
+        assert_eq!(
+            denied.code,
+            HostApiError::QUOTA_EXCEEDED,
+            "审批过了才轮到配额"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("loop.txt")).expect("读回"),
+            format!("{}", QUOTA_PER_CALL - 1),
+            "超配额的写不能落盘"
+        );
+
+        let rows = FsHostApi::wait_audit(&store, |row| {
+            row.detail["decision"] == DECISION_QUOTA_EXCEEDED
+        })
+        .await;
+        let overflow = rows
+            .iter()
+            .find(|row| row.detail["decision"] == DECISION_QUOTA_EXCEEDED)
+            .expect("应有 quota_exceeded 行");
+        assert_eq!(overflow.detail["capability"], "fs.write");
+        assert!(
+            overflow.detail["scopeKey"]
+                .as_str()
+                .unwrap_or("")
+                .ends_with("/loop.txt"),
+            "超配额的行也要带 scopeKey：{}",
+            overflow.detail
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 没授权 `fs.write` 一律 6103，且不会被问审批。
+    #[test]
+    fn fs_write_needs_the_capability() {
+        let root = sandbox("write-unauth");
+        let api = api_with(&root, &["fs.read"]);
+        let approver = StubApprover::answering(Some(WriteApproval::AllowAlways));
+        api.set_write_approver(approver.clone());
+
+        let err = api
+            .call(
+                "demo",
+                "host/fs.write",
+                &json!({ "path": "x.txt", "content": "x" }),
+            )
+            .expect_err("没有 fs.write 能力");
+        assert_eq!(err.code, HostApiError::UNAUTHORIZED);
+        assert!(approver.asked().is_empty(), "没能力就不该惊动审批");
+        assert!(!root.join("x.txt").exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// 未实现的方法回 -32601，且不去碰闸门（不消耗配额、不落审计）。
     #[tokio::test]
     async fn unimplemented_method_answers_method_not_found() {
         let root = sandbox("unimpl");
         let (api, store) = api_with_store(&root, &["fs.read"], "unimpl").await;
 
-        for method in [
-            "host/fs.write",
-            "host/net.fetch",
-            "host/llm.chat",
-            "host/progress",
-        ] {
+        for method in ["host/net.fetch", "host/llm.chat", "host/progress"] {
             let err = api
                 .call("demo", method, &json!({ "path": "a.txt" }))
                 .expect_err("v1 未实现");
