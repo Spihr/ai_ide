@@ -405,8 +405,7 @@ export function SessionPanel(): React.JSX.Element {
             ) : null}
           </ul>
           </>
-        ) : null}
-      )}
+      ) : null}
     </div>
   )
 }
