@@ -35,6 +35,9 @@ use crate::audit_api;
 pub const ACTION_GRANT: &str = "grant";
 pub const ACTION_REVOKE: &str = "revoke";
 pub const ACTION_CALL: &str = "call";
+/// 用户触发插件命令（P5 切片二）。与 [`ACTION_CALL`] 分开：一个是模型调工具，
+/// 一个是用户按了命令面板，出问题时该被怀疑的对象完全不同。
+pub const ACTION_COMMAND: &str = "command";
 pub const ACTION_LOAD: &str = "load";
 pub const ACTION_UNLOAD: &str = "unload";
 pub const ACTION_RELOAD: &str = "reload";

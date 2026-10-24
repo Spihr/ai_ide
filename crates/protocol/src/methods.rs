@@ -182,7 +182,7 @@ pub mod mcp {
 
 /// 插件宿主（P0 协议骨架）。
 ///
-/// 只有这 10 个方法属于**内核协议**：它们进 [`IMPLEMENTED`]、进 `core.hello`
+/// 只有这 11 个方法属于**内核协议**：它们进 [`IMPLEMENTED`]、进 `core.hello`
 /// 的能力清单、进外壳 `policy.ts` 白名单、由 ts-rs 导出类型。目录里的
 /// `plugin/*`（宿主 → 插件）与 `host/*`（插件 → 宿主）是插件包内部协议，
 /// **不进**这张表——混进来会让能力清单不再是「静态可审计」的（见 docs/14 §6.1）。
@@ -207,6 +207,13 @@ pub mod plugin {
     pub const RELOAD: &str = "plugin.reload";
     /// 调用网关：按 `plugin_id` + `method` 转发到插件进程。
     pub const CALL: &str = "plugin.call";
+    /// 命令网关：按 `plugin_id` + `command` 执行插件声明的命令（命令面板入口）。
+    ///
+    /// 与 [`CALL`] 分开而不是复用它：命令带 `args`（清单 schema 校验）、有独立
+    /// 的审计 kind（`plugin.command`）、`risk=write` 时还要在执行**前**审批，
+    /// 语义与「调一个工具」并不相同。两者共用同一套闸门判定（见 core 的
+    /// `gate_base` / `gate_declared`），差别只在业务步骤。
+    pub const COMMAND: &str = "plugin.command";
     /// 授予能力。
     pub const GRANT: &str = "plugin.grant";
     /// 撤销能力（关键能力则连带 unload）。
@@ -342,6 +349,8 @@ pub const IMPLEMENTED: &[&str] = &[
     plugin::UNLOAD,
     plugin::RELOAD,
     plugin::CALL,
+    // P5 切片二：命令网关接线，闸门与 `plugin.call` 同源。
+    plugin::COMMAND,
     plugin::GRANT,
     plugin::REVOKE,
 ];
@@ -365,7 +374,7 @@ mod tests {
 
     #[test]
     fn implemented_list_covers_core_m1_m2_agent_domains() {
-        assert_eq!(IMPLEMENTED.len(), 71);
+        assert_eq!(IMPLEMENTED.len(), 72);
         assert!(IMPLEMENTED.contains(&"core.ping"));
         assert!(IMPLEMENTED.contains(&"$/cancelRequest"));
         assert!(IMPLEMENTED.contains(&"workspace.read_file"));
@@ -438,6 +447,7 @@ mod tests {
         assert_eq!(mcp::CALL, "mcp.call");
         // P0 插件协议骨架：10 个方法进清单（dispatch 分支统一回 6101），
         // 而 `plugin/*` / `host/*` 这类插件包内部方法一律不进。
+        // P5 切片二补第 11 个：`plugin.command`（命令网关，真实实现）。
         for name in [
             plugin::LIST,
             plugin::STATUS,
@@ -447,6 +457,7 @@ mod tests {
             plugin::UNLOAD,
             plugin::RELOAD,
             plugin::CALL,
+            plugin::COMMAND,
             plugin::GRANT,
             plugin::REVOKE,
         ] {
@@ -454,6 +465,7 @@ mod tests {
         }
         assert_eq!(plugin::LIST, "plugin.list");
         assert_eq!(plugin::CALL, "plugin.call");
+        assert_eq!(plugin::COMMAND, "plugin.command");
         assert!(!IMPLEMENTED.iter().any(|name| name.starts_with("host/")));
         assert!(!IMPLEMENTED.iter().any(|name| name.starts_with("plugin/")));
     }
@@ -485,7 +497,10 @@ mod tests {
         all.sort_unstable();
         all.dedup();
         assert_eq!(all.len(), total, "两张表不得有重叠");
-        assert_eq!(total, 71, "应恰好覆盖协议里定义的全部 71 个请求方法");
+        assert_eq!(
+            total, 72,
+            "应恰好覆盖协议里定义的全部 72 个请求方法（P5 切片二补 `plugin.command`）"
+        );
     }
 
     #[test]

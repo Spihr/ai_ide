@@ -58,12 +58,12 @@ use std::path::{Path, PathBuf};
 use ai_ide_plugin::host::{CallError, LoadError, LoadSpec, Restart};
 use ai_ide_plugin::{details_json, install as install_package, manifest, PackageError};
 use ai_ide_protocol::dto::{
-    PluginCallParams, PluginCallResult, PluginCommandSummary, PluginGrantParams, PluginGrantResult,
-    PluginInstallParams, PluginInstallResult, PluginListParams, PluginListResult, PluginLoadParams,
-    PluginLoadResult, PluginReloadParams, PluginReloadResult, PluginRevokeParams,
-    PluginRevokeResult, PluginState, PluginStatusParams, PluginStatusResult, PluginSummary,
-    PluginToolRisk, PluginToolSummary, PluginUninstallParams, PluginUninstallResult,
-    PluginUnloadParams, PluginUnloadResult,
+    PluginCallParams, PluginCallResult, PluginCommandParams, PluginCommandResult,
+    PluginCommandSummary, PluginGrantParams, PluginGrantResult, PluginInstallParams,
+    PluginInstallResult, PluginListParams, PluginListResult, PluginLoadParams, PluginLoadResult,
+    PluginReloadParams, PluginReloadResult, PluginRevokeParams, PluginRevokeResult, PluginState,
+    PluginStatusParams, PluginStatusResult, PluginSummary, PluginToolRisk, PluginToolSummary,
+    PluginUninstallParams, PluginUninstallResult, PluginUnloadParams, PluginUnloadResult,
 };
 use ai_ide_protocol::{ErrorCode, ErrorObject, Request};
 use ai_ide_store::{audit_kind, plugin_status, NewPlugin, PluginRecord, Store, StoreError};
@@ -74,8 +74,8 @@ use crate::dispatch::parse_params;
 use crate::llm_runtime::default_data_dir;
 use crate::peer::Peer;
 use crate::plugin_audit::{
-    self, PluginAuditRow, ACTION_CALL, ACTION_GRANT, ACTION_LOAD, ACTION_RELOAD, ACTION_REVOKE,
-    ACTION_UNLOAD,
+    self, PluginAuditRow, ACTION_CALL, ACTION_COMMAND, ACTION_GRANT, ACTION_LOAD, ACTION_RELOAD,
+    ACTION_REVOKE, ACTION_UNLOAD,
 };
 use crate::plugin_host::{DECISION_ALLOW, DECISION_DENY, DECISION_ERROR};
 use crate::session_api::store_of;
@@ -959,6 +959,84 @@ fn check_call_params(params: &PluginCallParams) -> Result<(&str, &str), ErrorObj
     Ok((plugin_id, method))
 }
 
+/// 闸门 ②：插件是否在账上（6101）。
+///
+/// `subject` 只影响文案（"方法" / "命令"），判定与错误码完全一致——两个网关
+/// 共用同一份口径，才不会出现「调工具说插件没了、按命令说没装载」这种分叉。
+fn gate_installed(
+    installed: bool,
+    plugin_id: &str,
+    subject: &str,
+    item: &str,
+) -> Result<(), ErrorObject> {
+    if installed {
+        return Ok(());
+    }
+    Err(ErrorObject::new(
+        ErrorCode::PLUGIN_NOT_FOUND,
+        format!("插件不存在：{plugin_id}"),
+    )
+    .with_data(serde_json::json!({
+        "plugin_id": plugin_id,
+        "subject": subject,
+        "item": item,
+    })))
+}
+
+/// 闸门 ③：账本状态 + 进程是否在跑（6102）。
+fn gate_ready(
+    status: &str,
+    running: bool,
+    plugin_id: &str,
+    subject: &str,
+    item: &str,
+) -> Result<(), ErrorObject> {
+    if status == plugin_status::READY && running {
+        return Ok(());
+    }
+    let shown = if status.is_empty() {
+        "未装载"
+    } else {
+        status
+    };
+    Err(ErrorObject::new(
+        ErrorCode::PLUGIN_CRASHED,
+        format!("插件当前不可调用（状态 {shown}）：{plugin_id}"),
+    )
+    .with_data(serde_json::json!({
+        "plugin_id": plugin_id,
+        "status": status,
+        "running": running,
+        "subject": subject,
+        "item": item,
+    })))
+}
+
+/// 闸门 ④：归属——只能调**本插件自己**声明的东西（6106）。
+///
+/// `declared` 由调用方给：工具侧是「原名 + 命名空间名」，命令侧是命令名。
+/// 归属校验只看清单，不碰任何能力位——所以它必须早于 6103（见 [`check_call`]）。
+fn gate_declared(
+    declared: &[String],
+    plugin_id: &str,
+    subject: &str,
+    item: &str,
+) -> Result<(), ErrorObject> {
+    if declared.iter().any(|name| name == item) {
+        return Ok(());
+    }
+    Err(ErrorObject::new(
+        ErrorCode::PLUGIN_PROTOCOL_VIOLATION,
+        format!("插件 {plugin_id} 没有声明{subject} {item}，不能跨插件调用"),
+    )
+    .with_data(serde_json::json!({
+        "plugin_id": plugin_id,
+        "subject": subject,
+        "item": item,
+        "declared": declared,
+    })))
+}
+
 /// 前四步：参数快照校验 → 6101 → 6102 → 6106。
 ///
 /// **顺序不可交换**，每一对相邻步骤都在防一种具体的误报：
@@ -970,49 +1048,24 @@ fn check_call_params(params: &PluginCallParams) -> Result<(&str, &str), ErrorObj
 ///   不碰任何能力位；插件后续在 `host/*` 上撞到的 6103 必然发生在这之后。
 ///   反过来先判能力的话，一个拿别人 `plugin_id` 调别人的方法的请求会拿到
 ///   「你没授权」，把方向指到授权上，而真正的问题是越权。
+///
+/// 四步全部走 [`gate_installed`] / [`gate_ready`] / [`gate_declared`]——
+/// `plugin.command` 用的是同一组函数（见 [`check_command`]），两个网关共用一份
+/// 口径，改闸门只需改一处。
 pub fn check_call(
     params: &PluginCallParams,
     snapshot: &CallSnapshot,
 ) -> Result<(String, String), ErrorObject> {
     let (plugin_id, method) = check_call_params(params)?;
-
-    if !snapshot.installed {
-        return Err(ErrorObject::new(
-            ErrorCode::PLUGIN_NOT_FOUND,
-            format!("插件不存在：{plugin_id}"),
-        )
-        .with_data(serde_json::json!({ "plugin_id": plugin_id })));
-    }
-
-    if snapshot.status != plugin_status::READY || !snapshot.running {
-        let status = if snapshot.status.is_empty() {
-            "未装载"
-        } else {
-            snapshot.status.as_str()
-        };
-        return Err(ErrorObject::new(
-            ErrorCode::PLUGIN_CRASHED,
-            format!("插件当前不可调用（状态 {status}）：{plugin_id}"),
-        )
-        .with_data(serde_json::json!({
-            "plugin_id": plugin_id,
-            "status": snapshot.status,
-            "running": snapshot.running,
-        })));
-    }
-
-    if !snapshot.declared.iter().any(|name| name == method) {
-        return Err(ErrorObject::new(
-            ErrorCode::PLUGIN_PROTOCOL_VIOLATION,
-            format!("插件 {plugin_id} 没有声明方法 {method}，不能跨插件调用"),
-        )
-        .with_data(serde_json::json!({
-            "plugin_id": plugin_id,
-            "method": method,
-            "declared": snapshot.declared,
-        })));
-    }
-
+    gate_installed(snapshot.installed, plugin_id, "方法", method)?;
+    gate_ready(
+        &snapshot.status,
+        snapshot.running,
+        plugin_id,
+        "方法",
+        method,
+    )?;
+    gate_declared(&snapshot.declared, plugin_id, "方法", method)?;
     Ok((plugin_id.to_string(), method.to_string()))
 }
 
@@ -1078,6 +1131,13 @@ fn call_error(plugin_id: &str, method: &str, err: CallError) -> ErrorObject {
         CallError::UnknownTool(tool) => ErrorObject::new(
             ErrorCode::PLUGIN_PROTOCOL_VIOLATION,
             format!("插件 {plugin_id} 没有声明工具 {tool}"),
+        )
+        .with_data(data),
+        // 命令与工具共用 6106：两者都是「指名了清单里不存在的东西」，用户要做
+        // 的动作也一样（去面板看它到底声明了什么）。
+        CallError::UnknownCommand(command) => ErrorObject::new(
+            ErrorCode::PLUGIN_PROTOCOL_VIOLATION,
+            format!("插件 {plugin_id} 没有声明命令 {command}"),
         )
         .with_data(data),
         CallError::Timeout { timeout, .. } => ErrorObject::new(
@@ -1247,6 +1307,598 @@ pub async fn call(peer: &Peer, state: &AppState, req: &Request) {
         &PluginCallResult {
             plugin_id,
             method,
+            content,
+            truncated,
+        },
+    )
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// 命令网关（P5 切片二：plugin.command）
+// ---------------------------------------------------------------------------
+
+/// 命令侧快照：与 [`CallSnapshot`] 读的是同一本账 + 同一张装载表，只是
+/// `declared` 记的是**命令**，并且带全摘要（risk / pathField / args schema）——
+/// 后三道闸门（能力 / 路径 / 审批）全靠这三个字段，缺一项就没法判。
+#[derive(Debug, Clone, Default)]
+pub struct CommandSnapshot {
+    pub installed: bool,
+    pub status: String,
+    pub running: bool,
+    pub declared: Vec<PluginCommandSummary>,
+}
+
+impl CommandSnapshot {
+    fn names(&self) -> Vec<String> {
+        self.declared
+            .iter()
+            .map(|command| command.name.clone())
+            .collect()
+    }
+
+    fn find(&self, name: &str) -> Option<&PluginCommandSummary> {
+        self.declared.iter().find(|command| command.name == name)
+    }
+}
+
+/// 第 ① 步：命令参数快照校验（早于碰库，理由同 [`check_call_params`]）。
+fn check_command_params(params: &PluginCommandParams) -> Result<(&str, &str), ErrorObject> {
+    let plugin_id = params.plugin_id.trim();
+    if plugin_id.is_empty() {
+        return Err(ErrorObject::invalid_params(
+            "plugin_id 不能为空：plugin.command 必须指名插件",
+        ));
+    }
+    let command = params.command.trim();
+    if command.is_empty() {
+        return Err(
+            ErrorObject::invalid_params("command 不能为空：必须指名该插件声明的命令")
+                .with_data(serde_json::json!({ "plugin_id": plugin_id })),
+        );
+    }
+    // 入参必须是 JSON 对象：清单的 `args` 是 object schema，插件侧的帧也按
+    // 对象读。放一个数组进去只会在插件里炸出更难懂的错误。
+    if let Some(args) = params.args.as_ref() {
+        if !args.is_object() {
+            return Err(ErrorObject::invalid_params("args 必须是 JSON 对象")
+                .with_data(serde_json::json!({ "plugin_id": plugin_id, "command": command })));
+        }
+    }
+    Ok((plugin_id, command))
+}
+
+/// 前四步：参数快照校验 → 6101 → 6102 → 6106。与 [`check_call`] 共用同一组
+/// 闸门函数（[`gate_installed`] / [`gate_ready`] / [`gate_declared`]），差别只在
+/// 「归属对象」是命令而不是工具。
+pub fn check_command(
+    params: &PluginCommandParams,
+    snapshot: &CommandSnapshot,
+) -> Result<PluginCommandSummary, ErrorObject> {
+    let (plugin_id, command) = check_command_params(params)?;
+    gate_installed(snapshot.installed, plugin_id, "命令", command)?;
+    gate_ready(
+        &snapshot.status,
+        snapshot.running,
+        plugin_id,
+        "命令",
+        command,
+    )?;
+    let declared = snapshot.names();
+    gate_declared(&declared, plugin_id, "命令", command)?;
+    snapshot
+        .find(command)
+        .cloned()
+        .ok_or_else(|| ErrorObject::invalid_params("命令声明已失效，请重试"))
+}
+
+/// 读一次命令判定所需的现状（账本 + 装载表命令目录）。
+async fn command_snapshot(
+    state: &AppState,
+    plugin_id: &str,
+) -> Result<CommandSnapshot, ErrorObject> {
+    let record = match state.store() {
+        Some(store) => match store.get_plugin(plugin_id).await {
+            Ok(record) => record,
+            Err(err) => return Err(store_error(err)),
+        },
+        None => None,
+    };
+    let running = state.plugins().is_running(plugin_id);
+    let declared = state
+        .plugins()
+        .commands_of(plugin_id)
+        .into_iter()
+        .map(|command| PluginCommandSummary {
+            name: command.name,
+            title: command.title,
+            description: command.description,
+            risk: command.risk,
+            path_field: command.path_field,
+            args: command.args,
+        });
+    Ok(CommandSnapshot {
+        installed: record.is_some() || running,
+        status: record.map(|record| record.status).unwrap_or_default(),
+        running,
+        declared: declared.collect(),
+    })
+}
+
+/// 命令风险档位 → 必须具备的能力位（6103）。
+///
+/// 只有 `read` 免能力：`write` 与 `exec` 都要 `fs.write`——命令能落地的输出只有
+/// 工作区，没有 `fs.write` 就写不出任何结果；`exec` 还多一层审批（见
+/// [`needs_approval`]）。不引一个单独的 `exec` 能力位：清单里没有它，
+/// 凭空造一个只会让「授权时勾什么」变得无解。
+fn required_capability(risk: PluginToolRisk) -> Option<&'static str> {
+    match risk {
+        PluginToolRisk::Read => None,
+        PluginToolRisk::Write | PluginToolRisk::Exec => Some("fs.write"),
+    }
+}
+
+/// 该命令是否必须在**执行前**过用户审批（3001）。
+///
+/// `write` 与 `exec` 都要：写命令会改用户文件，exec 命令会起进程——两者都是
+/// 用户点了才发现「它到底动了什么」的那类操作。
+fn needs_approval(risk: PluginToolRisk) -> bool {
+    matches!(risk, PluginToolRisk::Write | PluginToolRisk::Exec)
+}
+
+/// 「总是允许」的落键：命令粒度，带具体路径时再细一层。
+fn command_scope_key(plugin_id: &str, command: &str, path: Option<&str>) -> String {
+    match path {
+        Some(path) => format!("plugin.command:{plugin_id}:{command}:{path}"),
+        None => format!("plugin.command:{plugin_id}:{command}"),
+    }
+}
+
+/// 宿主闸门错误（1002 / 1003 / 3001 / -32602）原样转成协议错误。
+///
+/// 不重新组织文案：路径与审批的文案里已经带了「哪个路径、哪个 scope」，重写一遍
+/// 只会让两处说法分叉。
+fn host_error(err: ai_ide_plugin::HostApiError) -> ErrorObject {
+    ErrorObject::new(ErrorCode(err.code as i32), err.message)
+}
+
+/// 按清单声明校验命令入参（不合法 → `-32602`）。
+///
+/// **只实现 JSON Schema 的一个子集**：`type` / `required` / `properties` /
+/// `enum` / `minimum` / `maximum` / `minLength` / `maxLength` / `minItems` /
+/// `maxItems` / `items` / `additionalProperties(false)`。不认识的约束一律放行
+/// ——假拒会挡住合法调用，而插件进程里还会再校验一次，漏判的代价只是错误晚一步
+/// 出现；误判的代价是用户明明按规矩传参却永远点不动这条命令。
+///
+/// `schema` 为 `None` 表示该命令不吃入参，此时只接受空对象。
+fn validate_args(
+    schema: Option<&serde_json::Value>,
+    args: &serde_json::Value,
+) -> Result<(), String> {
+    let Some(schema) = schema else {
+        if args.as_object().map(|map| map.is_empty()).unwrap_or(false) {
+            return Ok(());
+        }
+        return Err("该命令不接受入参，args 必须为空对象".to_string());
+    };
+    validate_at(schema, args, "args")
+}
+
+fn validate_at(
+    schema: &serde_json::Value,
+    value: &serde_json::Value,
+    at: &str,
+) -> Result<(), String> {
+    if let Some(expected) = schema.get("type") {
+        let ok = match expected {
+            serde_json::Value::String(kind) => type_matches(kind, value),
+            serde_json::Value::Array(kinds) => kinds
+                .iter()
+                .filter_map(|kind| kind.as_str())
+                .any(|kind| type_matches(kind, value)),
+            _ => true,
+        };
+        if !ok {
+            return Err(format!("{at} 的类型不符合声明（应为 {expected}）"));
+        }
+    }
+    if let Some(options) = schema.get("enum").and_then(|value| value.as_array()) {
+        if !options.contains(value) {
+            return Err(format!("{at} 必须是 {options:?} 之一"));
+        }
+    }
+    if let Some(number) = value.as_f64() {
+        if let Some(min) = schema.get("minimum").and_then(|value| value.as_f64()) {
+            if number < min {
+                return Err(format!("{at} 不得小于 {min}"));
+            }
+        }
+        if let Some(max) = schema.get("maximum").and_then(|value| value.as_f64()) {
+            if number > max {
+                return Err(format!("{at} 不得大于 {max}"));
+            }
+        }
+    }
+    if let Some(text) = value.as_str() {
+        let length = text.chars().count();
+        if let Some(min) = schema.get("minLength").and_then(|value| value.as_u64()) {
+            if (length as u64) < min {
+                return Err(format!("{at} 长度不得小于 {min}"));
+            }
+        }
+        if let Some(max) = schema.get("maxLength").and_then(|value| value.as_u64()) {
+            if (length as u64) > max {
+                return Err(format!("{at} 长度不得大于 {max}"));
+            }
+        }
+    }
+    if let Some(items) = value.as_array() {
+        if let Some(min) = schema.get("minItems").and_then(|value| value.as_u64()) {
+            if (items.len() as u64) < min {
+                return Err(format!("{at} 至少需要 {min} 项"));
+            }
+        }
+        if let Some(max) = schema.get("maxItems").and_then(|value| value.as_u64()) {
+            if (items.len() as u64) > max {
+                return Err(format!("{at} 最多 {max} 项"));
+            }
+        }
+        if let Some(item_schema) = schema.get("items") {
+            for (index, item) in items.iter().enumerate() {
+                validate_at(item_schema, item, &format!("{at}[{index}]"))?;
+            }
+        }
+    }
+    if let Some(object) = value.as_object() {
+        if let Some(required) = schema.get("required").and_then(|value| value.as_array()) {
+            for field in required.iter().filter_map(|field| field.as_str()) {
+                if !object.contains_key(field) {
+                    return Err(format!("{at} 缺少必填字段 {field}"));
+                }
+            }
+        }
+        let properties = schema.get("properties").and_then(|value| value.as_object());
+        if let Some(properties) = properties {
+            for (field, field_schema) in properties {
+                if let Some(field_value) = object.get(field) {
+                    if !field_value.is_null() {
+                        validate_at(field_schema, field_value, &format!("{at}.{field}"))?;
+                    }
+                }
+            }
+        }
+        // 只有显式写 `additionalProperties: false` 才拦多余字段：清单作者不写
+        // 通常意味着「还没想清楚」，替他做严格判定等于让插件与外壳互相卡死。
+        let deny_extra = schema
+            .get("additionalProperties")
+            .and_then(|value| value.as_bool())
+            .map(|allow| !allow)
+            .unwrap_or(false);
+        if deny_extra {
+            for field in object.keys() {
+                let declared = properties
+                    .map(|map| map.contains_key(field))
+                    .unwrap_or(false);
+                if !declared {
+                    return Err(format!("{at} 不接受字段 {field}"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn type_matches(kind: &str, value: &serde_json::Value) -> bool {
+    match kind {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "number" => value.is_number(),
+        "integer" => value.is_i64() || value.is_u64(),
+        "boolean" => value.is_boolean(),
+        "null" => value.is_null(),
+        _ => true,
+    }
+}
+
+/// `audit_command` 的可选 note 集合。
+///
+/// 命令的排查链是「谁按的 → 哪条命令 → 碰了哪个文件、风险多大」，这四段里
+/// `code` 只有被拒时才有、`path` 只有命令声明了 `pathField` 才有、`risk` 在
+/// 首个请求之后才有、`truncated` 只有成功时才知道，全是可选的。打包传是为了
+/// 让参数表保持可读：`audit_command` 已经处在 clippy 的 7 参数上限边缘，
+/// 再多四个 `Option` 就无法一眼看出谁对应哪个 note。
+#[derive(Default, Clone, Copy)]
+struct CommandAuditNotes<'a> {
+    code: Option<i32>,
+    path: Option<&'a str>,
+    risk: Option<PluginToolRisk>,
+    truncated: Option<bool>,
+}
+
+/// 给命令落一行审计（kind = `plugin.command`，`action` = `command`）。
+///
+/// `target` 记命令名而不是插件 id（理由同 [`audit_call`]）；`path` 与 `risk`
+/// 各记一个 note：命令的排查链路是「谁按的 → 哪条命令 → 碰了哪个文件」，
+/// 少了后两段就只剩「有人按了点什么」。
+async fn audit_command(
+    state: &AppState,
+    call_id: &str,
+    plugin_id: &str,
+    command: &str,
+    decision: &str,
+    notes: CommandAuditNotes<'_>,
+) {
+    let Some(store) = state.store() else {
+        return;
+    };
+    let mut row = PluginAuditRow::new(
+        audit_kind::PLUGIN_COMMAND,
+        plugin_id,
+        ACTION_COMMAND,
+        decision,
+    )
+    .target(if command.is_empty() {
+        None
+    } else {
+        Some(command)
+    })
+    .call_id(Some(call_id));
+    if let Some(code) = notes.code {
+        row = row.note("code", json!(code));
+    }
+    if let Some(path) = notes.path {
+        row = row.note("path", json!(path));
+    }
+    if let Some(risk) = notes.risk {
+        row = row.note("risk", json!(risk));
+    }
+    if let Some(truncated) = notes.truncated {
+        row = row.note("truncated", json!(truncated));
+    }
+    plugin_audit::record(store, row).await;
+}
+
+/// `plugin.command`：命令网关（P5 切片二）。
+///
+/// 闸门顺序与 `plugin.call` **完全一致且不可交换**：
+/// 参数 `-32602` → 6101 → 6102 → 6106（归属）→ 6103（能力）→ `-32602`（args
+/// 按清单 schema）→ 1002 / 1003（路径）→ 3001（写命令审批）→ 转发（配额 6109
+/// 在宿主侧按次计）→ 截断 → 审计。
+///
+/// 三次踩过的坑都写在这里：① **6106 早于 6103**——先判能力会把「越权调别人的
+/// 命令」报成「你没授权」，方向指错；② **args 校验早于路径与审批**——畸形请求
+/// 不该弹审批框，也不该因为路径字段类型不对报成 1002；③ **审批早于转发**——
+/// 批了才发现命令不存在，等于白打扰用户一次。
+pub async fn command(peer: &Peer, state: &AppState, req: &Request) {
+    let Some(params) = require_params::<PluginCommandParams>(peer, req).await else {
+        return;
+    };
+    let raw_id = params.plugin_id.trim();
+    let raw_command = params.command.trim();
+    if let Err(err) = check_command_params(&params) {
+        audit_command(
+            state,
+            &req.id,
+            raw_id,
+            raw_command,
+            DECISION_DENY,
+            CommandAuditNotes {
+                code: Some(err.code.as_i32()),
+                ..Default::default()
+            },
+        )
+        .await;
+        return peer.respond_error(&req.id, &err).await;
+    }
+
+    let snapshot = match command_snapshot(state, raw_id).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            audit_command(
+                state,
+                &req.id,
+                raw_id,
+                raw_command,
+                DECISION_DENY,
+                CommandAuditNotes {
+                    code: Some(err.code.as_i32()),
+                    ..Default::default()
+                },
+            )
+            .await;
+            return peer.respond_error(&req.id, &err).await;
+        }
+    };
+    let summary = match check_command(&params, &snapshot) {
+        Ok(summary) => summary,
+        Err(err) => {
+            audit_command(
+                state,
+                &req.id,
+                raw_id,
+                raw_command,
+                DECISION_DENY,
+                CommandAuditNotes {
+                    code: Some(err.code.as_i32()),
+                    ..Default::default()
+                },
+            )
+            .await;
+            return peer.respond_error(&req.id, &err).await;
+        }
+    };
+    let plugin_id = raw_id.to_string();
+    let command_name = summary.name.clone();
+    let args = params.args.clone().unwrap_or_else(|| json!({}));
+
+    // 闸门 ⑤：能力（6103）。判的是「这条命令的风险档位需要什么能力」，而不是
+    // 插件清单申请过什么——申请过不等于此刻仍被授予（`plugin.revoke` 会撤销）。
+    if let Some(capability) = required_capability(summary.risk) {
+        if !state.plugin_host().has_capability(&plugin_id, capability) {
+            let err = ErrorObject::new(
+                ErrorCode::PLUGIN_CAPABILITY_DENIED,
+                format!("命令 {command_name} 需要能力 {capability}，当前未授予"),
+            )
+            .with_data(json!({
+                "plugin_id": plugin_id,
+                "command": command_name,
+                "capability": capability,
+            }));
+            audit_command(
+                state,
+                &req.id,
+                &plugin_id,
+                &command_name,
+                DECISION_DENY,
+                CommandAuditNotes {
+                    code: Some(err.code.as_i32()),
+                    risk: Some(summary.risk),
+                    ..Default::default()
+                },
+            )
+            .await;
+            return peer.respond_error(&req.id, &err).await;
+        }
+    }
+
+    // 闸门 ⑥：入参按清单声明校验（`-32602`）。
+    if let Err(message) = validate_args(summary.args.as_ref(), &args) {
+        let err =
+            ErrorObject::invalid_params(format!("命令 {command_name} 的入参不合法：{message}"))
+                .with_data(json!({
+                    "plugin_id": plugin_id,
+                    "command": command_name,
+                }));
+        audit_command(
+            state,
+            &req.id,
+            &plugin_id,
+            &command_name,
+            DECISION_DENY,
+            CommandAuditNotes {
+                code: Some(err.code.as_i32()),
+                risk: Some(summary.risk),
+                ..Default::default()
+            },
+        )
+        .await;
+        return peer.respond_error(&req.id, &err).await;
+    }
+
+    // 闸门 ⑦：路径（1002 / 1003）。只有声明了 `pathField` 的命令才有路径可判；
+    // 走的是与 `host/fs.*` 同一个 `resolve`，所以 `..` / 绝对路径 / `.git` 这些
+    // 判法与写文件完全一致。
+    let mut path = None;
+    if let Some(field) = summary.path_field.as_deref() {
+        match state.plugin_host().command_path(&args, field) {
+            Ok(resolved) => path = resolved,
+            Err(err) => {
+                let err = host_error(err);
+                audit_command(
+                    state,
+                    &req.id,
+                    &plugin_id,
+                    &command_name,
+                    DECISION_DENY,
+                    CommandAuditNotes {
+                        code: Some(err.code.as_i32()),
+                        risk: Some(summary.risk),
+                        ..Default::default()
+                    },
+                )
+                .await;
+                return peer.respond_error(&req.id, &err).await;
+            }
+        }
+    }
+
+    // 闸门 ⑧：审批（3001）。只对 write / exec 弹，且「总是允许」按命令粒度记住。
+    if needs_approval(summary.risk) {
+        let scope_key = command_scope_key(&plugin_id, &command_name, path.as_deref());
+        if let Err(err) = state.plugin_host().approve_command(
+            &plugin_id,
+            ai_ide_protocol::methods::plugin::COMMAND,
+            &command_name,
+            path.as_deref(),
+            &scope_key,
+        ) {
+            let err = host_error(err);
+            audit_command(
+                state,
+                &req.id,
+                &plugin_id,
+                &command_name,
+                DECISION_DENY,
+                CommandAuditNotes {
+                    code: Some(err.code.as_i32()),
+                    path: path.as_deref(),
+                    risk: Some(summary.risk),
+                    ..Default::default()
+                },
+            )
+            .await;
+            return peer.respond_error(&req.id, &err).await;
+        }
+    }
+
+    // ⑨ 转发 `plugin/command-invoke`。配额（6109）在宿主侧按「单次命令内
+    // `host/*` 调用次数」计，`call_command` 进来先归零，与 `plugin.call` 同口径。
+    let value = match state
+        .plugins()
+        .call_command(&plugin_id, &command_name, args)
+        .await
+    {
+        Ok(value) => value,
+        Err(err) => {
+            let error = call_error(&plugin_id, &command_name, err);
+            audit_command(
+                state,
+                &req.id,
+                &plugin_id,
+                &command_name,
+                DECISION_ERROR,
+                CommandAuditNotes {
+                    code: Some(error.code.as_i32()),
+                    path: path.as_deref(),
+                    risk: Some(summary.risk),
+                    ..Default::default()
+                },
+            )
+            .await;
+            return peer.respond_error(&req.id, &error).await;
+        }
+    };
+
+    // ⑩ 截断后回灌（与 `plugin.call` 同一个 64 KB 上限）。
+    let (content, truncated) = truncate_content(crate::plugin_tools::result_text(&value));
+    if truncated {
+        tracing::warn!(
+            plugin_id = %plugin_id,
+            command = %command_name,
+            limit = CALL_CONTENT_LIMIT,
+            "plugin.command 结果超限，已截断"
+        );
+    }
+    audit_command(
+        state,
+        &req.id,
+        &plugin_id,
+        &command_name,
+        DECISION_ALLOW,
+        CommandAuditNotes {
+            path: path.as_deref(),
+            risk: Some(summary.risk),
+            truncated: Some(truncated),
+            ..Default::default()
+        },
+    )
+    .await;
+    peer.respond(
+        &req.id,
+        &PluginCommandResult {
+            plugin_id,
+            command: command_name,
             content,
             truncated,
         },
@@ -1667,6 +2319,9 @@ fn commands_of(manifest: &manifest::Manifest) -> Vec<PluginCommandSummary> {
             name: command.name.clone(),
             title: command.title.clone(),
             description: command.description.clone(),
+            risk: command.risk,
+            path_field: command.path_field.clone(),
+            args: command.args.clone(),
         })
         .collect()
 }
@@ -2366,5 +3021,204 @@ mod tests {
         revoke(&peer, &state, &revoke_req).await;
         let rows = rows_of_kind(&store, audit_kind::PLUGIN_CAPABILITY_CHANGED).await;
         assert_eq!(rows.len(), 2, "旧行不能被新事件顶掉");
+    }
+
+    // -------------------------------------------------------------- 命令网关
+
+    fn command_params(
+        plugin_id: &str,
+        command: &str,
+        args: Option<serde_json::Value>,
+    ) -> PluginCommandParams {
+        PluginCommandParams {
+            plugin_id: plugin_id.to_string(),
+            command: command.to_string(),
+            args,
+        }
+    }
+
+    /// 一条 `write` 档、带 `pathField` 的命令声明。
+    fn command_summary(name: &str, risk: PluginToolRisk) -> PluginCommandSummary {
+        PluginCommandSummary {
+            name: name.to_string(),
+            title: format!("{name} 命令"),
+            description: None,
+            risk,
+            path_field: Some("path".to_string()),
+            args: None,
+        }
+    }
+
+    /// 一条「一切就绪」的命令快照：装了、`ready`、在跑、声明了 `deploy`。
+    fn command_ready_snapshot() -> CommandSnapshot {
+        CommandSnapshot {
+            installed: true,
+            status: plugin_status::READY.to_string(),
+            running: true,
+            declared: vec![command_summary("deploy", PluginToolRisk::Write)],
+        }
+    }
+
+    /// 闸门 ①：空 id / 空命令 / `args` 不是对象，一律 `-32602`，且不回退成业务错误。
+    #[test]
+    fn command_params_reject_blank_id_blank_command_and_non_object_args() {
+        let err = check_command_params(&command_params("  ", "deploy", None))
+            .expect_err("空 plugin_id 必须拒");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+
+        let err = check_command_params(&command_params("demo-plugin", "  ", None))
+            .expect_err("空 command 必须拒");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+        // 报错里带上「想指名谁」：用户按错了命令名时能看出是哪个插件。
+        assert_eq!(
+            err.data.as_ref().expect("-32602 要带 data")["plugin_id"],
+            "demo-plugin"
+        );
+
+        // 清单的 `args` 是 object schema：数组/字符串进来只会在插件里炸得更难懂。
+        for bad in [json!([1, 2]), json!("path=a.txt"), json!(42)] {
+            let err = check_command_params(&command_params("demo-plugin", "deploy", Some(bad)))
+                .expect_err("args 必须是对象");
+            assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+        }
+
+        // 全对：id / 命令名都 trim 过，和后续转发、审计的口径一致。
+        let params = command_params(
+            " demo-plugin ",
+            " deploy ",
+            Some(json!({ "path": "a.txt" })),
+        );
+        let (plugin_id, command) = check_command_params(&params).expect("一切就绪应放行");
+        assert_eq!(plugin_id, "demo-plugin");
+        assert_eq!(command, "deploy");
+    }
+
+    /// 前四步必须按序报错：同一次「全错」的请求，错误码只能是最前面那一关的。
+    #[test]
+    fn command_gates_report_the_first_failing_step_only() {
+        // ① 参数快照校验先于一切：空命令配「插件不存在」的账本，报 -32602 而不是 6101。
+        let broken = CommandSnapshot::default();
+        let err = check_command(&command_params("demo-plugin", " ", None), &broken)
+            .expect_err("空命令必须拒");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+
+        // ② 插件不存在 → 6101：状态、装载、命令全都对不上，也只能报这一条。
+        let err = check_command(&command_params("demo-plugin", "deploy", None), &broken)
+            .expect_err("没装就没得跑");
+        assert_eq!(err.code, ErrorCode::PLUGIN_NOT_FOUND);
+
+        // ③ 装了但没装载 / 状态不是 ready → 6102，归属还没轮到判。
+        let installed_only = CommandSnapshot {
+            installed: true,
+            status: plugin_status::NEEDS_GRANT.to_string(),
+            running: false,
+            declared: vec![command_summary("deploy", PluginToolRisk::Write)],
+        };
+        let err = check_command(
+            &command_params("demo-plugin", "deploy", None),
+            &installed_only,
+        )
+        .expect_err("needs_grant 不可跑命令");
+        assert_eq!(err.code, ErrorCode::PLUGIN_CRASHED);
+        // 账本说 ready 但进程不在，同样是 6102。
+        let dead = CommandSnapshot {
+            running: false,
+            ..command_ready_snapshot()
+        };
+        let err = check_command(&command_params("demo-plugin", "deploy", None), &dead)
+            .expect_err("进程不在不可跑命令");
+        assert_eq!(err.code, ErrorCode::PLUGIN_CRASHED);
+
+        // ④ 状态齐了才判归属：没声明的命令 → 6106，而不是「不属于这个插件的命令」。
+        let err = check_command(
+            &command_params("demo-plugin", "nope", None),
+            &command_ready_snapshot(),
+        )
+        .expect_err("越权命令必须拒");
+        assert_eq!(err.code, ErrorCode::PLUGIN_PROTOCOL_VIOLATION);
+
+        // 五关全过：回的是这份声明本身（后三道闸门全靠它的 risk / pathField / args）。
+        let summary = check_command(
+            &command_params("demo-plugin", "deploy", None),
+            &command_ready_snapshot(),
+        )
+        .expect("一切就绪应放行");
+        assert_eq!(summary.name, "deploy");
+        assert_eq!(summary.risk, PluginToolRisk::Write);
+        assert_eq!(summary.path_field.as_deref(), Some("path"));
+    }
+
+    /// 闸门 ⑥：`args` 按清单 schema 校验，非法一律 `-32602`。
+    ///
+    /// 只验实现里真支持的那几条约束——不认识的约束故意放行（插件侧还会再校验一次），
+    /// 假拒会让用户明明按规矩传参却永远点不动这条命令。
+    #[test]
+    fn command_args_are_validated_against_the_declared_schema() {
+        // 没声明 schema：只接受空对象。
+        assert!(validate_args(None, &json!({})).is_ok());
+        assert!(validate_args(None, &json!({ "q": 1 })).is_err());
+        assert!(validate_args(None, &json!([1])).is_err());
+
+        let schema = json!({
+            "type": "object",
+            "required": ["query"],
+            "additionalProperties": false,
+            "properties": {
+                "query": { "type": "string", "minLength": 1 },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 50 },
+                "mode": { "enum": ["fast", "full"] }
+            }
+        });
+
+        assert!(validate_args(Some(&schema), &json!({ "query": "abc" })).is_ok());
+        assert!(validate_args(
+            Some(&schema),
+            &json!({ "query": "abc", "limit": 10, "mode": "fast" })
+        )
+        .is_ok());
+        // 缺必填 / 类型不对 / 越界 / 枚举外 / 多余字段：五种都必须拒。
+        for bad in [
+            json!({}),
+            json!({ "query": 1 }),
+            json!({ "query": "" }),
+            json!({ "query": "abc", "limit": 0 }),
+            json!({ "query": "abc", "mode": "slow" }),
+            json!({ "query": "abc", "extra": true }),
+        ] {
+            assert!(
+                validate_args(Some(&schema), &bad).is_err(),
+                "这份入参必须被拒：{bad}"
+            );
+        }
+    }
+
+    /// 闸门 ⑧：只有 write / exec 弹审批；read 档的命令不该打扰用户。
+    #[test]
+    fn command_risk_decides_whether_approval_is_needed() {
+        assert!(!needs_approval(PluginToolRisk::Read));
+        assert!(needs_approval(PluginToolRisk::Write));
+        assert!(needs_approval(PluginToolRisk::Exec));
+    }
+
+    /// 「总是允许」的落键：命令粒度，带具体路径时再细一层。
+    ///
+    /// 这条防的是「批了 `a.txt` 就等于批了整个工作区」：路径进了 key，换文件必须重批；
+    /// 而插件 id 与命令名都在 key 里，两个插件的同名命令不会互相静默放行。
+    #[test]
+    fn command_scope_key_is_narrowed_by_path() {
+        let bare = command_scope_key("demo-plugin", "deploy", None);
+        assert_eq!(bare, "plugin.command:demo-plugin:deploy");
+
+        let file = command_scope_key("demo-plugin", "deploy", Some("C:/ws/a.txt"));
+        let other = command_scope_key("demo-plugin", "deploy", Some("C:/ws/b.txt"));
+        assert_ne!(file, other, "换文件必须重新审批");
+        assert_ne!(file, bare, "带路径的授权不能复用到无路径的命令");
+        assert!(file.ends_with("C:/ws/a.txt"));
+
+        assert_ne!(
+            command_scope_key("demo-plugin", "deploy", None),
+            command_scope_key("other-plugin", "deploy", None),
+            "两个插件的同名命令不能共用授权"
+        );
     }
 }

@@ -19,8 +19,8 @@ use crate::events::{subscribed, EventSink, PushOutcome, EVENT_METHOD, PLUGIN_STA
 use crate::host_api::HostApi;
 use crate::loader::{PluginProcess, RequestError, SpawnError, SpawnOptions, EXITED_REPLY_CODE};
 use crate::manifest::{
-    namespaced_tool, Manifest, ManifestTool, ValidatedManifest, HOST_PLUGIN_API_MAJOR,
-    HOST_PLUGIN_API_MINOR,
+    namespaced_tool, Manifest, ManifestCommand, ManifestTool, ValidatedManifest,
+    HOST_PLUGIN_API_MAJOR, HOST_PLUGIN_API_MINOR,
 };
 
 /// 宿主 → 插件的握手方法名（docs/14 §6.2）。
@@ -33,6 +33,12 @@ pub const METHOD_NOT_FOUND: i64 = -32601;
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// 宿主 → 插件的工具调用方法名（P3 工具注入，docs/14 §6.4）。
 pub const TOOL_INVOKE_METHOD: &str = "plugin/tool-invoke";
+/// 宿主 → 插件的命令执行方法名（P5 切片二，docs/14 §7「命令与事件」）。
+///
+/// 与 [`TOOL_INVOKE_METHOD`] 分成两条帧：命令的执行语义是「用户按下去了」，
+/// 插件侧可能要弹 UI、可能要长跑，和「模型调一个工具」在插件实现里往往走
+/// 不同分支；共用一条帧会逼插件靠参数形状去猜来源。
+pub const COMMAND_INVOKE_METHOD: &str = "plugin/command-invoke";
 /// 单次工具调用预算。与清单默认值 [`crate::manifest::DEFAULT_TIMEOUT_MS`] 一致；
 /// 调用一律走这个常量，避免「插件自己声明的超时」被拿来做无限等待。
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -215,6 +221,39 @@ pub struct RunningTool {
     pub parameters: Value,
 }
 
+/// 一条**当下可触发**的插件命令（P5 切片二）。
+///
+/// 与 [`RunningTool`] 分开：命令不进 agent 工具表，只进命令面板；两者的
+/// 风险档位与 schema 语义相同（都来自清单），但「谁能触发」完全不同——
+/// 工具是模型，命令是用户。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunningCommand {
+    pub plugin_id: String,
+    /// 插件内 `commands[].name`，执行时原样回填给插件。
+    pub name: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub risk: ai_ide_protocol::PluginToolRisk,
+    /// 路径闸门用的入参字段名（见 [`crate::manifest::ManifestCommand::path_field`]）。
+    pub path_field: Option<String>,
+    /// 入参 JSON Schema；`None` 表示该命令不吃入参。
+    pub args: Option<Value>,
+}
+
+impl From<(&str, &ManifestCommand)> for RunningCommand {
+    fn from((plugin_id, command): (&str, &ManifestCommand)) -> Self {
+        Self {
+            plugin_id: plugin_id.to_string(),
+            name: command.name.clone(),
+            title: command.title.clone(),
+            description: command.description.clone(),
+            risk: command.risk,
+            path_field: command.path_field.clone(),
+            args: command.args.clone(),
+        }
+    }
+}
+
 /// 一次工具调用的失败原因。`crates/core` 按它选 61xx。
 #[derive(Debug, Clone)]
 pub enum CallError {
@@ -222,6 +261,8 @@ pub enum CallError {
     NotRunning(String),
     /// 插件在跑，但没声明过这个工具。
     UnknownTool(String),
+    /// 插件在跑，但清单里没有这条命令（P5 切片二：归属 6106 的运行时兜底）。
+    UnknownCommand(String),
     /// 等回包超时（6105）。
     Timeout { tool: String, timeout: Duration },
     /// 请求途中进程没了（6102）。
@@ -240,6 +281,7 @@ impl std::fmt::Display for CallError {
         match self {
             Self::NotRunning(plugin_id) => write!(f, "插件未装载或已退出：{plugin_id}"),
             Self::UnknownTool(tool) => write!(f, "插件没有声明工具：{tool}"),
+            Self::UnknownCommand(command) => write!(f, "插件没有声明命令：{command}"),
             Self::Timeout { tool, timeout } => {
                 write!(f, "调用工具 {tool} 超时（{} ms）", timeout.as_millis())
             }
@@ -693,6 +735,40 @@ impl Host {
         catalog
     }
 
+    /// 当前所有可触发的插件命令（P5 切片二：命令面板的数据源）。
+    ///
+    /// 与 [`Self::tool_catalog`] 同一口径：现场扫装载表、只收进程还活着的、
+    /// 按 `(plugin_id, name)` 排定，保证面板顺序逐字稳定。命令取自**清单**
+    /// （`resume.manifest.commands`）而不是握手：命令是用户在安装时看到的那份
+    /// 承诺，插件运行期不能偷偷加一条命令出来让用户按。
+    pub fn command_catalog(&self) -> Vec<RunningCommand> {
+        let Ok(guard) = self.loaded.lock() else {
+            return Vec::new();
+        };
+        let mut catalog = Vec::new();
+        for (plugin_id, entry) in guard.iter() {
+            if entry.start.process.has_exited() {
+                continue;
+            }
+            for command in entry.resume.manifest.commands.iter() {
+                catalog.push(RunningCommand::from((plugin_id.as_str(), command)));
+            }
+        }
+        catalog.sort_by(|left, right| {
+            (left.plugin_id.as_str(), left.name.as_str())
+                .cmp(&(right.plugin_id.as_str(), right.name.as_str()))
+        });
+        catalog
+    }
+
+    /// 某个插件当前可触发的命令（装好了但没在跑时为空：命令要打到进程上）。
+    pub fn commands_of(&self, plugin_id: &str) -> Vec<RunningCommand> {
+        self.command_catalog()
+            .into_iter()
+            .filter(|command| command.plugin_id == plugin_id)
+            .collect()
+    }
+
     /// 调一次插件工具：`plugin/tool-invoke`，参数 `{tool, arguments}`。
     ///
     /// 锁只用来取一个 `Arc<PluginProcess>` 快照，取到就立刻释放——`await` 期间
@@ -741,6 +817,77 @@ impl Host {
             Err(RequestError::Plugin { code, message }) => Err(CallError::Plugin { code, message }),
             Err(RequestError::Timeout { timeout, .. }) => Err(CallError::Timeout {
                 tool: tool.to_string(),
+                timeout,
+            }),
+            Err(RequestError::Exited { tail }) => Err(CallError::Exited {
+                code: exit_code(&process).await,
+                tail,
+            }),
+            Err(RequestError::Closed) => Err(CallError::Exited {
+                code: exit_code(&process).await,
+                tail: process.stderr_tail(),
+            }),
+            Err(RequestError::Protocol(message)) => Err(CallError::Protocol { message }),
+        }
+    }
+
+    /// 执行一次插件命令：`plugin/command-invoke`，参数 `{command, args}`。
+    ///
+    /// 与 [`Self::call_tool`] 同构，差异只有三处，且都在「命令是用户按的」这条
+    /// 语义上：① 归属校验查的是**清单里的 `commands[]`**（不是握手里的工具表）；
+    /// ② 配额同样在调用边界归零——命令里插件一样会反复问宿主，不归零就等于
+    /// 把整场会话的 `host/*` 额度算成一次；③ 错误里的名目叫命令，不是工具。
+    pub async fn call_command(
+        &self,
+        plugin_id: &str,
+        command: &str,
+        args: Value,
+    ) -> Result<Value, CallError> {
+        let process = {
+            let guard = self.loaded.lock().map_err(|_| CallError::Protocol {
+                message: "插件装载表已不可用（锁中毒）".to_string(),
+            })?;
+            let Some(entry) = guard.get(plugin_id) else {
+                return Err(CallError::NotRunning(plugin_id.to_string()));
+            };
+            if entry.start.process.has_exited() {
+                return Err(CallError::NotRunning(plugin_id.to_string()));
+            }
+            // 运行时再校验一次归属：上层的快照是几十微秒前的，这一条才是真正
+            // 「此刻这份装载表里有没有它」的答案。两道检查不重复——上层那道是
+            // 为了给出带 `declared` 清单的可诊断错误，这道是防竞态。
+            if !entry
+                .resume
+                .manifest
+                .commands
+                .iter()
+                .any(|item| item.name == command)
+            {
+                return Err(CallError::UnknownCommand(command.to_string()));
+            }
+            Arc::clone(&entry.start.process)
+        };
+
+        let params = json!({ "command": command, "args": args });
+        if let Some(api) = process.host() {
+            api.begin_call(plugin_id);
+        }
+        match process
+            .request(COMMAND_INVOKE_METHOD, params, CALL_TIMEOUT)
+            .await
+        {
+            Ok(value) => Ok(value),
+            Err(RequestError::Plugin { code, .. }) if code == EXITED_REPLY_CODE => {
+                Err(CallError::Exited {
+                    code: exit_code(&process).await,
+                    tail: process.stderr_tail(),
+                })
+            }
+            Err(RequestError::Plugin { code, message }) => Err(CallError::Plugin { code, message }),
+            Err(RequestError::Timeout { timeout, .. }) => Err(CallError::Timeout {
+                // 命令超时沿用同一个 `tool` 字段：上层文案统一按「调用」措辞，
+                // 多造一个字段只会让错误映射分叉。
+                tool: command.to_string(),
                 timeout,
             }),
             Err(RequestError::Exited { tail }) => Err(CallError::Exited {

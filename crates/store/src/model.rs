@@ -325,6 +325,12 @@ pub mod audit_kind {
     /// 与 [`PLUGIN_HOST_CALL`] 的区别是**方向**：这条是外面的调用进来（模型 /
     /// 外壳 → 插件工具），那条是插件向外要能力（插件 → 宿主）。
     pub const PLUGIN_CALL: &str = "plugin.call";
+    /// 通过 `plugin.command` 网关发起的一次命令执行（P5 切片二）。
+    ///
+    /// 与 [`PLUGIN_CALL`] 分开记：命令是**用户显式触发**的（命令面板 / 协议调用方），
+    /// 排查时「这条命令是谁按的、批没批、路径过没过」和「模型调了个工具」是两条线，
+    /// 混成一个 kind 就只能靠 `target` 猜。
+    pub const PLUGIN_COMMAND: &str = "plugin.command";
     /// 插件进程生命周期（P4 切片四）：`plugin.load` / `unload` / `reload`。
     pub const PLUGIN_LIFECYCLE: &str = "plugin.lifecycle";
 }

@@ -127,7 +127,7 @@ fn unimplemented_calls() -> Vec<(&'static str, Value)> {
 }
 
 #[test]
-fn capabilities_advertise_all_ten_plugin_methods() {
+fn capabilities_advertise_all_eleven_plugin_methods() {
     let data = TempDataDir::new("plugin-caps");
     let mut core = Core::spawn(&data.root);
 
@@ -139,8 +139,8 @@ fn capabilities_advertise_all_ten_plugin_methods() {
 
     assert_eq!(
         plugin_methods.len(),
-        10,
-        "能力清单里 plugin.* 应有 10 项，实际 {plugin_methods:?}"
+        11,
+        "能力清单里 plugin.* 应有 11 项（P5 切片二新增 plugin.command），实际 {plugin_methods:?}"
     );
 }
 

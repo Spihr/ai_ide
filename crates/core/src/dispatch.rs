@@ -165,6 +165,7 @@ async fn handle_request(peer: &Peer, state: &AppState, req: Request) {
         methods::plugin::UNLOAD => plugin_api::unload(peer, state, &req).await,
         methods::plugin::RELOAD => plugin_api::reload(peer, state, &req).await,
         methods::plugin::CALL => plugin_api::call(peer, state, &req).await,
+        methods::plugin::COMMAND => plugin_api::command(peer, state, &req).await,
         methods::plugin::GRANT => plugin_api::grant(peer, state, &req).await,
         methods::plugin::REVOKE => plugin_api::revoke(peer, state, &req).await,
 

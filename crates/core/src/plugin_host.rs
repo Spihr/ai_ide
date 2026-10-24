@@ -117,6 +117,22 @@ pub struct WriteApprovalRequest {
     pub scope_key: String,
 }
 
+/// 一次命令审批请求（P5 切片二）。
+///
+/// 与 [`WriteApprovalRequest`] 分开：命令不是「写一个文件」，它的 `scope_key`
+/// 是「哪个插件的哪条命令」，而 `path`（若该命令针对具体文件）只是给人看的
+/// 目标说明。混用一张请求表会让「总是允许」的落键粒度从文件漂到命令。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandApprovalRequest {
+    pub plugin_id: String,
+    /// 命令名（插件内原始名）。
+    pub command: String,
+    /// 该命令声明了 `pathField` 时的规范化目标路径（仅用于展示与脱敏）。
+    pub path: Option<String>,
+    /// 「总是允许」的落键：`plugin.command:<plugin_id>:<command>[:<path>]`。
+    pub scope_key: String,
+}
+
 /// 写侧审批的裁决方。
 ///
 /// 同步签名是刻意的：判定跑在插件 stdout 的帧泵上，异步等一个 UI 回执会把该
@@ -126,6 +142,15 @@ pub struct WriteApprovalRequest {
 /// 返回 `None` 按「拒绝」处理：审批链断了的时候，默认值必须是「不写」。
 pub trait WriteApprover: Send + Sync {
     fn decide(&self, request: &WriteApprovalRequest) -> Option<WriteApproval>;
+
+    /// 命令审批（P5 切片二）：`risk=write` 的插件命令在执行**前**过这里。
+    ///
+    /// 默认返回 `None`（= 拒）：没接入审批的实现在这一步就该拦下写命令，
+    /// 而不是「没人管就放行」。生产实现见 `crate::plugin_approver`。
+    fn decide_command(&self, request: &CommandApprovalRequest) -> Option<WriteApproval> {
+        let _ = request;
+        None
+    }
 }
 
 /// 写侧的 `scope_key`：规范化绝对路径。
@@ -375,6 +400,14 @@ impl FsHostApi {
         self.store.read().ok().and_then(|slot| slot.clone())
     }
 
+    /// 命令侧能力闸门用（P5 切片二）：与 `host/*` 同一份授权表，同一套口径。
+    ///
+    /// 不复制一份「命令授权集」：命令能做的事都在插件进程里，最终还是要落到
+    /// `host/*` 上；两套表只会在「命令放行、host 拒绝」时造出一半成功的怪状态。
+    pub fn has_capability(&self, plugin_id: &str, capability: &str) -> bool {
+        self.is_granted(plugin_id, capability)
+    }
+
     /// 该插件是否被授予了这项能力。
     ///
     /// 先看按插件登记的授权；没有登记（老调用方 / 单测直连）再退回缺省集。
@@ -615,6 +648,114 @@ impl FsHostApi {
             "mtime": mtime,
             "dir": meta.is_dir(),
         }))
+    }
+
+    /// 命令侧路径闸门（P5 切片二）：把清单 `pathField` 指的那个入参取出来过
+    /// [`Self::resolve`]，返回展示路径。
+    ///
+    /// 与 `host/fs.*` 共用同一个 `resolve`——不能给命令开一条更宽的路径检查，
+    /// 否则「用命令绕过 fs.write 的路径闸门」就是现成的漏洞。
+    pub fn command_path(
+        &self,
+        args: &Value,
+        path_field: &str,
+    ) -> Result<Option<String>, HostApiError> {
+        let Some(raw) = args.get(path_field) else {
+            return Ok(None);
+        };
+        match raw {
+            Value::Null => Ok(None),
+            Value::String(text) => self.resolve(text).map(|abs| Some(self.display_path(&abs))),
+            _ => Err(HostApiError::invalid_params(format!(
+                "{path_field} 必须是字符串路径"
+            ))),
+        }
+    }
+
+    /// 命令审批闸门（P5 切片二，docs/14 §8.1 ⑤ 在命令上的同一条）。
+    ///
+    /// 只有 `risk=write` 的命令走这里（读命令不该弹窗，否则命令面板会变成
+    /// 「点一次弹一次」的灾难）。沿用写侧的「总是允许」集合，但落键换成
+    /// `plugin.command:<plugin>:<command>[:<path>]`，粒度是命令而不是文件。
+    pub fn approve_command(
+        &self,
+        plugin_id: &str,
+        method: &str,
+        command: &str,
+        path: Option<&str>,
+        scope_key: &str,
+    ) -> Result<(), HostApiError> {
+        if self.is_write_always(scope_key) {
+            return Ok(());
+        }
+        let request = CommandApprovalRequest {
+            plugin_id: plugin_id.to_string(),
+            command: command.to_string(),
+            path: path.map(str::to_string),
+            scope_key: scope_key.to_string(),
+        };
+        let decision = self
+            .approver_snapshot()
+            .and_then(|approver| approver.decide_command(&request));
+        let call_id = format!("host-{}", self.calls.fetch_add(1, Ordering::Relaxed) + 1);
+        // 审计的 target 取「哪个文件」而不是「哪条命令」：命令名在 summary 里，
+        // 而审批的争议点永远是「它想动我哪个文件」。没声明路径时才退回命令名。
+        //
+        // 与 [`Self::approve_write`] 一样用嵌套 fn 而不是闭包：这里要显式声明
+        // 「返回值的生命周期跟着入参走」，闭包写不出这个约束（会报
+        // `lifetime may not live long enough`）。
+        fn command_audit<'a>(
+            plugin_id: &'a str,
+            method: &'a str,
+            command: &'a str,
+            path: Option<&'a str>,
+            scope_key: &'a str,
+            call_id: &'a str,
+            decision: &'a str,
+        ) -> HostCallAudit<'a> {
+            HostCallAudit::new(plugin_id, method, "fs.write", call_id, decision)
+                .target(Some(path.unwrap_or(command)))
+                .scope_key(Some(scope_key))
+        }
+        match decision {
+            Some(WriteApproval::AllowAlways) => {
+                self.remember_write_always(scope_key);
+                self.audit(command_audit(
+                    plugin_id,
+                    method,
+                    command,
+                    path,
+                    scope_key,
+                    &call_id,
+                    DECISION_APPROVE,
+                ));
+                Ok(())
+            }
+            Some(WriteApproval::AllowOnce) => {
+                self.audit(command_audit(
+                    plugin_id,
+                    method,
+                    command,
+                    path,
+                    scope_key,
+                    &call_id,
+                    DECISION_APPROVE,
+                ));
+                Ok(())
+            }
+            Some(WriteApproval::Reject) | None => {
+                self.audit(command_audit(
+                    plugin_id,
+                    method,
+                    command,
+                    path,
+                    scope_key,
+                    &call_id,
+                    DECISION_REJECT,
+                ));
+                Err(HostApiError::tool_not_allowed(method, scope_key))
+            }
+        }
     }
 
     /// 写侧审批闸门（docs/14 §8.1 ⑤）。

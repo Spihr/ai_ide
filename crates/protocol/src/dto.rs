@@ -2703,6 +2703,18 @@ pub struct PluginCommandSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub description: Option<String>,
+    /// 审批档位：`write` 的命令在执行**前**弹一次审批（3001），
+    /// `read` 只走状态 / 归属 / 路径 / 配额四关。
+    #[serde(default)]
+    pub risk: PluginToolRisk,
+    /// 路径闸门用的入参字段名（如 `path`）。缺省表示该命令不针对具体文件。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub path_field: Option<String>,
+    /// 入参 JSON Schema（清单里的 `args`）。缺省表示该命令不吃入参。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub args: Option<serde_json::Value>,
 }
 
 /// `plugin.list` 参数：无（保留空对象，便于将来加过滤条件而不破坏兼容）。
@@ -2828,6 +2840,38 @@ pub struct PluginReloadResult {
     pub plugin: PluginSummary,
     /// 重载后注册的工具。
     pub tools: Vec<PluginToolSummary>,
+}
+
+/// `plugin.command` 参数（P5 切片二：命令面板触发）。
+///
+/// 与 [`PluginCallParams`] 刻意的差别：命令只有 `name` + `args` 两个业务字段，
+/// 没有 `method`——「执行哪个插件、哪条命令」在协议层是一等公民，因为闸门要按
+/// **归属**（这命令是不是这个插件声明的）逐条判，不能靠一个自由字符串承载。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginCommandParams {
+    /// 插件 id。
+    pub plugin_id: String,
+    /// 命令名（**只能是本插件 `commands[]` 里声明的**，越权回 6106）。
+    pub command: String,
+    /// 入参，缺省视为 `{}`；非空时按清单 `commands[].args` 校验，非法回 `-32602`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub args: Option<serde_json::Value>,
+}
+
+/// `plugin.command` 响应结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginCommandResult {
+    /// 插件 id（回显，便于一次并发多命令时对号）。
+    pub plugin_id: String,
+    /// 实际执行的命令名。
+    pub command: String,
+    /// 结果正文（文本化后回灌调用方）。
+    pub content: String,
+    /// 正文是否被截断（超过 64 KB）。
+    pub truncated: bool,
 }
 
 /// `plugin.call` 参数（docs/14 §6.3）。

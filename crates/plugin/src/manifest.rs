@@ -121,6 +121,17 @@ pub struct ManifestCommand {
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// 审批档位：`write` 的命令执行前弹审批（P5 切片二）。
+    ///
+    /// 命令没有 `exec` 档位可用（同工具：宿主不提供 `shell.exec`），解析到 `exec`
+    /// 按清单错误拒装——「写了 exec 却按 read 放行」是最坏的一种静默降级。
+    pub risk: PluginToolRisk,
+    /// 路径闸门用的入参字段名；缺省表示该命令不针对具体文件。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_field: Option<String>,
+    /// 入参 JSON Schema（清单里的 `args`），缺省等于「不吃入参」。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args: Option<Value>,
 }
 
 /// 校验通过的结果：规范化清单 + 归一化入口 + 非阻断告警。
@@ -580,6 +591,39 @@ fn optional_timeout(obj: &Map<String, Value>, errors: &mut Vec<Violation>) -> Op
     }
 }
 
+/// 解析 `risk` 字段（工具与命令共用一套口径）。
+///
+/// 返回 `None` 表示已记一条清单错误、调用方应当跳过该项——工具与命令对非法
+/// `risk` 的处理必须一致，否则同一个包里的两种声明会给出不同的宽容度。
+fn parse_risk(
+    item: &Map<String, Value>,
+    base: &str,
+    errors: &mut Vec<Violation>,
+) -> Option<PluginToolRisk> {
+    match item.get("risk") {
+        None | Some(Value::Null) => Some(PluginToolRisk::Read),
+        Some(Value::String(raw)) => match raw.as_str() {
+            "read" => Some(PluginToolRisk::Read),
+            "write" => Some(PluginToolRisk::Write),
+            "exec" => Some(PluginToolRisk::Exec),
+            other => {
+                errors.push(Violation::manifest(
+                    format!("{base}.risk"),
+                    format!("risk 只能是 read / write / exec，收到 {other}"),
+                ));
+                None
+            }
+        },
+        Some(_) => {
+            errors.push(Violation::manifest(
+                format!("{base}.risk"),
+                "risk 必须是字符串",
+            ));
+            None
+        }
+    }
+}
+
 fn parse_tools(obj: &Map<String, Value>, errors: &mut Vec<Violation>) -> Vec<ManifestTool> {
     let Some(value) = obj.get("tools") else {
         return Vec::new();
@@ -618,27 +662,8 @@ fn parse_tools(obj: &Map<String, Value>, errors: &mut Vec<Violation>) -> Vec<Man
             }
         };
 
-        let risk = match tool.get("risk") {
-            None | Some(Value::Null) => PluginToolRisk::Read,
-            Some(Value::String(raw)) => match raw.as_str() {
-                "read" => PluginToolRisk::Read,
-                "write" => PluginToolRisk::Write,
-                "exec" => PluginToolRisk::Exec,
-                other => {
-                    errors.push(Violation::manifest(
-                        format!("{base}.risk"),
-                        format!("risk 只能是 read / write / exec，收到 {other}"),
-                    ));
-                    continue;
-                }
-            },
-            Some(_) => {
-                errors.push(Violation::manifest(
-                    format!("{base}.risk"),
-                    "risk 必须是字符串",
-                ));
-                continue;
-            }
+        let Some(risk) = parse_risk(tool, &base, errors) else {
+            continue;
         };
 
         // parameters 必须是 `{ "type": "object", ... }`：模型侧只接受对象入参，
@@ -746,10 +771,49 @@ fn parse_commands(obj: &Map<String, Value>, errors: &mut Vec<Violation>) -> Vec<
             }
         };
 
+        // 命令与工具同一套 risk 口径：`write` 会在执行前弹审批（3001）。
+        // 命令没有 `exec` 档位——宿主不提供 `shell.exec`，写 `exec` 的命令
+        // 无法落地，语义校验阶段会把它当矛盾报出来（见 `validate` 的语义段）。
+        let Some(risk) = parse_risk(command, &base, errors) else {
+            continue;
+        };
+
+        // `args` 是**可选**的：命令不带参数是最常见形态（"重载配置"、"清缓存"）。
+        // 声明了就必须是 `type: "object"` 的 schema——与工具 side 一致，因为
+        // 校验器只吃对象入参；给了别的形状，命令会在执行时永远 -32602。
+        let args = match command.get("args") {
+            None | Some(Value::Null) => None,
+            Some(Value::Object(schema)) if schema.get("type") == Some(&json!("object")) => {
+                Some(Value::Object(schema.clone()))
+            }
+            Some(_) => {
+                errors.push(Violation::manifest(
+                    format!("{base}.args"),
+                    "args 必须是合法 JSON Schema 子集，且 type 为 \"object\"",
+                ));
+                continue;
+            }
+        };
+
+        let path_field = match command.get("pathField") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(field)) if !field.trim().is_empty() => Some(field.clone()),
+            Some(_) => {
+                errors.push(Violation::manifest(
+                    format!("{base}.pathField"),
+                    "pathField 必须是非空字符串",
+                ));
+                None
+            }
+        };
+
         commands.push(ManifestCommand {
             name,
             title,
             description,
+            risk,
+            path_field,
+            args,
         });
     }
     commands
