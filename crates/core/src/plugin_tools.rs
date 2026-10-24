@@ -155,7 +155,7 @@ fn call_error(tool: &str, err: CallError) -> AgentError {
 ///
 /// 不在这里做二次包装（不加「插件返回：」之类的前缀）——回灌给模型的内容越接近
 /// 插件原意越好，前缀会被模型当成数据的一部分引用。
-fn result_text(reply: &Value) -> String {
+pub(crate) fn result_text(reply: &Value) -> String {
     match reply {
         Value::String(text) => text.clone(),
         Value::Null => String::new(),

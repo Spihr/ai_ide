@@ -39,6 +39,7 @@ use ai_ide_protocol::dto::ApprovalDecision;
 use ai_ide_workspace::PathError;
 use async_trait::async_trait;
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -431,10 +432,37 @@ impl PermissionGate {
         }
     }
 
+    /// 只走「审批」这一步：判定由调用方自己做完。
+    ///
+    /// 插件写侧的四道闸门在 `FsHostApi` 里（能力 → 路径 → 审批 → 配额），前两关
+    /// 已经过完，只剩「问不问用户」。复用的理由不是省代码，而是**口径必须一致**：
+    /// 事件形状、`approval_id` 的应答通道、`allow_always` 的进程内记忆、`deny`
+    /// 的拒绝话术，任何一处另起一套，用户就会遇到「同一个文件有时记得、有时又问」。
+    ///
+    /// `root` 只用于把 `allow_always` 记录落在哪个工作区名下，与判定无关。
+    pub async fn request_approval(
+        &self,
+        root: &Path,
+        call: &ToolCall<'_>,
+        reason: impl Into<String>,
+    ) -> Result<Grant, AgentError> {
+        self.ask_with_root(root, call, reason.into()).await
+    }
+
     /// 向裁决者要一次答复，并把四种动作落到结果上。
     async fn ask(
         &self,
         ctx: &ToolContext<'_>,
+        call: &ToolCall<'_>,
+        reason: String,
+    ) -> Result<Grant, AgentError> {
+        self.ask_with_root(ctx.root, call, reason).await
+    }
+
+    /// [`Self::ask`] 的本体：只认工作区根，不关心调用方从哪里来。
+    async fn ask_with_root(
+        &self,
+        root: &Path,
         call: &ToolCall<'_>,
         reason: String,
     ) -> Result<Grant, AgentError> {
@@ -495,7 +523,7 @@ impl PermissionGate {
                         recorder.remember(AlwaysRecord {
                             key: scope,
                             tool: tool.to_string(),
-                            scope: ctx.root.to_string_lossy().replace('\\', "/"),
+                            scope: root.to_string_lossy().replace('\\', "/"),
                         });
                     }
                     Ok(Grant::Approved(reply))
@@ -942,6 +970,46 @@ mod tests {
         );
         assert_eq!(records[0].key, "command:cargo", "命令按程序记范围");
         assert!(!records[0].scope.is_empty(), "作用域要记工作区");
+    }
+
+    /// 只走审批这一步时口径不变：没裁决方 → 判拒；`allow_always` → 照样落盘。
+    #[tokio::test]
+    async fn request_approval_shares_the_gate_policy() {
+        let call = ToolCall::new("fs.write").path("a.txt");
+
+        // 没有裁决者：不能因为「调用方跳过了策略判定」就默认放行。
+        let bare = PermissionGate::new();
+        let err = bare
+            .request_approval(Path::new("C:/ws"), &call, "插件要写文件")
+            .await
+            .expect_err("没有审批通道必须判拒");
+        assert_eq!(err.code(), ErrorCode::TOOL_NOT_ALLOWED);
+
+        // 有裁决者：答复与落盘走同一套（键也必须是同一个 `scope_of`）。
+        let stub = StubDecider::answering(ApprovalReply::new(ApprovalDecision::AllowAlways));
+        let recorder = StubRecorder::default();
+        let gate = PermissionGate::with_decider(stub.clone()).with_recorder(recorder.clone());
+        let grant = gate
+            .request_approval(Path::new("C:/ws"), &call, "插件要写文件")
+            .await
+            .expect("用户批了就放行");
+        assert_eq!(
+            grant,
+            Grant::Approved(ApprovalReply::new(ApprovalDecision::AllowAlways))
+        );
+        let records = recorder.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].key,
+            scope_key(&call),
+            "免问键与策略判定共用一把钥匙"
+        );
+        assert_eq!(records[0].tool, "fs.write");
+        // 第二次不再问：进程内记住。
+        gate.request_approval(Path::new("C:/ws"), &call, "插件要写文件")
+            .await
+            .expect("命中免问应直接放行");
+        assert_eq!(stub.calls(), 1, "allow_always 之后不该再打扰用户");
     }
 
     #[tokio::test]

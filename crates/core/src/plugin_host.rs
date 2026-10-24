@@ -159,7 +159,10 @@ pub struct FsHostApi {
     by_plugin: Arc<RwLock<HashMap<String, HashSet<String>>>>,
     /// 会话库。用 `RwLock` 而非 `Option<Store>`：api 在 `AppState::new` 就建好
     /// （`Host` 随时可能收到 `host/*`），库是启动稍后才连上的，晚装必须能生效。
-    store: RwLock<Option<Store>>,
+    ///
+    /// `Arc` 是为了把槽位交给写侧审批方（[`crate::plugin_approver`]）：
+    /// 「总是允许」的落盘要写进同一个库，而库可能在审批方建好之后才连上。
+    store: Arc<RwLock<Option<Store>>>,
     /// 每插件在当前工具调用内的宿主调用计数。
     quota: Mutex<HashMap<String, usize>>,
     /// 写侧审批裁决方。没装 = 没人能批准 = 写请求一律 3001（fail closed）。
@@ -235,7 +238,7 @@ impl FsHostApi {
             root: Arc::new(RwLock::new(None)),
             granted: Arc::new(RwLock::new(HashSet::new())),
             by_plugin: Arc::new(RwLock::new(HashMap::new())),
-            store: RwLock::new(None),
+            store: Arc::new(RwLock::new(None)),
             quota: Mutex::new(HashMap::new()),
             approver: RwLock::new(None),
             write_always: RwLock::new(HashSet::new()),
@@ -317,6 +320,19 @@ impl FsHostApi {
     /// 当前工作区根（测试与审计用）。
     pub fn root(&self) -> Option<PathBuf> {
         self.root.read().ok().and_then(|slot| slot.clone())
+    }
+
+    /// 工作区根的共享槽位。
+    ///
+    /// 审批方必须拿到槽位而不是快照：`ws.open` / `ws.close` 会随时换根，拷一份
+    /// 进来就会把「用户批了 A 区的文件」记到 B 区名下。
+    pub fn root_handle(&self) -> Arc<RwLock<Option<PathBuf>>> {
+        Arc::clone(&self.root)
+    }
+
+    /// 会话库的共享槽位（同上：库可能晚装，审批方必须按需取，不能拷快照）。
+    pub fn store_handle(&self) -> Arc<RwLock<Option<Store>>> {
+        Arc::clone(&self.store)
     }
 
     /// 某插件在当前工具调用内已用的宿主调用次数（测试用）。

@@ -70,7 +70,7 @@ use crate::state::AppState;
 ///
 /// 比 `crates/agent` 的缺省值（30 秒）宽得多：这里等的是**人在 IDE 里**读完
 /// 「它打算干什么」再点一下，30 秒不够；超时即判拒，不会把运行挂死。
-const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// 等待审批时检查「运行是否已被停止」的轮询间隔。
 ///
@@ -904,7 +904,7 @@ impl PendingCall {
 // ---------------------------------------------------------------------------
 
 /// 把审批询问送到主进程、等用户点一次的裁决者。
-struct PeerDecider {
+pub(crate) struct PeerDecider {
     peer: Arc<Peer>,
     hub: Arc<AgentHub>,
     run_id: String,
@@ -914,6 +914,28 @@ struct PeerDecider {
     deny: Vec<String>,
     /// 同一运行内的询问序号，保证 `approval_id` 不重。
     seq: AtomicU64,
+}
+
+/// 插件写侧（P4 切片三）专用的询问编号前缀。
+///
+/// 插件写盘发生在任何 agent 运行之外（用户直接 `plugin.call`），没有 `run_id`
+/// 可用。这里给一个固定运行名：回执仍按 `approval_id` 派发，UI 会把事件里的
+/// `run_id` 原样带回来，所以固定名不会串到别的运行上——`AgentHub::resolve`
+/// 先按 `approval_id` 找登记，再核对 `run_id`，两者都对得上才入账。
+pub(crate) const PLUGIN_HOST_RUN_ID: &str = "plugin-host";
+
+impl PeerDecider {
+    /// 给插件写侧造一个：不认覆盖表（那是单次运行的语义），只负责问。
+    pub(crate) fn for_plugin_host(peer: Arc<Peer>, hub: Arc<AgentHub>) -> Self {
+        Self {
+            peer,
+            hub,
+            run_id: PLUGIN_HOST_RUN_ID.to_string(),
+            allow: Vec::new(),
+            deny: Vec::new(),
+            seq: AtomicU64::new(1),
+        }
+    }
 }
 
 #[async_trait]

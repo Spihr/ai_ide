@@ -107,6 +107,15 @@ pub async fn open(peer: &Peer, state: &AppState, req: &Request) {
     // 多工作区下后开的那个成为默认靶子，与 `workspace.tree` 的「不带 id 就取活动区」一致。
     state.plugin_host().set_root(Some(workspace.root.clone()));
 
+    // 写侧（P4 切片三）：先把裁决方接到 agent 审批通道，再把本工作区已批过的
+    // 「总是允许」灌回宿主。顺序不能反——先灌集合再装裁决方，中间那一刻的写请求
+    // 会拿到 3001（没人能批）；先装后灌只会多问一次，不会误拒。
+    crate::plugin_approver::install(state);
+    let seeded = crate::plugin_approver::seed_write_always(state, Some(&workspace.root)).await;
+    if seeded > 0 {
+        tracing::debug!(seeded, root = %workspace.root.display(), "已灌入写侧免问规则");
+    }
+
     if params.watch {
         start_watch(state, &workspace);
     }
@@ -159,7 +168,11 @@ pub async fn close(peer: &Peer, state: &AppState, req: &Request) {
         .active_id()
         .and_then(|id| state.workspaces().get(&id).ok())
         .map(|workspace| workspace.root.clone());
-    state.plugin_host().set_root(next_root);
+    state.plugin_host().set_root(next_root.clone());
+
+    // 写侧免问范围跟着活动工作区换：留着上一个区的集合，等于「关掉的工作区
+    // 仍然免问写盘」。灌 0 条就是清空。
+    crate::plugin_approver::seed_write_always(state, next_root.as_deref()).await;
 
     info!(workspace_id = %params.workspace_id, "工作区已关闭");
     peer.respond(&req.id, &OkResult { ok: true }).await;

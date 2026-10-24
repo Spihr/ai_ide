@@ -71,6 +71,7 @@ pub mod peer;
 pub mod permission_api;
 /// 插件协议处理器（P0 协议骨架）：10 个 `plugin.*` 方法的空分支。
 pub mod plugin_api;
+pub mod plugin_approver;
 /// 插件的读侧宿主能力（P3.5）：`host/fs.read` 等五个方法的闸门、配额与审计。
 pub mod plugin_host;
 /// 插件工具注入（P3）：把 `plugin__<id>__<tool>` 挂到 agent 注册表。

@@ -55,17 +55,17 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use ai_ide_plugin::host::{LoadError, LoadSpec, Restart};
+use ai_ide_plugin::host::{CallError, LoadError, LoadSpec, Restart};
 use ai_ide_plugin::{details_json, install as install_package, manifest, PackageError};
 use ai_ide_protocol::dto::{
-    PluginCallParams, PluginCommandSummary, PluginGrantParams, PluginGrantResult,
+    PluginCallParams, PluginCallResult, PluginCommandSummary, PluginGrantParams, PluginGrantResult,
     PluginInstallParams, PluginInstallResult, PluginListParams, PluginListResult, PluginLoadParams,
     PluginLoadResult, PluginReloadParams, PluginReloadResult, PluginRevokeParams,
     PluginRevokeResult, PluginState, PluginStatusParams, PluginStatusResult, PluginSummary,
     PluginToolRisk, PluginToolSummary, PluginUninstallParams, PluginUninstallResult,
     PluginUnloadParams, PluginUnloadResult,
 };
-use ai_ide_protocol::{methods, ErrorCode, ErrorObject, Request};
+use ai_ide_protocol::{ErrorCode, ErrorObject, Request};
 use ai_ide_store::{plugin_status, NewPlugin, PluginRecord, Store, StoreError};
 use serde::de::DeserializeOwned;
 
@@ -74,9 +74,6 @@ use crate::llm_runtime::default_data_dir;
 use crate::peer::Peer;
 use crate::session_api::store_of;
 use crate::state::AppState;
-
-/// P0 遗留话术，供仍未接线的 6 个方法使用。
-const NOT_WIRED: &str = "插件宿主尚未接线（P1 只落地清单与安装）";
 
 /// 解析参数；不合法时已回错误，调用方直接返回。
 async fn require_params<T: DeserializeOwned>(peer: &Peer, req: &Request) -> Option<T> {
@@ -87,18 +84,6 @@ async fn require_params<T: DeserializeOwned>(peer: &Peer, req: &Request) -> Opti
             None
         }
     }
-}
-
-/// 空分支统一出口。
-async fn not_wired(peer: &Peer, req: &Request, method: &str) {
-    peer.respond_error(
-        &req.id,
-        &ErrorObject::new(
-            ErrorCode::PLUGIN_NOT_FOUND,
-            format!("{NOT_WIRED}：{method}"),
-        ),
-    )
-    .await;
 }
 
 /// `plugin.install`：校验清单、复制包目录、写账本，不启动进程。
@@ -822,15 +807,248 @@ async fn recover_crashed(state: &AppState, store: &Store, plugin_id: &str) {
     }
 }
 
-/// `plugin.call`：调用网关（P3）。
-pub async fn call(peer: &Peer, _state: &AppState, req: &Request) {
-    if require_params::<PluginCallParams>(peer, req)
-        .await
-        .is_none()
-    {
-        return;
+// ---------------------------------------------------------------------------
+// 调用网关（P4 切片三）
+// ---------------------------------------------------------------------------
+
+/// `plugin.call` 正文上限：64 KB（docs/14 §6.3 第 6 步）。
+pub const CALL_CONTENT_LIMIT: usize = 64 * 1024;
+
+/// 网关判定用的运行时快照。
+///
+/// 把「账本里有它吗 / 现在什么状态 / 进程还活着吗 / 它声明了哪些方法」四件事抽成
+/// 纯数据，六步定序就能脱离真实子进程验收——起插件要 node，单测不该被它拖住。
+#[derive(Debug, Default, Clone)]
+pub struct CallSnapshot {
+    /// 账本里有这条记录。**装了就算存在**：与「在不在跑」是两件事，
+    /// 混成一件事的话，「装了但没装载」会被报成 6101（插件不存在），
+    /// 而它明明就在列表里，用户按提示重装一遍也不会好。
+    pub installed: bool,
+    /// 账本状态（`plugin_status::*`）。`installed` 为假时无意义。
+    pub status: String,
+    /// 进程是否活着（[`ai_ide_plugin::host::Host::is_running`]）。
+    pub running: bool,
+    /// 该插件声明过的工具名：内置名与 `plugin__<id>__<name>` 全名都收。
+    pub declared: Vec<String>,
+}
+
+/// 第 ① 步：参数快照校验（`plugin_id` / `method` 必须是非空字符串）。
+///
+/// 单独拎出来是因为它必须**早于**碰库：空 `plugin_id` 拿去查账本，只会把
+/// 「外壳塞进来的畸形请求」一路走到 6101，排查时被带偏成「插件没了」。
+fn check_call_params(params: &PluginCallParams) -> Result<(&str, &str), ErrorObject> {
+    let plugin_id = params.plugin_id.trim();
+    if plugin_id.is_empty() {
+        return Err(ErrorObject::invalid_params(
+            "plugin_id 不能为空：plugin.call 必须指名插件",
+        ));
     }
-    not_wired(peer, req, methods::plugin::CALL).await;
+    let method = params.method.trim();
+    if method.is_empty() {
+        return Err(
+            ErrorObject::invalid_params("method 不能为空：必须指名该插件声明的工具")
+                .with_data(serde_json::json!({ "plugin_id": plugin_id })),
+        );
+    }
+    Ok((plugin_id, method))
+}
+
+/// 前四步：参数快照校验 → 6101 → 6102 → 6106。
+///
+/// **顺序不可交换**，每一对相邻步骤都在防一种具体的误报：
+///
+/// - ①→②：畸形请求先拒，不能借 6101 回答「你参数写错了」；
+/// - ②→③：没这个插件（6101）与有这个插件但跑不起来（6102）分开报，
+///   前者让模型「别再编这个名字」，后者让用户「去面板看它为什么挂了」；
+/// - ③→④：**6106 早于能力判定**。归属校验只看「这个插件自己声明的清单」，
+///   不碰任何能力位；插件后续在 `host/*` 上撞到的 6103 必然发生在这之后。
+///   反过来先判能力的话，一个拿别人 `plugin_id` 调别人的方法的请求会拿到
+///   「你没授权」，把方向指到授权上，而真正的问题是越权。
+pub fn check_call(
+    params: &PluginCallParams,
+    snapshot: &CallSnapshot,
+) -> Result<(String, String), ErrorObject> {
+    let (plugin_id, method) = check_call_params(params)?;
+
+    if !snapshot.installed {
+        return Err(ErrorObject::new(
+            ErrorCode::PLUGIN_NOT_FOUND,
+            format!("插件不存在：{plugin_id}"),
+        )
+        .with_data(serde_json::json!({ "plugin_id": plugin_id })));
+    }
+
+    if snapshot.status != plugin_status::READY || !snapshot.running {
+        let status = if snapshot.status.is_empty() {
+            "未装载"
+        } else {
+            snapshot.status.as_str()
+        };
+        return Err(ErrorObject::new(
+            ErrorCode::PLUGIN_CRASHED,
+            format!("插件当前不可调用（状态 {status}）：{plugin_id}"),
+        )
+        .with_data(serde_json::json!({
+            "plugin_id": plugin_id,
+            "status": snapshot.status,
+            "running": snapshot.running,
+        })));
+    }
+
+    if !snapshot.declared.iter().any(|name| name == method) {
+        return Err(ErrorObject::new(
+            ErrorCode::PLUGIN_PROTOCOL_VIOLATION,
+            format!("插件 {plugin_id} 没有声明方法 {method}，不能跨插件调用"),
+        )
+        .with_data(serde_json::json!({
+            "plugin_id": plugin_id,
+            "method": method,
+            "declared": snapshot.declared,
+        })));
+    }
+
+    Ok((plugin_id.to_string(), method.to_string()))
+}
+
+/// 读一次网关判定所需的现状（账本 + 装载表）。
+async fn call_snapshot(state: &AppState, plugin_id: &str) -> Result<CallSnapshot, ErrorObject> {
+    let record = match state.store() {
+        Some(store) => match store.get_plugin(plugin_id).await {
+            Ok(record) => record,
+            Err(err) => return Err(store_error(err)),
+        },
+        // 库没连上时只能靠装载表：进程在跑就是「存在且可用」，没跑就说没这个插件。
+        None => None,
+    };
+    let running = state.plugins().is_running(plugin_id);
+    let declared = state
+        .plugins()
+        .tool_catalog()
+        .into_iter()
+        .filter(|tool| tool.plugin_id == plugin_id)
+        .flat_map(|tool| [tool.name, tool.namespaced_name])
+        .collect();
+    Ok(CallSnapshot {
+        installed: record.is_some() || running,
+        status: record.map(|record| record.status).unwrap_or_default(),
+        running,
+        declared,
+    })
+}
+
+/// 第 ⑥ 步：正文超过 64 KB 就截断。
+///
+/// 按**字节**截（上限是内存与上下文预算，不是字数），但落点回退到最近的字符
+/// 边界：切在 UTF-8 多字节序列中间会让 `String` 变成非法编码，回灌成 JSON 时
+/// 直接炸。截断与否由 [`PluginCallResult::truncated`] 标记，正文里不加
+/// 「已截断」之类后缀——模型会把后缀当成插件返回的数据复述出来。
+fn truncate_content(text: String) -> (String, bool) {
+    if text.len() <= CALL_CONTENT_LIMIT {
+        return (text, false);
+    }
+    let mut end = CALL_CONTENT_LIMIT;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut content = text;
+    content.truncate(end);
+    (content, true)
+}
+
+/// 插件回包折成网关错误。
+///
+/// 口径：插件的**结构性**问题（越权方法、帧不合协议）走 61xx；插件自己回的
+/// 业务错误原样带上它的 code（`data.plugin_code`），顶层用 `-32603`——那是
+/// 「插件说它失败了」，不是「内核出故障了」，但外壳只需要一个转发分支。
+fn call_error(plugin_id: &str, method: &str, err: CallError) -> ErrorObject {
+    let data = serde_json::json!({ "plugin_id": plugin_id, "method": method });
+    match err {
+        // 转发前刚确认过在跑，跑到一半没了：按「炸了」报，让用户去面板看退出码。
+        CallError::NotRunning(_) | CallError::Exited { .. } => ErrorObject::new(
+            ErrorCode::PLUGIN_CRASHED,
+            format!("插件已不可用：{plugin_id}"),
+        )
+        .with_data(data),
+        CallError::UnknownTool(tool) => ErrorObject::new(
+            ErrorCode::PLUGIN_PROTOCOL_VIOLATION,
+            format!("插件 {plugin_id} 没有声明工具 {tool}"),
+        )
+        .with_data(data),
+        CallError::Timeout { timeout, .. } => ErrorObject::new(
+            ErrorCode::PLUGIN_TIMEOUT,
+            format!("插件调用超时（{} ms）", timeout.as_millis()),
+        )
+        .with_data(data),
+        CallError::Protocol { message } => ErrorObject::new(
+            ErrorCode::PLUGIN_PROTOCOL_VIOLATION,
+            format!("插件协议错误：{message}"),
+        )
+        .with_data(data),
+        CallError::Plugin { code, message } => ErrorObject::new(
+            ErrorCode::INTERNAL_ERROR,
+            format!("插件返回错误：{message}"),
+        )
+        .with_data(serde_json::json!({
+            "plugin_id": plugin_id,
+            "method": method,
+            "plugin_code": code,
+        })),
+    }
+}
+
+/// `plugin.call`：调用网关（六步定序见 [`check_call`]）。
+pub async fn call(peer: &Peer, state: &AppState, req: &Request) {
+    let Some(params) = require_params::<PluginCallParams>(peer, req).await else {
+        return;
+    };
+    // ① 先校验、再碰库：畸形请求不该产生一次账本读。
+    if let Err(err) = check_call_params(&params) {
+        return peer.respond_error(&req.id, &err).await;
+    }
+
+    let snapshot = match call_snapshot(state, params.plugin_id.trim()).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => return peer.respond_error(&req.id, &err).await,
+    };
+    let (plugin_id, method) = match check_call(&params, &snapshot) {
+        Ok(pair) => pair,
+        Err(err) => return peer.respond_error(&req.id, &err).await,
+    };
+
+    // ⑤ 转发 `plugin/tool-invoke`：`params` 缺省按 `{}`，与插件侧的 schema 校验一致。
+    let args = params
+        .params
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let value = match state.plugins().call_tool(&plugin_id, &method, args).await {
+        Ok(value) => value,
+        Err(err) => {
+            return peer
+                .respond_error(&req.id, &call_error(&plugin_id, &method, err))
+                .await
+        }
+    };
+
+    // ⑥ 截断后再回灌。
+    let (content, truncated) = truncate_content(crate::plugin_tools::result_text(&value));
+    if truncated {
+        tracing::warn!(
+            plugin_id = %plugin_id,
+            method = %method,
+            limit = CALL_CONTENT_LIMIT,
+            "plugin.call 结果超限，已截断"
+        );
+    }
+    peer.respond(
+        &req.id,
+        &PluginCallResult {
+            plugin_id,
+            method,
+            content,
+            truncated,
+        },
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1412,5 +1630,200 @@ mod tests {
         for capability in ["fs.read", "search", "workspace.info"] {
             assert!(!is_key_capability(capability), "{capability} 不该连带卸载");
         }
+    }
+
+    // -------------------------------------------------------------- 调用网关
+
+    fn call_params(plugin_id: &str, method: &str) -> PluginCallParams {
+        PluginCallParams {
+            plugin_id: plugin_id.to_string(),
+            method: method.to_string(),
+            params: None,
+        }
+    }
+
+    /// 一条「一切就绪」的快照：装了、`ready`、在跑、声明了 `echo`。
+    fn ready_snapshot() -> CallSnapshot {
+        CallSnapshot {
+            installed: true,
+            status: plugin_status::READY.to_string(),
+            running: true,
+            declared: vec!["echo".to_string(), "plugin__demo-plugin__echo".to_string()],
+        }
+    }
+
+    /// 六步里的前四步必须按序报错：同一次「全错」的请求，错误码只能是最前面那一关的。
+    #[test]
+    fn gate_reports_the_first_failing_step_only() {
+        let broken = CallSnapshot::default();
+
+        // ① 参数快照校验先于一切：空 method 配「插件不存在」的账本，报 -32602 而不是 6101。
+        let err = check_call(&call_params("demo-plugin", "  "), &broken).expect_err("空方法必须拒");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+        // 空 plugin_id 同理：不能一路走到 6101 把畸形请求说成「插件没了」。
+        let err = check_call(&call_params(" ", "echo"), &broken).expect_err("空 id 必须拒");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+
+        // ② 插件不存在 → 6101：即便状态、装载、方法全都对不上，也只能报这一条。
+        let err =
+            check_call(&call_params("demo-plugin", "echo"), &broken).expect_err("没装就没得调");
+        assert_eq!(err.code, ErrorCode::PLUGIN_NOT_FOUND);
+
+        // ③ 装了但没装载 / 状态不是 ready → 6102，而不是 6106（方法归属还没轮到判）。
+        let installed_only = CallSnapshot {
+            installed: true,
+            status: plugin_status::NEEDS_GRANT.to_string(),
+            running: false,
+            declared: Vec::new(),
+        };
+        let err = check_call(&call_params("demo-plugin", "echo"), &installed_only)
+            .expect_err("needs_grant 不可调用");
+        assert_eq!(err.code, ErrorCode::PLUGIN_CRASHED);
+        // 账本说 ready 但进程不在，同样是 6102。
+        let dead = CallSnapshot {
+            installed: true,
+            status: plugin_status::READY.to_string(),
+            running: false,
+            declared: vec!["echo".to_string()],
+        };
+        let err =
+            check_call(&call_params("demo-plugin", "echo"), &dead).expect_err("进程不在不可调");
+        assert_eq!(err.code, ErrorCode::PLUGIN_CRASHED);
+
+        // ④ 状态齐了才判归属：没声明的方�� → 6106。
+        let err = check_call(&call_params("demo-plugin", "nope"), &ready_snapshot())
+            .expect_err("越权方法必须拒");
+        assert_eq!(err.code, ErrorCode::PLUGIN_PROTOCOL_VIOLATION);
+
+        // 五关全过：返回的是归一化后的 id / method（trim 过的，与后续转发口径一致）。
+        let (plugin_id, method) =
+            check_call(&call_params(" demo-plugin ", "echo"), &ready_snapshot())
+                .expect("一切就绪应放行");
+        assert_eq!(plugin_id, "demo-plugin");
+        assert_eq!(method, "echo");
+    }
+
+    /// **6106 早于能力判定**：这里的插件一个能力都没授权，越权方法仍然必须是 6106，
+    /// 绝不能落到「能力不足」的 6103 上——那会把「改了别人的方法名」误导成「去授权」。
+    #[test]
+    fn attribution_error_precedes_any_capability_verdict() {
+        let no_capability = ready_snapshot();
+        let err = check_call(
+            &call_params("demo-plugin", "other-plugin__secret"),
+            &no_capability,
+        )
+        .expect_err("别人的方法不能借道");
+        assert_eq!(err.code, ErrorCode::PLUGIN_PROTOCOL_VIOLATION);
+        assert_ne!(
+            err.code,
+            ErrorCode::PLUGIN_CAPABILITY_DENIED,
+            "归属校验不能退化成能力判定"
+        );
+        // `declared` 一并回给外壳：面板能直接说出「它到底声明了什么」。
+        let declared = err
+            .data
+            .as_ref()
+            .and_then(|data| data.get("declared"))
+            .and_then(|value| value.as_array())
+            .expect("错误里要带声明清单");
+        assert_eq!(declared.len(), 2);
+    }
+
+    /// 第 ⑥ 步：64 KB 是硬上限，且截断点必须落在字符边界上。
+    #[test]
+    fn content_over_limit_is_truncated_on_char_boundary() {
+        // 正好等于上限：不截。
+        let exact = "a".repeat(CALL_CONTENT_LIMIT);
+        let (content, truncated) = truncate_content(exact);
+        assert_eq!(content.len(), CALL_CONTENT_LIMIT);
+        assert!(!truncated, "等于上限不算超限");
+
+        // 多一个字节：截到上限。
+        let over = "a".repeat(CALL_CONTENT_LIMIT + 1);
+        let (content, truncated) = truncate_content(over);
+        assert_eq!(content.len(), CALL_CONTENT_LIMIT);
+        assert!(truncated);
+
+        // 上限处正好切在 3 字节汉字中间：回退到字符边界，绝不产出非法 UTF-8。
+        let mut mixed = "a".repeat(CALL_CONTENT_LIMIT - 1);
+        mixed.push('汉');
+        assert!(mixed.len() > CALL_CONTENT_LIMIT);
+        let (content, truncated) = truncate_content(mixed);
+        assert!(truncated);
+        assert_eq!(content.len(), CALL_CONTENT_LIMIT - 1);
+        assert!(content.is_char_boundary(content.len()));
+        assert_eq!(content.chars().last(), Some('a'));
+    }
+
+    /// 转发失败按类折码：超时 6105、越权工具 6106、插件自报错误原样带上它的 code。
+    #[test]
+    fn relay_failures_map_to_their_own_codes() {
+        let timeout = call_error(
+            "demo-plugin",
+            "echo",
+            CallError::Timeout {
+                tool: "echo".to_string(),
+                timeout: std::time::Duration::from_millis(5000),
+            },
+        );
+        assert_eq!(timeout.code, ErrorCode::PLUGIN_TIMEOUT);
+
+        let unknown = call_error(
+            "demo-plugin",
+            "nope",
+            CallError::UnknownTool("nope".to_string()),
+        );
+        assert_eq!(unknown.code, ErrorCode::PLUGIN_PROTOCOL_VIOLATION);
+
+        let exited = call_error(
+            "demo-plugin",
+            "echo",
+            CallError::Exited {
+                code: Some(1),
+                tail: Vec::new(),
+            },
+        );
+        assert_eq!(exited.code, ErrorCode::PLUGIN_CRASHED);
+
+        let plugin = call_error(
+            "demo-plugin",
+            "echo",
+            CallError::Plugin {
+                code: -32000,
+                message: "业务失败".to_string(),
+            },
+        );
+        assert_eq!(plugin.code, ErrorCode::INTERNAL_ERROR);
+        assert_eq!(
+            plugin
+                .data
+                .as_ref()
+                .and_then(|data| data.get("plugin_code"))
+                .and_then(|value| value.as_i64()),
+            Some(-32000),
+            "插件自己的错误码不能丢"
+        );
+    }
+
+    /// 快照读的是真账本：装了但没装载 → `installed` 为真、`running` 为假，
+    /// 于是第二步放行、第三步 6102；账本里没有的 id 才落 6101。
+    #[tokio::test]
+    async fn snapshot_distinguishes_installed_from_running() {
+        let (state, _store) = seeded(&["fs.read"]).await;
+
+        let snapshot = call_snapshot(&state, PLUGIN_ID)
+            .await
+            .expect("读账本应成功");
+        assert!(snapshot.installed, "账本里有它就算存在");
+        assert!(!snapshot.running, "没 load 过就不该有进程");
+        assert!(snapshot.declared.is_empty(), "没装载就没有可路由的方法");
+        let err = check_call(&call_params(PLUGIN_ID, "echo"), &snapshot).expect_err("未装载不可调");
+        assert_eq!(err.code, ErrorCode::PLUGIN_CRASHED);
+
+        let snapshot = call_snapshot(&state, "nope").await.expect("读账本应成功");
+        assert!(!snapshot.installed);
+        assert!(!snapshot.running);
+        let err = check_call(&call_params("nope", "echo"), &snapshot).expect_err("不存在应 6101");
+        assert_eq!(err.code, ErrorCode::PLUGIN_NOT_FOUND);
     }
 }
