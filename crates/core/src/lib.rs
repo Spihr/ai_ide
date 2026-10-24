@@ -71,6 +71,8 @@ pub mod peer;
 pub mod permission_api;
 /// 插件协议处理器（P0 协议骨架）：10 个 `plugin.*` 方法的空分支。
 pub mod plugin_api;
+/// 插件工具注入（P3）：把 `plugin__<id>__<tool>` 挂到 agent 注册表。
+pub mod plugin_tools;
 pub mod provider_api;
 pub mod session_api;
 pub mod session_export;

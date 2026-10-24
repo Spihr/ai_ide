@@ -67,7 +67,7 @@ pub struct AppState {
     /// `Mutex<HashMap>`，没有任何后台资源；真正需要「只装一次」的是里面的子进程，
     /// 而它们的存在本身就是「装过一次」的证明。直接挂字段还换来一件事：
     /// 单测里不需要先 `install_*` 就能直接装载/卸载，少一层初始化就少一种假失败。
-    plugins: Host,
+    plugins: Arc<Host>,
 }
 
 impl Default for AppState {
@@ -93,7 +93,7 @@ impl AppState {
             git: Arc::new(GitService::new()),
             store: OnceLock::new(),
             mcp: OnceLock::new(),
-            plugins: Host::new(),
+            plugins: Arc::new(Host::new()),
         }
     }
 
@@ -151,7 +151,7 @@ impl AppState {
     }
 
     /// 插件宿主：`plugin.load` / `unload` / `reload` 与崩溃巡检都从这里进。
-    pub fn plugins(&self) -> &Host {
+    pub fn plugins(&self) -> &Arc<Host> {
         &self.plugins
     }
 

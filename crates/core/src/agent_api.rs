@@ -40,6 +40,7 @@ use ai_ide_agent::{
     DEFAULT_MAX_ROUNDS, DEFAULT_MAX_STEPS,
 };
 use ai_ide_llm::{CancelToken, ChatRequest, LlmError, Provider, StreamEvent};
+use ai_ide_plugin::host::Host;
 use ai_ide_protocol::dto::{
     AgentApprovalRequiredEvent, AgentDecideParams, AgentDecideResult, AgentFinishedEvent,
     AgentMode, AgentPermissionOverride, AgentRunStatus, AgentStartParams, AgentStartResult,
@@ -380,6 +381,7 @@ pub async fn start(peer: &Peer, state: &AppState, req: &Request) {
         cancel,
         store: state.store().cloned(),
         mcp: state.mcp().map(Arc::clone),
+        plugins: Arc::clone(state.plugins()),
     };
 
     info!(
@@ -518,6 +520,10 @@ struct RunCtx {
     /// 这样「本次运行开始前刚连上的 Server」的工具立刻可用，而运行中途断连的
     /// Server 也只会在真正调用时报 8003 / 8004，不会让整次运行崩掉。
     mcp: Option<Arc<McpManager>>,
+    /// 插件宿主（P3）。与 `mcp` 同样**现取**：注册表在每次运行开头重建，
+    /// 运行前刚装载的插件立刻可用；中途卸载/崩溃的插件只会在调用时报错，
+    /// 不会把已经建好的注册表变成幽灵工具。
+    plugins: Arc<Host>,
 }
 
 /// 跑完一次运行并把结果翻成 `agent.finished`。
@@ -634,9 +640,11 @@ async fn run_loop(
     workspace: &Workspace,
     messages: Vec<ChatMessage>,
 ) -> (AgentRunStatus, Option<String>) {
-    // 核心八工具 + 当前已连接的 MCP 工具。注入点放在这里而不是启动时一次性建表：
-    // 连接状态是会变的，注册表若做成全局单例，新连上的 Server 就得等下次重启才生效。
+    // 核心八工具 + 当前已连接的 MCP 工具 + 已装载插件的工具。注入点放在这里而不是
+    // 启动时一次性建表：连接与装载状态都是会变的，注册表若做成全局单例，新连上的
+    // Server / 刚装载的插件就得等下次重启才生效。
     let registry = crate::mcp_tools::inject(ToolRegistry::core(), ctx.mcp.as_ref());
+    let registry = crate::plugin_tools::inject(registry, Some(&ctx.plugins));
     let gate = PermissionGate::with_decider(PeerDecider {
         peer: Arc::clone(&ctx.peer),
         hub: Arc::clone(&ctx.hub),
@@ -645,6 +653,7 @@ async fn run_loop(
         deny: ctx.override_rules.deny_tools.clone(),
         seq: AtomicU64::new(1),
     })
+    .with_extra_read_tools(crate::plugin_tools::read_tool_names(&ctx.plugins))
     .with_timeout(APPROVAL_TIMEOUT);
 
     // 免问规则落盘（M5 切片六）：`allow_always` 在闸门里命中时就记进库，重启后

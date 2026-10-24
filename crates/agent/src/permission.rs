@@ -296,6 +296,11 @@ pub struct PermissionGate {
     timeout: Duration,
     always: Mutex<HashSet<String>>,
     recorder: Option<Box<dyn AlwaysRecorder>>,
+    /// 运行期登记的「只读工具」全名（P3：插件 `risk=read` 工具直通）。
+    ///
+    /// 与 [`READ_TOOLS`] 分开：那张表是编译期常量，这张表按每次运行的装载状态变化。
+    /// 只装只读工具——写工具漏进这里，就等于给了它一条绕开审批的写盘路。
+    extra_read: Mutex<HashSet<String>>,
 }
 
 impl PermissionGate {
@@ -306,6 +311,7 @@ impl PermissionGate {
             timeout: DEFAULT_APPROVAL_TIMEOUT,
             always: Mutex::new(HashSet::new()),
             recorder: None,
+            extra_read: Mutex::new(HashSet::new()),
         }
     }
 
@@ -322,6 +328,44 @@ impl PermissionGate {
     pub fn with_recorder(mut self, recorder: impl AlwaysRecorder + 'static) -> Self {
         self.recorder = Some(Box::new(recorder));
         self
+    }
+
+    /// 登记一批「按只读处理」的工具全名（P3：插件 `risk=read` 工具）。
+    ///
+    /// 命中集合的调用走 [`ruling_for_path`] 的只读分支：工作区内放行、越界路径照拒
+    /// （闸门的路径校验一步都不省）。调用方必须只传插件声明为 `risk=read` 的工具——`risk=write` 的
+    /// 工具留在「未登记 → Ask」分支，审批该问还得问。
+    #[must_use]
+    pub fn with_extra_read_tools(self, tools: impl IntoIterator<Item = String>) -> Self {
+        {
+            let mut guard = self
+                .extra_read
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            guard.extend(tools);
+        }
+        self
+    }
+
+    /// 当前登记的只读工具（测试与诊断用，按字典序稳定输出）。
+    pub fn extra_read_tools(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .extra_read
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .iter()
+            .cloned()
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// 该工具是否被登记为「按只读处理」。
+    fn is_extra_read(&self, tool: &str) -> bool {
+        self.extra_read
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .contains(tool)
     }
 
     /// 灌入历史免问范围（进程启动时从库里读回），返回灌入条数。
@@ -361,7 +405,7 @@ impl PermissionGate {
         if tool == COMMAND_TOOL {
             return ruling_for_command(call);
         }
-        if READ_TOOLS.contains(&tool) {
+        if READ_TOOLS.contains(&tool) || self.is_extra_read(tool) {
             return ruling_for_path(ctx, call, false);
         }
         if WRITE_TOOLS.contains(&tool) {
@@ -726,6 +770,54 @@ mod tests {
         assert!(err.is_fatal());
         assert_eq!(err.code(), ErrorCode::PATH_DENIED);
         assert_eq!(err.code().as_i32(), 1003);
+    }
+
+    #[test]
+    fn extra_read_tools_from_plugins_are_allowed_and_others_still_ask() {
+        let sandbox = Sandbox::new("perm-plugin-read");
+        let ctx = sandbox.ctx();
+        let read_tool = "plugin__demo__peek";
+        let write_tool = "plugin__demo__poke";
+        let gate = PermissionGate::new().with_extra_read_tools([read_tool.to_string()]);
+
+        assert_eq!(gate.extra_read_tools(), vec![read_tool.to_string()]);
+        // 登记过的只读工具：工作区内直接放行，与内置 `read` 同口径。
+        assert!(matches!(
+            gate.ruling(&ctx, &ToolCall::new(read_tool).path("src/a.rs")),
+            Ruling::Allow
+        ));
+        // 没给路径的插件只读工具按工作区根处理，也放行。
+        assert!(matches!(
+            gate.ruling(&ctx, &ToolCall::new(read_tool)),
+            Ruling::Allow
+        ));
+
+        // 写工具不进集合：还是既有「未登记 → Ask」，审批不能被插件绕过。
+        assert!(matches!(
+            gate.ruling(&ctx, &ToolCall::new(write_tool).path("src/a.rs")),
+            Ruling::Ask(_)
+        ));
+
+        // 只读直通不等于免路径校验：越界路径照旧直接拒（与内置 `read` 同一套 guard）。
+        let out = gate.ruling(&ctx, &ToolCall::new(read_tool).path("../../etc/passwd"));
+        let Ruling::Deny(err) = out else {
+            panic!("插件只读工具的越界路径必须直接拒");
+        };
+        assert_eq!(err.code(), ErrorCode::PATH_OUT_OF_WORKSPACE);
+    }
+
+    #[test]
+    fn extra_read_tools_are_opt_in_per_run() {
+        let sandbox = Sandbox::new("perm-plugin-read-off");
+        let ctx = sandbox.ctx();
+        let call = ToolCall::new("plugin__demo__peek").path("src/a.rs");
+
+        // 没登记（例如本轮没有插件）：未登记工具照旧问上层，绝不默认放行。
+        assert!(matches!(
+            PermissionGate::new().ruling(&ctx, &call),
+            Ruling::Ask(_)
+        ));
+        assert!(PermissionGate::new().extra_read_tools().is_empty());
     }
 
     #[test]
