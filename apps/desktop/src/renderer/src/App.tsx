@@ -17,11 +17,13 @@ import { PermissionPanel } from './components/PermissionPanel'
 import { PluginPanel } from './components/PluginPanel'
 import { SearchPanel } from './components/SearchPanel'
 import { StatusBar } from './components/StatusBar'
+import { PluginActivityPanel } from './components/PluginActivityPanel'
 import { TerminalPanel } from './components/TerminalPanel'
 import { initCheckpoints } from './checkpoint-store'
 import { togglePalette } from './command-palette-store'
 import { initGit } from './git-store'
 import { initSessions } from './session-store'
+import { initPluginActivityEvents } from './plugin-activity-store'
 import { initTerminalEvents, toggleTerminalPanel } from './terminal-store'
 import {
   closeWorkspace,
@@ -69,6 +71,12 @@ export function App() {
     // M6：终端输出与退出事件常驻订阅——面板收起时也要收，否则后台跑完的输出
     // 会在下次展开时整段缺失。
     const offTerminal = initTerminalEvents()
+    /*
+     * P5：插件日志 / 进度 / 状态迁移三条遥测同样常驻订阅。与终端同理——面板收起时
+     * 不收，等用户点开「插件活动」就只能看到「从现在开始」的空白，而插件崩溃恰恰
+     * 是发生在你没看着面板的时候。
+     */
+    const offPluginActivity = initPluginActivityEvents()
     // M6：Git 状态是「工作区内容」的视图——`git.*` 没有自己的事件，靠 `workspace.changed`
     // 去抖后重拉。订阅常驻，这样活动栏角标在别的视图里也能实时对上。
     const offGit = initGit()
@@ -77,6 +85,7 @@ export function App() {
       offStatus()
       offWorkspace()
       offTerminal()
+      offPluginActivity()
       offGit()
       disposeAi()
     }
@@ -217,6 +226,12 @@ export function App() {
 
       {/* M6：终端是底部面板，横跨整个外壳（在 body 之外），不挤占侧栏与编辑器。 */}
       <TerminalPanel />
+
+      {/*
+        P5：插件活动是右下角的浮层（不是又一条底部横条）——它跟「插件」侧栏视图
+        一起看，压在底条上会把终端挤走；侧栏里点「活动」开，收起不影响插件面板。
+      */}
+      <PluginActivityPanel />
 
       {/* P5：全局命令面板是浮层，放在 body 之外、notice 之前——浮层要压住所有面板。 */}
       <CommandPalette />

@@ -136,7 +136,11 @@ function installHarness(): Harness {
     onAiEvent: () => () => undefined,
     onCredentialStatus: () => () => undefined,
     onTerminalData: () => () => undefined,
-    onTerminalExit: () => () => undefined
+    onTerminalExit: () => () => undefined,
+    // P5 切片七：插件遥测三条与终端输出同一范式，这些用例不驱动它们，但接口要全。
+    onPluginLog: () => () => undefined,
+    onPluginProgress: () => () => undefined,
+    onPluginStateChanged: () => () => undefined
   }
 
   const confirm = vi.fn(() => true)

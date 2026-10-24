@@ -43,6 +43,10 @@ import {
   pluginStateTone
 } from '../plugin-api'
 import {
+  togglePluginActivity,
+  usePluginActivity
+} from '../plugin-activity-store'
+import {
   cancelRevoke,
   dismissPluginError,
   dismissPluginHint,
@@ -62,6 +66,7 @@ import {
 
 export function PluginPanel(): React.JSX.Element {
   const state = usePlugins()
+  const activity = usePluginActivity()
   /** 待确认的卸载：插件 id。 */
   const [confirming, setConfirming] = useState<string | null>(null)
 
@@ -135,6 +140,15 @@ export function PluginPanel(): React.JSX.Element {
           onClick={() => void refreshPlugins()}
         >
           刷新
+        </button>
+        {/* P5：日志/进度流水在右下角浮层里，这里只负责开关开关。 */}
+        <button
+          className="ai-button"
+          type="button"
+          data-testid="plugin-activity-toggle"
+          onClick={() => togglePluginActivity()}
+        >
+          活动{activity.entries.length > 0 ? `（${activity.entries.length}）` : ''}
         </button>
       </div>
 

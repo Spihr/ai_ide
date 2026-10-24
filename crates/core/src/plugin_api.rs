@@ -746,6 +746,9 @@ async fn load_into(
 /// `host/progress`），所以载荷里的身份一定是宿主认定的那一个，伪造没有入口。
 fn announce_state(state: &AppState, plugin_id: &str, status: &str) {
     state.plugins().announce_state(plugin_id, status);
+    // 除了订阅了事件的插件，用户眼前的「插件活动」视图也要知道（P5 切片七）：
+    // 它靠这条事件刷新插件列表并追加一条状态变更条目。窗口没接线时是空操作。
+    state.plugin_host().announce_shell_state(plugin_id, status);
 }
 
 /// 握手工具声明 → 协议视图（描述/风险/schema 缺省时回落清单里的同类字段）。

@@ -269,6 +269,54 @@ export type { PluginGrantResult } from "./generated/PluginGrantResult";
 export type { PluginRevokeParams } from "./generated/PluginRevokeParams";
 export type { PluginRevokeResult } from "./generated/PluginRevokeResult";
 
+// ---- 插件可观测事件（P5 切片七）----
+//
+// 三个事件的载荷都由 Rust 侧用 `json!` 手工构造（`crates/plugin/src/events.rs`
+// 与 `crates/core/src/plugin_host.rs`），因此**没有** ts-rs 生成的 DTO。这里按
+// 内核真正投递的键逐字排列，字段一律 camelCase（与 Rust 侧一致，不是协议的
+// snake_case——事件载荷不是 RPC 参数）。
+
+/** 插件日志级别。内核侧只做原样透传，未知级别按 `info` 处理。 */
+export type PluginLogLevel = "debug" | "info" | "warn" | "error";
+
+/**
+ * `plugin.log` 载荷。
+ *
+ * `fields` 是插件自报的结构化附加信息（内核只放行对象形态），UI 不解析它，
+ * 仅原样展示在详情里。
+ */
+export interface PluginLogEvent {
+  pluginId: string;
+  level: PluginLogLevel;
+  message: string;
+  fields?: Record<string, unknown>;
+}
+
+/**
+ * `plugin.progress` 载荷。
+ *
+ * `token` 把同一次长任务的多次上报串起来（渲染侧靠 `pluginId + token` 归并）；
+ * `percent` 已被内核夹到 0~100 且非有限值一律为 `null`；`truncated` 表示
+ * `message` / `token` 被按字符截断过。
+ */
+export interface PluginProgressEvent {
+  pluginId: string;
+  token: string | null;
+  message: string | null;
+  percent: number | null;
+  truncated: boolean;
+}
+
+// `PluginState` 只在上面的 re-export 列表里出现过，re-export 不进本文件作用域，
+// 于是 `PluginStateChangedEvent.state` 得单独 import 一次。
+import type { PluginState } from "./generated/PluginState";
+
+/** `plugin.state_changed` 载荷：`state` 与 `PluginState` 同集合。 */
+export interface PluginStateChangedEvent {
+  pluginId: string;
+  state: PluginState;
+}
+
 // ---- 协议常量（与 Rust 侧保持一致的运行时镜像）----
 
 /** JSON-RPC 版本字面量。对应 Rust `ai_ide_protocol::JSONRPC_VERSION`。 */
@@ -404,6 +452,13 @@ export const Methods = {
     agentFinished: "agent.finished",
     terminalData: "terminal.data",
     terminalExit: "terminal.exit",
+    // 插件可观测事件（P5 切片七）。名字取自 Rust `crates/plugin/src/events.rs`
+    // 的常量（`PLUGIN_LOG` / `PLUGIN_PROGRESS` / `PLUGIN_STATE_CHANGED`）——
+    // 这三个不是 `ai_ide_protocol::methods::event` 的成员，因为它们是宿主
+    // 内部通道：内核 → 外壳窗口，不参与插件协议握手。
+    pluginLog: "plugin.log",
+    pluginProgress: "plugin.progress",
+    pluginStateChanged: "plugin.state_changed",
   },
 } as const;
 

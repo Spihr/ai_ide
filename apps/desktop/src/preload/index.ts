@@ -15,6 +15,9 @@ import {
   type CoreStatus,
   type CredentialStatus,
   type PingBenchmarkResult,
+  type PluginLogEvent,
+  type PluginProgressEvent,
+  type PluginStateChangedEvent,
   type TerminalDataEvent,
   type TerminalExitEvent,
   type WorkspaceChangedEvent,
@@ -111,6 +114,33 @@ const api: AiIdeApi = {
     ipcRenderer.on(IpcChannels.terminalExit, handler)
     return () => {
       ipcRenderer.removeListener(IpcChannels.terminalExit, handler)
+    }
+  },
+
+  // P5 切片七：插件可观测事件。三条通道原样转交——归并、去抖、上限都在
+  // 渲染侧的 store 里做，preload 一旦开始加工载荷，两侧就会各有一套口径。
+  onPluginLog: (listener: (event: PluginLogEvent) => void): (() => void) => {
+    const handler = (_event: IpcRendererEvent, payload: PluginLogEvent): void => listener(payload)
+    ipcRenderer.on(IpcChannels.pluginLog, handler)
+    return () => {
+      ipcRenderer.removeListener(IpcChannels.pluginLog, handler)
+    }
+  },
+
+  onPluginProgress: (listener: (event: PluginProgressEvent) => void): (() => void) => {
+    const handler = (_event: IpcRendererEvent, payload: PluginProgressEvent): void => listener(payload)
+    ipcRenderer.on(IpcChannels.pluginProgress, handler)
+    return () => {
+      ipcRenderer.removeListener(IpcChannels.pluginProgress, handler)
+    }
+  },
+
+  onPluginStateChanged: (listener: (event: PluginStateChangedEvent) => void): (() => void) => {
+    const handler = (_event: IpcRendererEvent, payload: PluginStateChangedEvent): void =>
+      listener(payload)
+    ipcRenderer.on(IpcChannels.pluginStateChanged, handler)
+    return () => {
+      ipcRenderer.removeListener(IpcChannels.pluginStateChanged, handler)
     }
   }
 }

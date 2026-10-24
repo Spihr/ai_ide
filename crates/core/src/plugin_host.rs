@@ -42,7 +42,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
-use ai_ide_plugin::events::{progress_payload, PLUGIN_LOG, PLUGIN_PROGRESS};
+use ai_ide_plugin::events::{
+    progress_payload, state_changed_payload, PLUGIN_LOG, PLUGIN_PROGRESS, PLUGIN_STATE_CHANGED,
+};
 use ai_ide_plugin::host::Host;
 use ai_ide_plugin::host_api::{
     HostApi, HostApiError, LLM_CHAT_CAPABILITY, LLM_CHAT_METHOD, LOG_METHOD, NET_FETCH_CAPABILITY,
@@ -481,6 +483,18 @@ impl FsHostApi {
         if let Some(sink) = sink {
             sink.emit(event, payload);
         }
+    }
+
+    /// 把一次状态迁移推给外壳窗口（`plugin.state_changed`，P5 切片七）。
+    ///
+    /// 与 `Host::announce_state` 分工：那边管订阅了 `plugin.state_changed` 的
+    /// 插件，这边管用户眼前的「插件活动」视图。两条路互不依赖——一条插件订阅
+    /// 都没有时窗口照样要刷新状态，窗口没开时插件订阅也照样要收到。
+    pub fn announce_shell_state(&self, plugin_id: &str, state: &str) {
+        self.emit_shell(
+            PLUGIN_STATE_CHANGED,
+            state_changed_payload(plugin_id, state),
+        );
     }
 
     /// 装上写侧审批裁决方（`AppState` 接线 / 单测注入）。
@@ -1529,7 +1543,11 @@ impl HostApi for FsHostApi {
                     }
                 }
                 tracing::debug!(plugin_id, %method, "插件日志");
-                self.publish_event(PLUGIN_LOG, payload);
+                // 两条腿都要走：订阅了 `plugin.log` 的插件拿一份，用户眼前的
+                // 「插件活动」视图也拿一份（P5 切片七）。日志开销只在事件泵里
+                // 多一次队列写入，与「写日志本身」同量级，不值得为它加开关。
+                self.publish_event(PLUGIN_LOG, payload.clone());
+                self.emit_shell(PLUGIN_LOG, payload);
                 Ok(())
             }
             PROGRESS_METHOD => {
@@ -2621,6 +2639,10 @@ mod tests {
     }
 
     /// `host/log` 仍然不要能力：同一份授权表下，日志能过、进度不能过。
+    ///
+    /// 但日志**要进外壳窗口**（P5 切片七）：用户的「插件活动」视图就是靠这条
+    /// 事件攒出来的。所以这里断言的是「日志到了窗口、进度没到」——关键在于
+    /// 那条被拒的进度不能污染窗口，日志本身必须在。
     #[test]
     fn log_stays_free_while_progress_is_gated() {
         let root = sandbox("progress-vs-log");
@@ -2634,9 +2656,33 @@ mod tests {
             .notify("demo", "host/progress", &json!({ "message": "hi" }))
             .expect_err("进度需要能力");
         assert_eq!(denied.code, HostApiError::UNAUTHORIZED);
-        assert!(
-            shell.taken().is_empty(),
-            "日志走插件订阅通道，不进外壳的进度口"
+
+        let taken = shell.taken();
+        assert_eq!(taken.len(), 1, "只该有那条日志：{taken:?}");
+        assert_eq!(taken[0].0, PLUGIN_LOG);
+        assert_eq!(taken[0].1["pluginId"], json!("demo"));
+        assert_eq!(taken[0].1["level"], json!("info"));
+        assert_eq!(taken[0].1["message"], json!("hi"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 内核侧可以直接把状态迁移推给窗口，且载荷只有 `{pluginId,state}` 两键。
+    #[test]
+    fn state_changed_reaches_shell_with_minimal_payload() {
+        let root = sandbox("state-shell");
+        let api = api_with(&root, &[]);
+        let shell = Arc::new(RecordingShell::default());
+        api.set_shell_events(shell.clone());
+
+        api.announce_shell_state("demo", "crashed");
+
+        let taken = shell.taken();
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].0, PLUGIN_STATE_CHANGED);
+        assert_eq!(
+            taken[0].1,
+            json!({ "pluginId": "demo", "state": "crashed" })
         );
 
         std::fs::remove_dir_all(&root).ok();

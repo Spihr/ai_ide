@@ -1685,3 +1685,154 @@ button {
   color: var(--muted);
   opacity: 0.75;
 }
+
+/*
+ * P5：插件活动浮层。右下角固定宽度（不跟着窗口变宽，日志一行太长反而不好扫），
+ * 高度上限 42vh，超出滚动。压在终端底条上方——两者都要看得见。
+ */
+.plugin-activity {
+  position: fixed;
+  right: 12px;
+  bottom: 34px;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  width: 520px;
+  max-width: calc(100vw - 24px);
+  max-height: 42vh;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-2);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  font-size: 12px;
+}
+
+.plugin-activity__head {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.plugin-activity__title {
+  font-size: 12px;
+}
+
+.plugin-activity__count {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.plugin-activity__spacer {
+  flex: 1;
+}
+
+/* 选中的级别按钮与其它按钮拉开：这是「当前筛选」而不是「再点一下做个动作」 */
+.plugin-activity__head .ai-button.is-active {
+  background: rgba(90, 169, 255, 0.22);
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.plugin-activity__dropped {
+  flex: none;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.plugin-activity__list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 2px 0;
+}
+
+.plugin-activity__row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 3px 8px;
+  line-height: 1.5;
+}
+
+.plugin-activity__row:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.plugin-activity__time {
+  flex: none;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 11px;
+}
+
+.plugin-activity__badge {
+  flex: none;
+  min-width: 44px;
+  padding: 0 5px;
+  border-radius: 8px;
+  background: rgba(120, 130, 145, 0.2);
+  color: #9aa3b0;
+  font-size: 10px;
+  text-align: center;
+}
+
+.plugin-activity__badge.is-info {
+  color: #8fb6e8;
+}
+
+.plugin-activity__badge.is-warn {
+  background: rgba(200, 160, 60, 0.2);
+  color: #e0bd6a;
+}
+
+.plugin-activity__badge.is-bad {
+  background: rgba(200, 70, 70, 0.2);
+  color: #e08a8a;
+}
+
+.plugin-activity__plugin {
+  flex: none;
+  max-width: 120px;
+  overflow: hidden;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.plugin-activity__percent {
+  flex: none;
+  color: #8fb6e8;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 11px;
+}
+
+/* 固定宽度的进度槽：百分比变化时行宽不抖 */
+.plugin-activity__bar {
+  flex: none;
+  width: 64px;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(120, 130, 145, 0.25);
+  overflow: hidden;
+}
+
+.plugin-activity__bar-fill {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+
+.plugin-activity__message {
+  flex: 1;
+  min-width: 0;
+  word-break: break-word;
+}
+
+.plugin-activity .panel__hint {
+  padding: 8px;
+}

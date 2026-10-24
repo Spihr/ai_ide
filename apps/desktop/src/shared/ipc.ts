@@ -7,13 +7,24 @@
 
 import type {
   HelloResult,
+  PluginLogEvent,
+  PluginProgressEvent,
+  PluginStateChangedEvent,
   TerminalDataEvent,
   TerminalExitEvent,
   WorkspaceChangedEvent,
   WorkspaceIndexedEvent
 } from '@ai-ide/shared-types'
 
-export type { TerminalDataEvent, TerminalExitEvent, WorkspaceChangedEvent, WorkspaceIndexedEvent }
+export type {
+  PluginLogEvent,
+  PluginProgressEvent,
+  PluginStateChangedEvent,
+  TerminalDataEvent,
+  TerminalExitEvent,
+  WorkspaceChangedEvent,
+  WorkspaceIndexedEvent
+}
 
 /** IPC 通道名。集中定义，避免两侧字符串写歪。 */
 export const IpcChannels = {
@@ -58,7 +69,24 @@ export const IpcChannels = {
    */
   terminalData: 'terminal:data',
   /** 主进程 → 渲染进程：终端子进程退出（`terminal.exit`） */
-  terminalExit: 'terminal:exit'
+  terminalExit: 'terminal:exit',
+  /**
+   * 主进程 → 渲染进程：插件日志（`plugin.log`）。
+   *
+   * 三条插件可观测事件各开一条通道，与 `ai:event` 分开：`plugin.log` /
+   * `plugin.progress` 是插件自己刷的遥测（`host/log` 无条件转发、进度可以
+   * 每秒好几帧），混进 AI 事件会让对话面板的监听无谓唤醒；而它们的订阅方
+   * 只有一个「插件活动」视图。
+   */
+  pluginLog: 'plugin:log',
+  /** 主进程 → 渲染进程：插件长任务进度（`plugin.progress`） */
+  pluginProgress: 'plugin:progress',
+  /**
+   * 主进程 → 渲染进程：插件状态迁移（`plugin.state_changed`）。
+   *
+   * 这条同时承担「刷新插件清单」的职责：状态变了就意味着面板上的行过期了。
+   */
+  pluginStateChanged: 'plugin:state-changed'
 } as const
 
 export type CoreState = 'idle' | 'starting' | 'ready' | 'failed' | 'stopped'
@@ -159,6 +187,17 @@ export interface AiIdeApi {
   onTerminalData: (listener: (event: TerminalDataEvent) => void) => () => void
   /** 订阅终端子进程退出（`terminal.exit`），返回取消订阅函数。 */
   onTerminalExit: (listener: (event: TerminalExitEvent) => void) => () => void
+  /** 订阅插件日志（`plugin.log`），返回取消订阅函数。 */
+  onPluginLog: (listener: (event: PluginLogEvent) => void) => () => void
+  /**
+   * 订阅插件进度（`plugin.progress`），返回取消订阅函数。
+   *
+   * 同一个 `pluginId + token` 会来很多帧，归并由渲染侧的插件活动 store 负责
+   * （preload 只转交，不改写载荷）。
+   */
+  onPluginProgress: (listener: (event: PluginProgressEvent) => void) => () => void
+  /** 订阅插件状态迁移（`plugin.state_changed`），返回取消订阅函数。 */
+  onPluginStateChanged: (listener: (event: PluginStateChangedEvent) => void) => () => void
 }
 
 // ---------------------------------------------------------------------------

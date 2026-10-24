@@ -96,6 +96,14 @@ function pushLog(text: string): void {
 // 密钥托管（docs/02 §6.3）
 // ---------------------------------------------------------------------------
 
+/** 插件可观测事件（P5 切片七）：插件遥测专用的三条通道。 */
+function pluginEventChannel(method: string): string | null {
+  if (method === Methods.event.pluginLog) return IpcChannels.pluginLog
+  if (method === Methods.event.pluginProgress) return IpcChannels.pluginProgress
+  if (method === Methods.event.pluginStateChanged) return IpcChannels.pluginStateChanged
+  return null
+}
+
 /** M2 事件：`provider.changed` 与 `llm.*` 全家。 */
 function isAiEvent(method: string): boolean {
   return method === Methods.event.providerChanged || method.startsWith('llm.')
@@ -186,6 +194,7 @@ async function startCore(): Promise<CoreStatus> {
     // 工作区事件走各自专用通道，M2 的 `provider.changed` / `llm.*` 与 M4 的
     // `agent.*` 走统一 AI 事件通道，M6 的 `terminal.data` / `terminal.exit`
     // 走终端专用通道（高频字节流，不能混进 AI 事件）；其余通知只留在内核日志里。
+    const pluginChannel = pluginEventChannel(method)
     const channel =
       method === Methods.event.workspaceChanged
         ? IpcChannels.workspaceChanged
@@ -195,9 +204,11 @@ async function startCore(): Promise<CoreStatus> {
             ? IpcChannels.terminalData
             : method === Methods.event.terminalExit
               ? IpcChannels.terminalExit
-              : isAiEvent(method)
-                ? IpcChannels.aiEvent
-                : null
+              : pluginChannel !== null
+                ? pluginChannel
+                : isAiEvent(method)
+                  ? IpcChannels.aiEvent
+                  : null
 
     if (channel && mainWindow && !mainWindow.isDestroyed()) {
       const payload = channel === IpcChannels.aiEvent ? ({ method, params } satisfies AiEvent) : params
