@@ -494,6 +494,7 @@ pub async fn unload(peer: &Peer, state: &AppState, req: &Request) {
     {
         return peer.respond_error(&req.id, &store_error(err)).await;
     }
+    announce_state(state, &plugin_id, plugin_status::INSTALLED);
     // 卸载后它的 host/* 授权一并作废：进程已经没了，留着这份授权只会让下一次
     // 同名重装继承上一轮的权限。
     state.plugin_host().set_granted_for(&plugin_id, Vec::new());
@@ -681,6 +682,9 @@ async fn load_into(
                 let _ = state.plugins().unload(plugin_id).await;
                 return Err(store_error(err));
             }
+            // 账本写成功才广播：状态事件必须与账本一致，否则订阅方会收到一个
+            // 「面板上说 ready、库里还是 crashed」的假状态。
+            announce_state(state, plugin_id, plugin_status::READY);
 
             let mut fresh = record.clone();
             fresh.status = plugin_status::READY.to_string();
@@ -712,9 +716,18 @@ async fn load_into(
             let _ = store
                 .set_plugin_status(plugin_id, status, Some(&error.to_string()))
                 .await;
+            announce_state(state, plugin_id, status);
             Err(mapped)
         }
     }
+}
+
+/// 广播一次插件状态迁移（`plugin.state_changed`）。
+///
+/// `pluginId` 由宿主填，插件发不出这个事件（它只能发 `host/log` /
+/// `host/progress`），所以载荷里的身份一定是宿主认定的那一个，伪造没有入口。
+fn announce_state(state: &AppState, plugin_id: &str, status: &str) {
+    state.plugins().announce_state(plugin_id, status);
 }
 
 /// 握手工具声明 → 协议视图（描述/风险/schema 缺省时回落清单里的同类字段）。
@@ -851,6 +864,7 @@ async fn recover_crashed(state: &AppState, store: &Store, plugin_id: &str) {
             {
                 tracing::warn!(plugin_id = %plugin_id, %err, "重启成功但状态写入失败");
             }
+            announce_state(state, plugin_id, plugin_status::READY);
             tracing::info!(
                 plugin_id = %plugin_id,
                 attempt = attempts,
@@ -871,6 +885,7 @@ async fn recover_crashed(state: &AppState, store: &Store, plugin_id: &str) {
             {
                 tracing::warn!(plugin_id = %plugin_id, %err, "崩溃状态写入账本失败");
             }
+            announce_state(state, plugin_id, plugin_status::CRASHED);
         }
         Restart::Exhausted {
             attempts,
@@ -890,6 +905,7 @@ async fn recover_crashed(state: &AppState, store: &Store, plugin_id: &str) {
             {
                 tracing::warn!(plugin_id = %plugin_id, %err, "崩溃状态写入账本失败");
             }
+            announce_state(state, plugin_id, plugin_status::CRASHED);
         }
         // 装载表里已经没有它：说明这一轮巡检前被 unload / 新一轮 load 收走了，
         // 账本状态由那条路径负责，这里不要覆盖。

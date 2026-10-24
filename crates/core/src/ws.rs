@@ -24,7 +24,9 @@ use ai_ide_protocol::{methods, ErrorObject, PathChange, Request};
 use ai_ide_workspace::{fs_ops, Workspace, WorkspaceError};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::task;
+use tokio::time::timeout;
 use tracing::{info, warn};
 
 // ---------------------------------------------------------------------------
@@ -190,8 +192,27 @@ fn start_watch(state: &AppState, workspace: &Arc<Workspace>) {
 
     let workspace_id = workspace.id.clone();
     let peer = state.peer();
+    let plugins = state.plugins().clone();
     tokio::spawn(async move {
-        while let Some(changes) = rx.recv().await {
+        while let Some(mut changes) = rx.recv().await {
+            // 合并窗口：一次保存常常连着触发好几条路径变化（临时文件写入、
+            // rename、目录 mtime），逐批投递会让插件被同一件事唤醒多次。
+            // 这里在源头上再收一次，与 `EventQueue` 的同类型事件合并一起兜高频。
+            // 退出条件有两个：`Ok(None)` = 通道关了（工作区已关闭），这批发完就退出；
+            // `Err(_)` = 窗口内没有新批次，合并结束。
+            while let Ok(Some(more)) = timeout(WORKSPACE_CHANGE_MERGE_WINDOW, rx.recv()).await {
+                changes.extend(more);
+            }
+
+            // 插件侧载荷只有路径：`workspace.changed` 的语义是「这些文件可能变了」，
+            // 正文由插件自己按需通过 `host/fs.read` 去取，宿主不主动推送内容。
+            plugins.publish(
+                ai_ide_plugin::events::WORKSPACE_CHANGED,
+                ai_ide_plugin::events::workspace_changed_payload(
+                    changes.iter().map(|change| change.path.as_str()),
+                ),
+            );
+
             let Some(peer) = peer.as_ref() else {
                 // 单测里没有对端句柄，事件无处可去，直接丢弃。
                 continue;
@@ -207,6 +228,9 @@ fn start_watch(state: &AppState, workspace: &Arc<Workspace>) {
         }
     });
 }
+
+/// `workspace.changed` 投给插件前的合并窗口。
+const WORKSPACE_CHANGE_MERGE_WINDOW: Duration = Duration::from_millis(120);
 
 // ---------------------------------------------------------------------------
 // workspace.tree
@@ -281,6 +305,7 @@ pub async fn write_file(peer: &Peer, state: &AppState, req: &Request) {
     };
 
     let path = params.path.clone();
+    let saved = path.clone();
     let content = params.content.clone();
     let expected_hash = params.expected_hash.clone();
     let eol = params.eol;
@@ -296,7 +321,16 @@ pub async fn write_file(peer: &Peer, state: &AppState, req: &Request) {
     })
     .await
     {
-        Ok(result) => peer.respond(&req.id, &result).await,
+        Ok(result) => {
+            // 写盘成功才算「保存」：失败的分支连内容都没落下去，投事件只会让插件
+            // 去读一份旧文件。载荷只有路径，`file.saved` 与 `workspace.changed` 一样
+            // 不带正文。
+            state.plugins().publish(
+                ai_ide_plugin::events::FILE_SAVED,
+                ai_ide_plugin::events::file_saved_payload(&saved),
+            );
+            peer.respond(&req.id, &result).await
+        }
         Err(err) => peer.respond_error(&req.id, &err).await,
     }
 }

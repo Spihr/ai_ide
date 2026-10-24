@@ -38,8 +38,10 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
+use ai_ide_plugin::events::{PLUGIN_LOG, PLUGIN_PROGRESS};
+use ai_ide_plugin::host::Host;
 use ai_ide_plugin::host_api::{HostApi, HostApiError};
 use ai_ide_store::{audit_actor, audit_kind, NewAuditEvent, Store};
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -179,6 +181,11 @@ pub struct FsHostApi {
     /// 临时文件名里的自增序号（不复用 `calls`：临时文件与审计编号没有关系，
     /// 混用会让 callId 出现「跳过」的假象）。
     temps: AtomicU64,
+    /// 装载表（P5 遥测转投用）。
+    ///
+    /// 存 `Weak` 而不是 `Arc`：`Host` 持有本结构，本结构再持 `Arc<Host>` 会成环，
+    /// 进程退出时释放不掉。`AppState::new` 建好 `Host` 后立刻回填。
+    plugins: RwLock<Option<Weak<Host>>>,
 }
 
 impl Default for FsHostApi {
@@ -244,6 +251,27 @@ impl FsHostApi {
             write_always: RwLock::new(HashSet::new()),
             calls: AtomicU64::new(0),
             temps: AtomicU64::new(0),
+            plugins: RwLock::new(None),
+        }
+    }
+
+    /// 回填装载表句柄（`AppState::new` 建好 `Host` 后调用一次）。
+    pub fn set_plugins(&self, plugins: &Arc<Host>) {
+        if let Ok(mut slot) = self.plugins.write() {
+            *slot = Some(Arc::downgrade(plugins));
+        }
+    }
+
+    /// 把一条宿主侧事件投给订阅了它的插件（没回填装载表时静默跳过）。
+    fn publish_event(&self, event: &str, payload: Value) -> usize {
+        let host = self
+            .plugins
+            .read()
+            .ok()
+            .and_then(|slot| slot.as_ref().and_then(Weak::upgrade));
+        match host {
+            Some(host) => host.publish(event, payload),
+            None => 0,
         }
     }
 
@@ -736,6 +764,13 @@ impl FsHostApi {
             return Err(write_error(&display, &err));
         }
 
+        // 插件写盘也是「保存」：其它订阅了 `file.saved` 的插件应当同样感知到，
+        // 不能只有编辑器那条路径会发事件。载荷只有路径，不带正文。
+        self.publish_event(
+            ai_ide_plugin::events::FILE_SAVED,
+            ai_ide_plugin::events::file_saved_payload(&display),
+        );
+
         Ok(json!({
             "path": display,
             "bytes": bytes.len(),
@@ -1010,6 +1045,71 @@ impl HostApi for FsHostApi {
         if let Ok(mut map) = self.quota.lock() {
             map.insert(plugin_id.to_string(), 0);
         }
+    }
+
+    /// `host/log` / `host/progress`：旁路遥测，不走能力闸门（它们不是能力）。
+    ///
+    /// `pluginId` 一律用这里的 `plugin_id`（来自进程句柄，装载时确定）覆盖插件
+    /// 自报的值：载荷里的身份只能是宿主认定的那一个，插件改不了。
+    fn notify(&self, plugin_id: &str, method: &str, params: &Value) -> Result<(), HostApiError> {
+        let payload = match method {
+            "host/log" => {
+                let level = params
+                    .get("level")
+                    .and_then(Value::as_str)
+                    .unwrap_or("info")
+                    .to_string();
+                let message = params
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_default();
+                let mut payload = json!({
+                    "pluginId": plugin_id,
+                    "level": level,
+                    "message": message,
+                });
+                // 允许透传结构化字段，但只放行白名单键：`pluginId` 必须最后由
+                // 宿主写，不能让 `params` 里同名的键把它顶掉。
+                if let (Some(extra), Some(object)) =
+                    (params.get("fields").cloned(), payload.as_object_mut())
+                {
+                    if extra.is_object() {
+                        object.insert("fields".to_string(), extra);
+                    }
+                }
+                tracing::debug!(plugin_id, %method, "插件日志");
+                payload
+            }
+            "host/progress" => {
+                let percent = params
+                    .get("percent")
+                    .and_then(Value::as_f64)
+                    .map(|value| value.clamp(0.0, 100.0));
+                let message = params
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let token = params
+                    .get("token")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                json!({
+                    "pluginId": plugin_id,
+                    "percent": percent,
+                    "message": message,
+                    "token": token,
+                })
+            }
+            _ => return Err(HostApiError::method_not_found(method)),
+        };
+        let event = if method == "host/log" {
+            PLUGIN_LOG
+        } else {
+            PLUGIN_PROGRESS
+        };
+        self.publish_event(event, payload);
+        Ok(())
     }
 }
 

@@ -114,6 +114,16 @@ pub trait HostApi: Send + Sync {
     fn begin_call(&self, plugin_id: &str) {
         let _ = plugin_id;
     }
+
+    /// 处理一条插件通知帧（无 `id`，插件不等回包）。
+    ///
+    /// P5 只开放两个：`host/log` 与 `host/progress`。它们不是能力，是**旁路
+    /// 遥测**——宿主把它们转成 `plugin.log` / `plugin.progress` 事件，`pluginId`
+    /// 由宿主填。默认实现回「方法不存在」，等于「实现方不打算收遥测」。
+    fn notify(&self, plugin_id: &str, method: &str, params: &Value) -> Result<(), HostApiError> {
+        let _ = (plugin_id, params);
+        Err(HostApiError::method_not_found(method))
+    }
 }
 
 /// 实现方的共享句柄。

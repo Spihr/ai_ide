@@ -15,6 +15,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::events::{subscribed, EventSink, PushOutcome, EVENT_METHOD, PLUGIN_STATE_CHANGED};
 use crate::host_api::HostApi;
 use crate::loader::{PluginProcess, RequestError, SpawnError, SpawnOptions, EXITED_REPLY_CODE};
 use crate::manifest::{
@@ -308,6 +309,69 @@ struct Entry {
     resume: Resume,
     /// 本装载会话内已经用掉的自动重启次数（重启成功也不清零）。
     restart_attempts: u32,
+    /// 装载时冻结的订阅清单（取自**清单**的 `subscriptions`，不是握手回包——
+    /// 清单是用户在安装时看到并同意的那一份，运行期改不了）。
+    subscriptions: Vec<String>,
+    /// 该插件的事件出口。一个插件一条队列，互不影响：慢插件只堵自己。
+    events: Arc<EventSink>,
+}
+
+impl Entry {
+    fn new(start: Start, resume: Resume, restart_attempts: u32) -> Self {
+        let sink = Arc::new(EventSink::new(resume.plugin_id.clone()));
+        let subscriptions = resume.manifest.subscriptions.clone();
+        Self {
+            start,
+            resume,
+            restart_attempts,
+            subscriptions,
+            events: sink,
+        }
+    }
+}
+
+/// 把一条事件队列抽干，逐条写进插件进程。
+///
+/// 只在队列里已有事件时被拉起，抽干即退出（见 [`EventSink`]）。写失败说明
+/// 进程已经不可用：停止投递并清空后续，插件的死活由装载表的状态机去判定，
+/// 事件通道不做二次裁决，也不重试。
+fn flush_events(sink: &Arc<EventSink>, process: Arc<PluginProcess>) {
+    if !sink.begin_drain() {
+        return;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        sink.end_drain();
+        tracing::debug!(
+            plugin_id = %sink.plugin_id(),
+            "没有异步运行时，事件留在队列里等下次"
+        );
+        return;
+    };
+    let queue = Arc::clone(sink);
+    runtime.spawn(async move {
+        loop {
+            let Some(item) = queue.pop() else {
+                queue.end_drain();
+                // 收尾窗口：刚判空又有事件进来时接着干，避免事件卡在队里等到
+                // 下一次 publish 才动（那可能就是几秒之后）。
+                if !queue.is_empty() && queue.begin_drain() {
+                    continue;
+                }
+                break;
+            };
+            let params = json!({ "event": item.event, "payload": item.payload });
+            if let Err(error) = process.notify(EVENT_METHOD, &params).await {
+                tracing::debug!(
+                    plugin_id = %queue.plugin_id(),
+                    event = %item.event,
+                    %error,
+                    "事件写不进插件进程，停止投递"
+                );
+                queue.end_drain();
+                break;
+            }
+        }
+    });
 }
 
 /// 一次自动重启的结局。
@@ -391,14 +455,7 @@ impl Host {
         let start = start(&resume).await?;
         let loaded = loaded_of(&start, false);
         if let Ok(mut guard) = self.loaded.lock() {
-            guard.insert(
-                plugin_id,
-                Entry {
-                    start,
-                    resume,
-                    restart_attempts: 0,
-                },
-            );
+            guard.insert(plugin_id, Entry::new(start, resume, 0));
         }
         Ok(loaded)
     }
@@ -447,11 +504,7 @@ impl Host {
                     if let Ok(mut guard) = self.loaded.lock() {
                         guard.insert(
                             plugin_id.to_string(),
-                            Entry {
-                                start: started,
-                                resume: entry.resume,
-                                restart_attempts: attempts,
-                            },
+                            Entry::new(started, entry.resume, attempts),
                         );
                     }
                     return Restart::Recovered { loaded, attempts };
@@ -518,6 +571,80 @@ impl Host {
     /// 该插件是否已装载且进程还活着。
     pub fn is_running(&self, plugin_id: &str) -> bool {
         self.alive(plugin_id).is_some()
+    }
+
+    /// 宿主 → 插件的单向事件投递（P5，docs/14 §6.5）。
+    ///
+    /// 过滤发生在**入队之前**：没声明订阅的插件连队列都不进，更不会有帧写进
+    /// 它的 stdin——「不投递」因此在物理上等于「不唤醒」（进程收不到 stdin
+    /// 数据就不会被调度去读）。已退出的插件同样跳过：它的工具已下架，再往里
+    /// 写帧只会撞管道错误。
+    ///
+    /// 返回本次实际入队的插件数（合并进已有队列也算），供调用方观测。
+    pub fn publish(&self, event: &str, payload: Value) -> usize {
+        let targets: Vec<(Arc<EventSink>, Arc<PluginProcess>)> = {
+            let Ok(guard) = self.loaded.lock() else {
+                return 0;
+            };
+            guard
+                .values()
+                .filter(|entry| !entry.start.process.has_exited())
+                .filter(|entry| subscribed(&entry.subscriptions, event))
+                .map(|entry| (entry.events.clone(), entry.start.process.clone()))
+                .collect()
+        };
+        if targets.is_empty() {
+            tracing::trace!(event, "没有插件订阅该事件，不投递");
+            return 0;
+        }
+        let mut delivered = 0;
+        for (sink, process) in targets {
+            if sink.push(event, payload.clone()) == PushOutcome::Dropped {
+                tracing::warn!(
+                    plugin_id = %sink.plugin_id(),
+                    %event,
+                    dropped = sink.dropped(),
+                    "事件队列已满，丢弃最旧的一条"
+                );
+            }
+            delivered += 1;
+            flush_events(&sink, process);
+        }
+        delivered
+    }
+
+    /// 广播一次插件状态迁移（`plugin.state_changed`）。
+    ///
+    /// `pluginId` 由这里填：插件发不出这个事件（它只能发 `host/log` /
+    /// `host/progress`，见 `loader::handle_notification`），所以载荷里的身份
+    /// 一定是宿主认定的那一个，伪造没有入口。
+    pub fn announce_state(&self, plugin_id: &str, state: &str) -> usize {
+        self.publish(
+            PLUGIN_STATE_CHANGED,
+            crate::events::state_changed_payload(plugin_id, state),
+        )
+    }
+
+    /// 某插件当前还在队列里、尚未写出去的事件数（诊断与单测用）。
+    pub fn pending_events(&self, plugin_id: &str) -> usize {
+        self.loaded
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(plugin_id).map(|entry| entry.events.len()))
+            .unwrap_or(0)
+    }
+
+    /// 某插件装载时冻结的订阅清单（诊断用）。
+    pub fn subscriptions(&self, plugin_id: &str) -> Vec<String> {
+        self.loaded
+            .lock()
+            .ok()
+            .and_then(|guard| {
+                guard
+                    .get(plugin_id)
+                    .map(|entry| entry.subscriptions.clone())
+            })
+            .unwrap_or_default()
     }
 
     /// 已在跑的工具全名（未装载为空）。
@@ -936,6 +1063,10 @@ fn merge_tools(manifest: &Manifest, handshake: &Handshake) -> Vec<HandshakeTool>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::{
+        file_saved_payload, session_payload, workspace_changed_payload, FILE_SAVED,
+        SESSION_STARTED, WORKSPACE_CHANGED,
+    };
     use crate::loader::{SpawnOptions, NODE_ENV};
     use crate::manifest::ManifestTool;
     use ai_ide_protocol::PluginToolRisk;
@@ -1035,9 +1166,9 @@ mod tests {
         let host = Host::new();
         host.loaded.lock().expect("装载表").insert(
             "demo".to_string(),
-            Entry {
+            Entry::new(
                 start,
-                resume: Resume {
+                Resume {
                     plugin_id: "demo".to_string(),
                     install_dir: dir.to_path_buf(),
                     entry: entry.to_path_buf(),
@@ -1047,8 +1178,8 @@ mod tests {
                     workspace: Value::Null,
                     host: None,
                 },
-                restart_attempts: 0,
-            },
+                0,
+            ),
         );
         host
     }
@@ -1117,6 +1248,364 @@ mod tests {
         assert_eq!(reply["method"], json!(TOOL_INVOKE_METHOD));
         assert_eq!(reply["tool"], json!("echo"));
         assert_eq!(reply["echo"], json!({ "text": "你好" }));
+
+        host.shutdown_all().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------------------------------------------------------
+    // P5 切片一：事件订阅投递
+    // ---------------------------------------------------------------
+
+    /// 事件接收替身：把收到的 `plugin/event` 的 `params` 原样追加到
+    /// `<dir>/events.jsonl`，其余带 `id` 的帧回空 `result`。
+    ///
+    /// 关键点：**只有真收到帧才写文件**。因此「文件不存在」就是「一个字节都
+    /// 没进过该进程的 stdin」的物理证据——未订阅的插件不投递、不被唤醒，
+    /// 不是靠读代码相信，而是靠落盘证据断言。
+    const EVENT_RECORDER: &str = r#"
+        const fs = require('node:fs')
+        const path = require('node:path')
+        const readline = require('node:readline')
+        const out = path.join(__dirname, 'events.jsonl')
+        const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity })
+        rl.on('line', (line) => {
+          if (!line.trim()) return
+          const frame = JSON.parse(line)
+          if (frame.method === 'plugin/event') {
+            fs.appendFileSync(out, JSON.stringify(frame.params) + '\n')
+          }
+          if (frame.id !== undefined) {
+            process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: frame.id, result: {} }) + '\n')
+          }
+        })
+    "#;
+
+    /// 越界替身：一上来就冒充宿主发 `plugin/state_changed`。
+    const EVENT_SPOOFER: &str = r#"
+        process.stdout.write(JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'plugin/state_changed',
+          params: { pluginId: 'victim', state: 'crashed' }
+        }) + '\n')
+        const readline = require('node:readline')
+        const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity })
+        rl.on('line', () => {})
+    "#;
+
+    /// 遥测替身：发一条 `host/progress`，参数里故意伪造 `pluginId`。
+    const PROGRESS_REPORTER: &str = r#"
+        process.stdout.write(JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'host/progress',
+          params: { progress: 0.5, message: '半程', pluginId: 'forged' }
+        }) + '\n')
+        const readline = require('node:readline')
+        const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity })
+        rl.on('line', () => {})
+    "#;
+
+    /// 记录 `notify` 的假宿主（只关心遥测，不实现任何 `host/*` 能力）。
+    #[derive(Default)]
+    struct RecordingHost {
+        seen: Mutex<Vec<(String, String, Value)>>,
+    }
+
+    impl HostApi for RecordingHost {
+        fn call(
+            &self,
+            _plugin_id: &str,
+            method: &str,
+            _params: &Value,
+        ) -> Result<Value, crate::host_api::HostApiError> {
+            Err(crate::host_api::HostApiError::method_not_found(method))
+        }
+
+        fn notify(
+            &self,
+            plugin_id: &str,
+            method: &str,
+            params: &Value,
+        ) -> Result<(), crate::host_api::HostApiError> {
+            if let Ok(mut seen) = self.seen.lock() {
+                seen.push((plugin_id.to_string(), method.to_string(), params.clone()));
+            }
+            Ok(())
+        }
+    }
+
+    /// 起一个装载表条目：`subscriptions` 只写进**清单**（投递只看它）。
+    async fn event_entry(
+        tag: &str,
+        plugin_id: &str,
+        subscriptions: &[&str],
+        script: &str,
+        host_api: Option<Arc<dyn HostApi>>,
+    ) -> (PathBuf, Entry) {
+        let dir = scratch(tag);
+        let entry_path = dir.join("index.cjs");
+        std::fs::write(&entry_path, script).expect("写脚本");
+        let process = PluginProcess::spawn(SpawnOptions {
+            plugin_id,
+            install_dir: &dir,
+            entry: &entry_path,
+            host: host_api,
+        })
+        .await
+        .expect("起进程");
+        let mut manifest = demo_manifest();
+        manifest.id = plugin_id.to_string();
+        manifest.tools = Vec::new();
+        manifest.subscriptions = subscriptions.iter().map(|item| item.to_string()).collect();
+        let start = Start {
+            handshake: Handshake {
+                plugin_api: Some(json!({ "major": 1, "minor": 0 })),
+                name: Some(plugin_id.to_string()),
+                version: Some("0.1.0".to_string()),
+                tools: Vec::new(),
+                commands: Vec::new(),
+                subscriptions: Vec::new(),
+            },
+            tools: Vec::new(),
+            namespaced: Vec::new(),
+            process,
+        };
+        let resume = Resume {
+            plugin_id: plugin_id.to_string(),
+            install_dir: dir.clone(),
+            entry: entry_path,
+            manifest,
+            requested: Vec::new(),
+            granted: Vec::new(),
+            workspace: Value::Null,
+            host: None,
+        };
+        (dir, Entry::new(start, resume, 0))
+    }
+
+    /// 轮询等一个文件出现且非空（投递是异步的：publish → 队 → 任务 → stdin）。
+    async fn wait_for_lines(path: &Path) -> Option<String> {
+        for _ in 0..120 {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if !text.trim().is_empty() {
+                    return Some(text);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn publish_reaches_subscriber_only() {
+        if !node_ready() {
+            eprintln!("跳过：本机没有 node");
+            return;
+        }
+        let (alpha_dir, alpha) = event_entry(
+            "pub-alpha",
+            "alpha",
+            &["workspace.changed"],
+            EVENT_RECORDER,
+            None,
+        )
+        .await;
+        let (beta_dir, beta) = event_entry("pub-beta", "beta", &[], EVENT_RECORDER, None).await;
+        let host = Host::new();
+        {
+            let mut guard = host.loaded.lock().expect("装载表");
+            guard.insert("alpha".to_string(), alpha);
+            guard.insert("beta".to_string(), beta);
+        }
+
+        let delivered = host.publish(
+            WORKSPACE_CHANGED,
+            workspace_changed_payload(["src/a.ts", "src/b.ts"]),
+        );
+        assert_eq!(delivered, 1, "只有 alpha 声明了 workspace.changed");
+
+        let text = wait_for_lines(&alpha_dir.join("events.jsonl"))
+            .await
+            .expect("alpha 应收到事件帧");
+        let frames: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("事件行是 JSON"))
+            .collect();
+        assert_eq!(frames.len(), 1, "一条事件只写一帧");
+        // 载荷最小化：只有路径，没有任何文件内容。
+        assert_eq!(
+            frames[0],
+            json!({
+                "event": WORKSPACE_CHANGED,
+                "payload": { "files": ["src/a.ts", "src/b.ts"] }
+            })
+        );
+        let payload = frames[0]["payload"].as_object().expect("载荷是对象");
+        assert_eq!(
+            payload.keys().collect::<Vec<_>>(),
+            vec!["files"],
+            "workspace.changed 只允许带 files"
+        );
+
+        // 未订阅的 beta：一个字节都没写进去（也就没被唤醒）。
+        assert!(
+            !beta_dir.join("events.jsonl").exists(),
+            "未订阅的插件不该收到任何帧"
+        );
+        assert_eq!(host.pending_events("beta"), 0, "未订阅的插件不该有队列残留");
+        assert!(host.is_running("beta"), "不投递 ≠ 杀进程：beta 仍在跑");
+
+        host.shutdown_all().await;
+        let _ = std::fs::remove_dir_all(&alpha_dir);
+        let _ = std::fs::remove_dir_all(&beta_dir);
+    }
+
+    #[tokio::test]
+    async fn wildcard_subscription_gets_session_events() {
+        if !node_ready() {
+            eprintln!("跳过：本机没有 node");
+            return;
+        }
+        let (dir, entry) =
+            event_entry("pub-session", "alpha", &["session.*"], EVENT_RECORDER, None).await;
+        let host = Host::new();
+        host.loaded
+            .lock()
+            .expect("装载表")
+            .insert("alpha".to_string(), entry);
+
+        assert_eq!(
+            host.publish(SESSION_STARTED, session_payload("s-1")),
+            1,
+            "session.* 应覆盖 session.started"
+        );
+        assert_eq!(
+            host.publish(FILE_SAVED, file_saved_payload("a.ts")),
+            0,
+            "没订阅 file.saved 就不该投"
+        );
+
+        let text = wait_for_lines(&dir.join("events.jsonl"))
+            .await
+            .expect("应收到会话事件");
+        assert_eq!(
+            text.trim(),
+            json!({ "event": SESSION_STARTED, "payload": { "sessionId": "s-1" } }).to_string()
+        );
+
+        host.shutdown_all().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn announce_state_uses_host_side_plugin_id() {
+        if !node_ready() {
+            eprintln!("跳过：本机没有 node");
+            return;
+        }
+        let (dir, entry) = event_entry(
+            "pub-state",
+            "alpha",
+            &[PLUGIN_STATE_CHANGED],
+            EVENT_RECORDER,
+            None,
+        )
+        .await;
+        let host = Host::new();
+        host.loaded
+            .lock()
+            .expect("装载表")
+            .insert("alpha".to_string(), entry);
+
+        host.announce_state("alpha", "ready");
+        let text = wait_for_lines(&dir.join("events.jsonl"))
+            .await
+            .expect("应收到状态迁移");
+        assert_eq!(
+            text.trim(),
+            json!({
+                "event": PLUGIN_STATE_CHANGED,
+                "payload": { "pluginId": "alpha", "state": "ready" }
+            })
+            .to_string()
+        );
+
+        host.shutdown_all().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn plugin_cannot_emit_plugin_events() {
+        if !node_ready() {
+            eprintln!("跳过：本机没有 node");
+            return;
+        }
+        let (dir, entry) = event_entry("spoof", "alpha", &[], EVENT_SPOOFER, None).await;
+        let host = Host::new();
+        let process = entry.start.process.clone();
+        host.loaded
+            .lock()
+            .expect("装载表")
+            .insert("alpha".to_string(), entry);
+
+        let mut violation = None;
+        for _ in 0..120 {
+            if let Some(reason) = process.violation() {
+                violation = Some(reason);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let violation = violation.expect("插件发 plugin/* 应被判违规");
+        assert!(
+            violation.contains("plugin/state_changed"),
+            "违规原因要指出被拒的方法：{violation}"
+        );
+
+        host.shutdown_all().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn host_progress_is_forwarded_with_stamped_plugin_id() {
+        if !node_ready() {
+            eprintln!("跳过：本机没有 node");
+            return;
+        }
+        let recorder = Arc::new(RecordingHost::default());
+        let (dir, entry) = event_entry(
+            "progress",
+            "alpha",
+            &[],
+            PROGRESS_REPORTER,
+            Some(recorder.clone() as Arc<dyn HostApi>),
+        )
+        .await;
+        let host = Host::new();
+        host.loaded
+            .lock()
+            .expect("装载表")
+            .insert("alpha".to_string(), entry);
+
+        let mut seen = Vec::new();
+        for _ in 0..120 {
+            if let Ok(list) = recorder.seen.lock() {
+                if !list.is_empty() {
+                    seen = list.clone();
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(seen.len(), 1, "应转出一条遥测");
+        assert_eq!(seen[0].0, "alpha");
+        assert_eq!(seen[0].1, "host/progress");
+        assert_eq!(
+            seen[0].2["pluginId"],
+            json!("alpha"),
+            "pluginId 由宿主覆盖，插件伪造无效"
+        );
+        assert_eq!(seen[0].2["progress"], json!(0.5));
 
         host.shutdown_all().await;
         let _ = std::fs::remove_dir_all(&dir);

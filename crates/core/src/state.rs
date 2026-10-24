@@ -92,6 +92,8 @@ impl AppState {
         let plugin_host_api = Arc::new(FsHostApi::new());
         let plugins = Arc::new(Host::new());
         plugins.set_api(plugin_host_api.clone());
+        // 反向引用：`host/log` / `host/progress` 要能投给订阅方，而订阅表在 `Host` 里。
+        plugin_host_api.set_plugins(&plugins);
         Self {
             started_at: Instant::now(),
             cancelled: Mutex::new(HashSet::new()),

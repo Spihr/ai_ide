@@ -79,6 +79,12 @@ pub async fn create(peer: &Peer, state: &AppState, req: &Request) {
                 })),
             )
             .await;
+            // 会话建好之后再投事件：插件收到 `session.started` 就能去读这条会话，
+            // 早一步投会读到「还不存在」。载荷只有 id，不带标题/正文。
+            state.plugins().publish(
+                ai_ide_plugin::events::SESSION_STARTED,
+                ai_ide_plugin::events::session_payload(&session.id),
+            );
             let result = SessionCreateResult {
                 session_id: session.id.clone(),
                 session: to_view(&session),
@@ -308,6 +314,12 @@ pub async fn delete(peer: &Peer, state: &AppState, req: &Request) {
         match store.delete_session(id).await {
             Ok(true) => {
                 deleted += 1;
+                // 会话真的从库里没了才广播，`Ok(false)`（本来就不存在）不投：
+                // 插件对「一个从来没存在过的会话结束」做反应没有意义。
+                state.plugins().publish(
+                    ai_ide_plugin::events::SESSION_ENDED,
+                    ai_ide_plugin::events::session_payload(id),
+                );
                 let summary = match &title {
                     Some(title) => format!("删除会话「{title}」"),
                     None => format!("删除会话 {id}"),

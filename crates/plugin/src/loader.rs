@@ -341,6 +341,26 @@ impl PluginProcess {
         }
     }
 
+    /// 发一条**通知帧**（无 `id`，不等回包）——事件投递的唯一出口。
+    ///
+    /// 与 [`PluginProcess::request`] 的区别在于不等回包：事件是单向的，宿主
+    /// 不能因为某个插件处理慢就卡住监听线程。写失败（进程已死、管道关了）
+    /// 直接回 `Exited`，调用方按「这条事件算了」处理，不重试——插件死了以后
+    /// 该由装载表的状态机去管，事件队列没有资格替它做决定。
+    pub async fn notify(&self, method: &str, params: &Value) -> Result<(), RequestError> {
+        if self.has_exited() {
+            return Err(RequestError::Exited {
+                tail: self.stderr_tail(),
+            });
+        }
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        });
+        self.write_frame(&frame).await
+    }
+
     fn forget(&self, id: u64) {
         if let Ok(mut pending) = self.pending.lock() {
             pending.remove(&id);
@@ -544,7 +564,7 @@ pub fn answer_plugin_request(
     }
 }
 
-/// 处理一帧：响应回填等待者；请求回 `-32601`；通知只记日志。
+/// 处理一帧：响应回填等待者；请求按命名空间放行；通知只走遥测白名单。
 async fn dispatch_frame(process: &Arc<PluginProcess>, frame: Value) -> Result<(), String> {
     let id = frame.get("id").filter(|value| !value.is_null());
     let method = frame.get("method").and_then(Value::as_str);
@@ -587,12 +607,70 @@ async fn dispatch_frame(process: &Arc<PluginProcess>, frame: Value) -> Result<()
                 .map_err(|error| format!("回复 {method} 失败：{error}"))?;
             Ok(())
         }
-        // 通知帧：插件日志 / 事件，P2 只落 trace。
+        // 通知帧：只有 `host/log` / `host/progress` 被接受（P5 §6.5）。
         (None, Some(method)) => {
-            tracing::debug!(plugin_id = %process.id, %method, "插件通知");
-            Ok(())
+            let params = frame
+                .get("params")
+                .filter(|value| value.is_object())
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            handle_notification(process, method, &params).await
         }
         (None, None) => Ok(()),
+    }
+}
+
+/// 处理插件的通知帧（无 `id`，插件不等回包）。
+///
+/// 白名单只有两条，其余一律丢弃并记日志（没有 `id` 就没法回错帧）：
+///
+/// - `host/log`、`host/progress`：旁路遥测，交 [`HostApi::notify`] 转成
+///   `plugin.log` / `plugin.progress` 事件，`pluginId` 由宿主填；
+/// - `plugin/*`：越权（docs/14 §8.2 T4）。事件是宿主 → 插件单向的，
+///   `plugin.state_changed` 尤其只能由宿主生成——插件冒用它就是伪造状态，
+///   按协议违规处理（`Err` 会让帧泵记违规并停掉该进程），而不是静默忽略。
+async fn handle_notification(
+    process: &Arc<PluginProcess>,
+    method: &str,
+    params: &Value,
+) -> Result<(), String> {
+    if method.starts_with("plugin/") {
+        return Err(format!(
+            "插件不能发送 {method}（事件只允许宿主 → 插件单向投递）"
+        ));
+    }
+    if method != "host/log" && method != "host/progress" {
+        tracing::debug!(plugin_id = %process.id, %method, "忽略未知的插件通知");
+        return Ok(());
+    }
+    let Some(host) = process.host() else {
+        tracing::debug!(plugin_id = %process.id, %method, "宿主能力未接线，遥测丢弃");
+        return Ok(());
+    };
+    // `pluginId` 由宿主盖：插件自己写一个只会被这里覆盖，遥测里的身份因此
+    // 永远等于管道那一端的进程，冒名没有入口。
+    let mut stamped = match params {
+        Value::Object(map) => map.clone(),
+        _ => serde_json::Map::new(),
+    };
+    stamped.insert(
+        "pluginId".to_string(),
+        Value::String(process.id().to_string()),
+    );
+    let stamped = Value::Object(stamped);
+    match host.notify(process.id(), method, &stamped) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // 遥测本身不是能力调用：被拒只说明宿主不接这条路，不该连坐插件。
+            tracing::debug!(
+                plugin_id = %process.id,
+                %method,
+                code = error.code,
+                message = %error.message,
+                "插件遥测被宿主拒绝"
+            );
+            Ok(())
+        }
     }
 }
 

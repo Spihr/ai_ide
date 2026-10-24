@@ -16,11 +16,19 @@
 //! 1. 正常关停：`plugin/shutdown` → 关 stdin → 宽限期后 `kill`；
 //! 2. `Child::kill_on_drop`：装载器被 drop 时兜底；
 //! 3. Windows 作业对象 `KILL_ON_JOB_CLOSE`：连内核被强杀都能连坐整棵进程树。
+pub mod events;
 pub mod host;
 pub mod host_api;
 pub mod install;
 pub mod loader;
 pub mod manifest;
+
+pub use events::{
+    file_saved_payload, session_payload, state_changed_payload, subscribed,
+    workspace_changed_payload, EventQueue, EventSink, PushOutcome, QueuedEvent, FILE_SAVED,
+    MAX_FILES_PER_EVENT, MAX_QUEUE, PLUGIN_LOG, PLUGIN_PROGRESS, PLUGIN_STATE_CHANGED,
+    SESSION_ENDED, SESSION_STARTED, WORKSPACE_CHANGED,
+};
 
 pub use host::{
     ApiVersion, Crashed, Handshake, HandshakeCommand, HandshakeTool, Host, LoadError, LoadSpec,
