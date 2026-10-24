@@ -180,7 +180,9 @@ impl ModelTurn for Scripted {
         let reply = {
             self.seen.lock().expect("seen 锁").push(request);
             let mut turns = self.turns.lock().expect("turns 锁");
-            turns.pop_front().unwrap_or_else(|| TurnReply::text_only("（脚本已耗尽）"))
+            turns
+                .pop_front()
+                .unwrap_or_else(|| TurnReply::text_only("（脚本已耗尽）"))
         };
         Ok(reply)
     }
@@ -257,8 +259,14 @@ async fn read_tool_runs_quietly_and_denied_write_never_reaches_the_plugin() {
         .with_extra_read_tools(ai_ide_core::plugin_tools::read_tool_names(&host));
 
     let model = Scripted::new(vec![
-        TurnReply::with_tool_calls("先看一眼", vec![call("c1", "plugin__demo__peek", json!({"q": "你好"}))]),
-        TurnReply::with_tool_calls("再动一下", vec![call("c2", "plugin__demo__poke", json!({}))]),
+        TurnReply::with_tool_calls(
+            "先看一眼",
+            vec![call("c1", "plugin__demo__peek", json!({"q": "你好"}))],
+        ),
+        TurnReply::with_tool_calls(
+            "再动一下",
+            vec![call("c2", "plugin__demo__poke", json!({}))],
+        ),
         TurnReply::text_only("好，我不动了"),
     ]);
 
@@ -280,9 +288,17 @@ async fn read_tool_runs_quietly_and_denied_write_never_reaches_the_plugin() {
 
     let results: Vec<String> = outcome.tool_messages().map(|m| m.content.clone()).collect();
     assert_eq!(results.len(), 2, "每个调用都要有配对的结果");
-    assert_eq!(outcome.assistant_errors.len(), 1, "被拒的那次应记一条回灌错误");
+    assert_eq!(
+        outcome.assistant_errors.len(),
+        1,
+        "被拒的那次应记一条回灌错误"
+    );
     assert!(results[0].contains("\"tool\":\"peek\""), "{}", results[0]);
-    assert!(results[0].contains("你好"), "回包参数应原样回到模型：{}", results[0]);
+    assert!(
+        results[0].contains("你好"),
+        "回包参数应原样回到模型：{}",
+        results[0]
+    );
     assert!(
         !results[0].contains("<tool_error"),
         "只读工具不该被拦：{}",
