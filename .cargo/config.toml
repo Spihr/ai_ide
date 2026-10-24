@@ -10,3 +10,13 @@ registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"
 
 [net]
 git-fetch-with-cli = true
+
+# 静态链接 MSVC CRT：内核 ai-ide-core.exe 不再依赖 VCRUNTIME140.dll / MSVCP140.dll。
+#
+# 背景（M8 真机验收 R1）：默认 MSVC 目标动态链接 CRT，目标机若未安装
+# VC++ Redistributable 会直接启动失败（0xC0000135）；e2e 只在开发机跑，
+# 本机装了 VC++ 因此长期掩盖了该缺失。改为静态 CRT 后内核自带运行库。
+#
+# 只对 Windows MSVC 目标生效，不影响 Linux/macOS 构建。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
