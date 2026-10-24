@@ -30,6 +30,12 @@ pub const NET_FETCH_METHOD: &str = "host/net.fetch";
 /// 出站网络所需的能力名。授权粒度是「按域名」：能力 + 清单 `allowedDomains`
 /// 两道都要过，缺一不可（见 docs/14 §7.1）。
 pub const NET_FETCH_CAPABILITY: &str = "net.fetch";
+/// 插件 → 宿主的模型调用方法名（P5 切片六）。
+pub const LLM_CHAT_METHOD: &str = "host/llm.chat";
+/// 模型调用所需的能力名。授权粒度是「按模型」：能力 + 清单 `allowedModels` /
+/// `maxTokens` 三道都要过（见 docs/14 §7.4）。密钥不下发插件——参数里没有、
+/// 回包里也没有任何塞 key 的口子。
+pub const LLM_CHAT_CAPABILITY: &str = "llm.chat";
 
 /// 插件反向请求的失败原因。`code` 直接进错误帧的 `error.code`。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +66,14 @@ impl HostApiError {
     /// 复用 `6103`（能力未授予）这一码：对插件作者来说「这个走法没被授权」
     /// 才是同一件事，前端也不必再认一个新码；`message` 里写明是哪一道闸门拦的。
     pub const NET_DENIED: i64 = Self::UNAUTHORIZED;
+    /// 模型调用被拒（P5 切片六）：模型不在清单 `allowedModels` 内，或清单没声明
+    /// `maxTokens`。
+    ///
+    /// 同样复用 `6103`：对插件作者而言「这个模型没被授权」与「这个能力没被授权」
+    /// 是同一类；`message` 里写明是清单哪一条拦的，前端也只需认一个码。
+    /// 注意 `maxTokens` **写大了**不归它管——那是 `-32602`：把数字改小就能过，
+    /// 属于「这次请求写错了」，不该让用户去改授权。
+    pub const LLM_DENIED: i64 = Self::UNAUTHORIZED;
     /// 参数畸形（缺字段 / 类型不对）。
     pub const INVALID_PARAMS: i64 = -32602;
     /// 方法不存在（v1 未实现的宿主能力也走它）。

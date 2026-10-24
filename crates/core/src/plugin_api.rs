@@ -501,6 +501,8 @@ pub async fn unload(peer: &Peer, state: &AppState, req: &Request) {
     // 域名清单不随授权集清空而失效（它属于清单，不属于授权），但插件已卸载，
     // 留着就是给下一次同名重装预先开好一条网络通路——一并清掉，重装时随清单重灌。
     state.plugin_host().clear_net_domains(&plugin_id);
+    // 模型授权面同理：清单已随卸载失效，留着等于给同名重装预开模型通路。
+    state.plugin_host().clear_llm_policy(&plugin_id);
 
     plugin_audit::record_user(
         store,
@@ -703,6 +705,13 @@ async fn load_into(
             state
                 .plugin_host()
                 .set_net_domains_for(plugin_id, validated.manifest.allowed_domains.clone());
+            // 模型授权面同理：`allowedModels` + `maxTokens` 是清单里写的，与账本
+            // 里的 `llm.chat` 授权两码事，但生效时机一样——插件 READY 的那一刻。
+            state.plugin_host().set_llm_policy_for(
+                plugin_id,
+                validated.manifest.allowed_models.clone(),
+                validated.manifest.max_tokens,
+            );
             tracing::info!(
                 plugin_id = %plugin_id,
                 pid = ?loaded.pid,

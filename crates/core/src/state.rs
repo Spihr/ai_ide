@@ -36,7 +36,12 @@ pub struct AppState {
     /// 对端句柄，用于主动推送事件。单测里不注入，事件静默丢弃。
     peer: Mutex<Option<Arc<Peer>>>,
     /// 模型接入层状态（M2：Provider 目录 / 注册表 / 内存密钥）。
-    llm: LlmRuntime,
+    ///
+    /// 用 `Arc` 而不是裸结构：插件的 `host/llm.chat` 要**长期持有**这条通道
+    /// （[`crate::plugin_llm::ProviderChannel`]），而它必须看见后续
+    /// `provider.upsert` 往注册表里加的东西——所以通道拿的是同一份运行态的句柄，
+    /// 不是一份快照。密钥仍只在这份运行态的内存里，插件侧拿不到任何引用。
+    llm: Arc<LlmRuntime>,
     /// 在途流式对话的取消句柄表（M2）。放在状态里是因为「取消」是一条独立报文，
     /// 需要按 `stream_id` 找到那条流。
     streams: Arc<StreamHub>,
@@ -87,6 +92,8 @@ impl Default for AppState {
 
 impl AppState {
     pub fn new() -> Self {
+        // 用默认落盘路径起步；单测用 `with_llm_runtime` 换成临时目录 + 替身传输。
+        let llm = Arc::new(LlmRuntime::new(default_store_path()));
         // 宿主能力必须先于 `Host` 挂好：插件的反向请求没有「稍后重试」这一说，
         // 没挂上就只能回 -32601，而那时插件已经起来了。
         let plugin_host_api = Arc::new(FsHostApi::new());
@@ -94,6 +101,9 @@ impl AppState {
         plugins.set_api(plugin_host_api.clone());
         // 反向引用：`host/log` / `host/progress` 要能投给订阅方，而订阅表在 `Host` 里。
         plugin_host_api.set_plugins(&plugins);
+        // 模型通道与宿主一起挂：晚一步就会出现「插件已 READY、`host/llm.chat`
+        // 却回『通道未就绪』」的窗口。
+        plugin_host_api.set_llm_runtime(Arc::clone(&llm));
         Self {
             started_at: Instant::now(),
             cancelled: Mutex::new(HashSet::new()),
@@ -102,7 +112,7 @@ impl AppState {
             active: Mutex::new(None),
             peer: Mutex::new(None),
             // 用默认落盘路径起步；单测用 `with_llm_runtime` 换成临时目录 + 替身传输。
-            llm: LlmRuntime::new(default_store_path()),
+            llm,
             streams: Arc::new(StreamHub::new()),
             agents: Arc::new(AgentHub::new()),
             terminals: Arc::new(TerminalManager::new()),
@@ -122,6 +132,11 @@ impl AppState {
     /// 模型接入层状态：Provider 目录、注册表与内存密钥（M2）。
     pub fn llm(&self) -> &LlmRuntime {
         &self.llm
+    }
+
+    /// 模型运行态句柄（插件 `host/llm.chat` 用同一份）。
+    pub fn llm_handle(&self) -> Arc<LlmRuntime> {
+        Arc::clone(&self.llm)
     }
 
     /// 在途流式对话的取消句柄表（M2）。
@@ -186,7 +201,9 @@ impl AppState {
     /// 落盘目录与 HTTP 传输都在 [`LlmRuntime`] 构造时确定，所以单测用它把
     /// 存储挪到临时目录、把传输换成测试替身，整条 `provider.*` 链路即可离线验收。
     pub fn with_llm_runtime(mut self, llm: LlmRuntime) -> Self {
-        self.llm = llm;
+        self.llm = Arc::new(llm);
+        // 换成替身运行态后必须重挂通道：通道持的是 `Arc`，不重挂就还指着上一份。
+        self.plugin_host.set_llm_runtime(Arc::clone(&self.llm));
         self
     }
 

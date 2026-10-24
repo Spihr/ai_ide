@@ -51,6 +51,19 @@ pub const MAX_ALLOWED_DOMAINS: usize = 32;
 /// 单个域名的字符长度上限（DNS 全名上限 253）。
 pub const MAX_DOMAIN_LEN: usize = 253;
 
+/// 模型白名单最多几条（`allowedModels`）。
+///
+/// 与域名同一个理由：清单是给用户审的，条目一多就没人逐条看了，而这份名单
+/// 恰恰是插件能烧掉多少 token 的边界。
+pub const MAX_ALLOWED_MODELS: usize = 16;
+/// 单条模型条目的字符长度上限（`provider/model` 两段加起来够用）。
+pub const MAX_MODEL_ENTRY_LEN: usize = 160;
+/// 清单 `maxTokens` 的上限（与 `plugin_llm::MAX_TOKENS_CEILING` 同值）。
+///
+/// 两处各写一份常量是刻意的：清单校验在 `crates/plugin`，运行期夹取在
+/// `crates/core`，后者不依赖前者的「信任」——校验通过不等于运行期不再看。
+pub const MAX_TOKENS_CEILING: u64 = 8192;
+
 /// 能力白名单——**这张表就是权限模型本身**（docs/14 §7.1）。
 ///
 /// 不在表里的能力一律拒载。理由不是「还没实现所以先拦着」，而是「未知能力无法被
@@ -115,7 +128,25 @@ pub struct Manifest {
     /// 运行期再兜一次「空表全拒」。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub allowed_domains: Vec<String>,
+    /// 模型白名单（`host/llm.chat` 用，P5 切片六）：`provider/model` 形式。
+    ///
+    /// 与 `capabilities` 里的 `llm.chat` 是一对：能力回答「能不能调模型」，这里
+    /// 回答「能调哪些」。空表示一个模型都不放行——申请了 `llm.chat` 却没写这份
+    /// 名单的包在校验阶段就被拒，运行期再兜一次「空名单全拒」。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allowed_models: Vec<String>,
+    /// 单次模型调用允许的最大输出 token（清单 `maxTokens`）。
+    ///
+    /// `0` 表示没声明：没申请 `llm.chat` 的包不写它是正常的；申请了就会被校验
+    /// 拦下。运行期按它夹，插件要更多一律 `-32602`。
+    #[serde(skip_serializing_if = "is_zero")]
+    pub max_tokens: u64,
     pub timeout_ms: u64,
+}
+
+/// `skip_serializing_if` 用：`maxTokens` 不声明时不出现在序列化结果里。
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// 清单里的一个工具声明。
@@ -270,6 +301,8 @@ pub fn validate(root: &Path, raw: &Value) -> Result<ValidatedManifest, Vec<Viola
     let subscriptions = string_array(obj, "subscriptions", false, &mut errors).unwrap_or_default();
     let timeout_ms = optional_timeout(obj, &mut errors);
     let allowed_domains = string_array(obj, "allowedDomains", false, &mut errors);
+    let allowed_models = string_array(obj, "allowedModels", false, &mut errors);
+    let max_tokens = optional_max_tokens(obj, &mut errors);
     let tools = parse_tools(obj, &mut errors);
     let commands = parse_commands(obj, &mut errors);
 
@@ -344,6 +377,49 @@ pub fn validate(root: &Path, raw: &Value) -> Result<ValidatedManifest, Vec<Viola
             } else if !normalized_domains.contains(&normalized) {
                 normalized_domains.push(normalized);
             }
+        }
+    }
+
+    // allowedModels：`provider/model`，归一化（全小写）后逐条判形状。
+    // 不做「斜杠切一刀就完事」的松散校验：`a/b/c`、空段、带空白的条目一律拒，
+    // 否则白名单比对会出现「两个不同清单写法等价」的灰区。
+    let mut normalized_models: Vec<String> = Vec::new();
+    if let Some(models) = &allowed_models {
+        if models.len() > MAX_ALLOWED_MODELS {
+            errors.push(Violation::manifest(
+                "$.allowedModels",
+                format!(
+                    "allowedModels 最多 {MAX_ALLOWED_MODELS} 条，收到 {} 条",
+                    models.len()
+                ),
+            ));
+        }
+        for (index, entry) in models.iter().enumerate() {
+            let path = format!("$.allowedModels[{index}]");
+            let normalized = entry.trim().to_ascii_lowercase();
+            if normalized.len() > MAX_MODEL_ENTRY_LEN {
+                errors.push(Violation::manifest(
+                    path,
+                    format!("模型条目超过 {MAX_MODEL_ENTRY_LEN} 字符"),
+                ));
+            } else if !is_valid_model_entry(&normalized) {
+                errors.push(Violation::manifest(
+                    path,
+                    format!("模型条目 {entry} 非法：应为 provider/model（各段非空，只含字母数字与 . _ -）"),
+                ));
+            } else if !normalized_models.contains(&normalized) {
+                normalized_models.push(normalized);
+            }
+        }
+    }
+
+    // maxTokens：范围（0 视为「没声明」，由交叉校验决定算不算错）。
+    if let Some(tokens) = max_tokens {
+        if tokens == 0 || tokens > MAX_TOKENS_CEILING {
+            errors.push(Violation::manifest(
+                "$.maxTokens",
+                format!("maxTokens 必须在 1–{MAX_TOKENS_CEILING} 之间，收到 {tokens}"),
+            ));
         }
     }
 
@@ -516,6 +592,35 @@ pub fn validate(root: &Path, raw: &Value) -> Result<ValidatedManifest, Vec<Viola
         }
     }
 
+    // 模型：能力 / 模型名单 / maxTokens 三者必须成套。只申请 llm.chat 不写名单，
+    // 运行期等于「永远拒」——装了也用不了，不如装载前说清楚；只写名单不申请能力，
+    // 则是作者以为能调，实际一步都出不去。`maxTokens` 缺省同样意味着用不了。
+    if capabilities.is_some() {
+        let wants_llm = normalized_caps.iter().any(|cap| cap == "llm.chat");
+        if wants_llm && normalized_models.is_empty() {
+            errors.push(Violation::manifest(
+                "$.allowedModels",
+                "申请了 llm.chat 却没声明 allowedModels：没有任何模型被授权",
+            ));
+        } else if !wants_llm && !normalized_models.is_empty() {
+            errors.push(Violation::manifest(
+                "$.capabilities",
+                "声明了 allowedModels 但未申请 llm.chat：模型名单不会生效",
+            ));
+        }
+        if wants_llm && !matches!(max_tokens, Some(tokens) if tokens > 0) {
+            errors.push(Violation::manifest(
+                "$.maxTokens",
+                "申请了 llm.chat 却没声明 maxTokens：输出长度没有上限",
+            ));
+        } else if !wants_llm && max_tokens.is_some() {
+            errors.push(Violation::manifest(
+                "$.capabilities",
+                "声明了 maxTokens 但未申请 llm.chat：该上限不会生效",
+            ));
+        }
+    }
+
     if !errors.is_empty() {
         return Err(errors);
     }
@@ -532,6 +637,8 @@ pub fn validate(root: &Path, raw: &Value) -> Result<ValidatedManifest, Vec<Viola
         commands,
         subscriptions,
         allowed_domains: normalized_domains,
+        allowed_models: normalized_models,
+        max_tokens: max_tokens.unwrap_or(0),
         timeout_ms: timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
     };
 
@@ -656,6 +763,49 @@ fn is_valid_domain(value: &str) -> bool {
             && !label.ends_with('-')
             && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
     })
+}
+
+/// `maxTokens` 的形状解析：只认正整数。范围判定留给语义段（那边才有
+/// `MAX_TOKENS_CEILING` 的上下文），这里只保证「不是数字」能报准。
+fn optional_max_tokens(obj: &Map<String, Value>, errors: &mut Vec<Violation>) -> Option<u64> {
+    match obj.get("maxTokens") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(number)) => match number.as_u64() {
+            Some(value) => Some(value),
+            None => {
+                errors.push(Violation::manifest(
+                    "$.maxTokens",
+                    "maxTokens 必须是非负整数",
+                ));
+                None
+            }
+        },
+        Some(_) => {
+            errors.push(Violation::manifest(
+                "$.maxTokens",
+                "maxTokens 必须是整数（不是字符串或小数）",
+            ));
+            None
+        }
+    }
+}
+
+/// 模型条目形状：`provider/model`，两段都非空，只允许 `[a-z0-9._-]`。
+///
+/// 斜杠恰好一个：多个斜杠意味着作者把 `vendor/provider/model` 当条目写，
+/// 那种条目运行期永远匹配不上白名单，装载前就该拦。
+fn is_valid_model_entry(entry: &str) -> bool {
+    let mut parts = entry.split('/');
+    let (Some(provider), Some(model), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    let ok = |part: &str| {
+        !part.is_empty()
+            && part
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    };
+    ok(provider) && ok(model)
 }
 
 fn optional_timeout(obj: &Map<String, Value>, errors: &mut Vec<Violation>) -> Option<u64> {
@@ -1366,6 +1516,107 @@ mod tests {
         raw["allowedDomains"] = json!(domains);
         let errors = validate(&root, &raw).expect_err("超过条数上限必须拒载");
         assert!(errors.iter().any(|error| error.path == "$.allowedDomains"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 模型三件套（能力 / 名单 / 上限）必须成套，缺哪一件都要在装载前说清楚。
+    ///
+    /// 只申请能力不写名单 = 运行期永远 `6103`，装了也用不了；只写名单不申请能力 =
+    /// 作者以为能调、实际一步都出不去；不写 `maxTokens` = 输出没有上限。三种都是
+    /// 「装上去才发现」的故障，所以一律前移到校验阶段。
+    #[test]
+    fn llm_chat_requires_models_and_max_tokens_together() {
+        let root = temp_package("llm-pair");
+
+        let mut raw = legal_manifest();
+        raw["capabilities"] = json!(["fs.read", "llm.chat"]);
+        let errors = validate(&root, &raw).expect_err("申请了 llm.chat 却没写名单必须拒载");
+        assert!(errors.iter().any(|error| error.path == "$.allowedModels"));
+        assert!(errors.iter().any(|error| error.path == "$.maxTokens"));
+
+        let mut raw = legal_manifest();
+        raw["capabilities"] = json!(["fs.read"]);
+        raw["allowedModels"] = json!(["openai/gpt-4o"]);
+        raw["maxTokens"] = json!(512);
+        let errors = validate(&root, &raw).expect_err("写了名单却没申请能力必须拒载");
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| error.path == "$.capabilities")
+                .count(),
+            2,
+            "名单与上限各报一条"
+        );
+
+        // 三件齐了才过：这是 `llm.chat` 唯一的合法形态。
+        let mut raw = legal_manifest();
+        raw["capabilities"] = json!(["fs.read", "fs.write", "llm.chat"]);
+        raw["allowedModels"] = json!(["openai/gpt-4o"]);
+        raw["maxTokens"] = json!(512);
+        let validated = validate(&root, &raw).expect("成套声明应被接受");
+        assert_eq!(validated.manifest.max_tokens, 512);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 模型条目归一化：大小写与首尾空白折成同一份，重复项只留一条。
+    ///
+    /// 白名单是**按字符串比对**的，不是按「语义上同一个模型」比对的。不归一化就会
+    /// 出现 `OpenAI/GPT-4o` 与 `openai/gpt-4o` 两条并列——审查的人会以为授权了
+    /// 两个模型，实际是同一个。
+    #[test]
+    fn allowed_models_are_normalized_and_deduped() {
+        let root = temp_package("models");
+        let mut raw = legal_manifest();
+        raw["capabilities"] = json!(["fs.read", "fs.write", "llm.chat"]);
+        raw["allowedModels"] = json!(["  OpenAI/GPT-4o  ", "openai/gpt-4o", "Local/qwen2.5-7b"]);
+        raw["maxTokens"] = json!(1024);
+        let validated = validate(&root, &raw).expect("合法模型名单应被接受");
+        assert_eq!(
+            validated.manifest.allowed_models,
+            vec!["openai/gpt-4o".to_string(), "local/qwen2.5-7b".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 模型条目形状与条数上限：`a/b/c`、空段、带空格、没斜杠都不是 `provider/model`。
+    ///
+    /// 松一点就会留下「两种写法等价」的灰区：插件写 `a/b/c` 能过校验，运行期却因为
+    /// 比对不上而永远被拒，作者只能靠猜。
+    #[test]
+    fn allowed_models_shape_and_count_are_bounded() {
+        let root = temp_package("model-shape");
+        let mut raw = legal_manifest();
+        raw["capabilities"] = json!(["fs.write", "llm.chat"]);
+        raw["allowedModels"] = json!(["gpt-4o", "a/b/c", "/headless", "tail/", "a b/c"]);
+        raw["maxTokens"] = json!(512);
+        let errors = validate(&root, &raw).expect_err("非法模型条目必须逐条报错");
+        for index in 0..5 {
+            let path = format!("$.allowedModels[{index}]");
+            assert!(
+                errors.iter().any(|error| error.path == path),
+                "第 {index} 条应被拒：{path}"
+            );
+        }
+
+        let mut raw = legal_manifest();
+        raw["capabilities"] = json!(["fs.write", "llm.chat"]);
+        let models: Vec<String> = (0..=MAX_ALLOWED_MODELS)
+            .map(|index| format!("p/m{index}"))
+            .collect();
+        raw["allowedModels"] = json!(models);
+        raw["maxTokens"] = json!(512);
+        let errors = validate(&root, &raw).expect_err("超过条数上限必须拒载");
+        assert!(errors.iter().any(|error| error.path == "$.allowedModels"));
+
+        // 上限本身有天花板：清单能批 8192，运行期也按这个数夹。
+        let mut raw = legal_manifest();
+        raw["capabilities"] = json!(["fs.write", "llm.chat"]);
+        raw["allowedModels"] = json!(["openai/gpt-4o"]);
+        raw["maxTokens"] = json!(MAX_TOKENS_CEILING + 1);
+        let errors = validate(&root, &raw).expect_err("超过 maxTokens 天花板必须拒载");
+        assert!(errors.iter().any(|error| error.path == "$.maxTokens"));
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }

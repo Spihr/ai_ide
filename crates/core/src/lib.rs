@@ -76,6 +76,7 @@ pub mod plugin_approver;
 pub mod plugin_audit;
 /// 插件的读侧宿主能力（P3.5）：`host/fs.read` 等五个方法的闸门、配额与审计。
 pub mod plugin_host;
+pub mod plugin_llm;
 /// 插件的出站网络（P5 切片五）：`host/net.fetch` 的协议 / 域名单 / 地址闸门与逐跳重定向。
 pub mod plugin_net;
 /// 插件工具注入（P3）：把 `plugin__<id>__<tool>` 挂到 agent 注册表。

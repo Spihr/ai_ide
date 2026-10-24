@@ -45,8 +45,8 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use ai_ide_plugin::events::{progress_payload, PLUGIN_LOG, PLUGIN_PROGRESS};
 use ai_ide_plugin::host::Host;
 use ai_ide_plugin::host_api::{
-    HostApi, HostApiError, LOG_METHOD, NET_FETCH_CAPABILITY, NET_FETCH_METHOD, PROGRESS_CAPABILITY,
-    PROGRESS_METHOD,
+    HostApi, HostApiError, LLM_CHAT_CAPABILITY, LLM_CHAT_METHOD, LOG_METHOD, NET_FETCH_CAPABILITY,
+    NET_FETCH_METHOD, PROGRESS_CAPABILITY, PROGRESS_METHOD,
 };
 use ai_ide_store::{audit_actor, audit_kind, NewAuditEvent, Store};
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -54,6 +54,7 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 
 use crate::peer::Peer;
+use crate::plugin_llm::{self, ChatPlan, LlmChannel, LlmPolicy, ProviderChannel};
 use crate::plugin_net::{self, FetchPlan, NetTransport, ReqwestTransport};
 
 /// `host/fs.read` 的默认读取上限（64 KB）。
@@ -100,6 +101,9 @@ fn capability_of(method: &str) -> Option<&'static str> {
         // 出站网络（P5 切片五）：能力之外还要过清单 `allowedDomains`，
         // 两道闸门都在 [`FsHostApi::call`] 里，先能力后名单。
         "host/net.fetch" => Some("net.fetch"),
+        // 模型调用（P5 切片六）：能力之外还要过清单 `allowedModels` 与
+        // `maxTokens`，两道闸门都在 [`FsHostApi::call`] 里，先能力后清单。
+        "host/llm.chat" => Some("llm.chat"),
         _ => None,
     }
 }
@@ -237,6 +241,13 @@ pub struct FsHostApi {
     net_domains: Arc<RwLock<HashMap<String, Vec<String>>>>,
     /// 出站传输实现（生产 reqwest，单测换假实现）。
     transport: RwLock<Arc<dyn NetTransport>>,
+    /// 按插件记的**模型授权面**（P5 切片六）：清单 `allowedModels` + `maxTokens`
+    /// 的装载副本。缺省是空 = 一个模型都不放行（fail closed）。
+    ///
+    /// 与 `net_domains` 分开的理由相同：这份数据随清单走、不随 `plugin.grant` 变。
+    llm_policy: Arc<RwLock<HashMap<String, LlmPolicy>>>,
+    /// 模型调用通道（生产走 [`ProviderChannel`]，单测换假实现）。
+    llm_channel: RwLock<Option<Arc<dyn LlmChannel>>>,
 }
 
 impl Default for FsHostApi {
@@ -258,6 +269,9 @@ struct HostCallAudit<'a> {
     decision: &'a str,
     target: Option<&'a str>,
     scope_key: Option<&'a str>,
+    /// 额外明细字段（模型名、token 数、耗时等）。键值直接进 `detail`，
+    /// **禁止放消息正文**：审计库长期留存，正文进去等于二次扩散。
+    extra: Vec<(&'a str, Value)>,
 }
 
 impl<'a> HostCallAudit<'a> {
@@ -276,7 +290,13 @@ impl<'a> HostCallAudit<'a> {
             decision,
             target: None,
             scope_key: None,
+            extra: Vec::new(),
         }
+    }
+
+    fn note(mut self, key: &'a str, value: Value) -> Self {
+        self.extra.push((key, value));
+        self
     }
 
     fn target(mut self, target: Option<&'a str>) -> Self {
@@ -306,6 +326,8 @@ impl FsHostApi {
             shell: RwLock::new(None),
             net_domains: Arc::new(RwLock::new(HashMap::new())),
             transport: RwLock::new(Arc::new(ReqwestTransport::new())),
+            llm_policy: Arc::new(RwLock::new(HashMap::new())),
+            llm_channel: RwLock::new(None),
         }
     }
 
@@ -347,6 +369,62 @@ impl FsHostApi {
             .ok()
             .map(|slot| Arc::clone(&*slot))
             .unwrap_or_else(|| Arc::new(ReqwestTransport::new()))
+    }
+
+    /// 记下某插件的模型授权面（装载 / 重新装载时用）。
+    ///
+    /// 覆盖而非合并：清单删掉一个模型，合并会让删除失效——那正是白名单最需要
+    /// 生效的时刻。`maxTokens` 在这里就夹到 [`plugin_llm::MAX_TOKENS_CEILING`]，
+    /// 免得一份夸张的清单把上限抬到失控。
+    pub fn set_llm_policy_for(&self, plugin_id: &str, models: Vec<String>, max_tokens: u64) {
+        let policy = LlmPolicy {
+            models: models
+                .iter()
+                .map(|entry| plugin_llm::normalize_model_entry(entry))
+                .filter(|entry| !entry.is_empty())
+                .collect(),
+            max_tokens: max_tokens.min(plugin_llm::MAX_TOKENS_CEILING),
+        };
+        if let Ok(mut map) = self.llm_policy.write() {
+            map.insert(plugin_id.to_string(), policy);
+        }
+    }
+
+    /// 忘掉某插件的模型授权面（卸载 / 装载失败时用）。
+    pub fn clear_llm_policy(&self, plugin_id: &str) {
+        if let Ok(mut map) = self.llm_policy.write() {
+            map.remove(plugin_id);
+        }
+    }
+
+    /// 取某插件的模型授权面。没登记 = 空名单 = 全拒。
+    pub fn llm_policy_for(&self, plugin_id: &str) -> LlmPolicy {
+        self.llm_policy
+            .read()
+            .ok()
+            .and_then(|map| map.get(plugin_id).cloned())
+            .unwrap_or_default()
+    }
+
+    /// 接上模型调用通道（`AppState` 建好 `LlmRuntime` 后调一次）。
+    ///
+    /// 密钥只在 [`ProviderChannel`] 里的 Provider 实例中，插件侧拿不到任何句柄。
+    pub fn set_llm_runtime(&self, runtime: Arc<crate::llm_runtime::LlmRuntime>) {
+        self.set_llm_channel(Arc::new(ProviderChannel::new(runtime)));
+    }
+
+    /// 换掉模型调用通道（单测注入假实现；生产走 [`set_llm_runtime`]）。
+    pub fn set_llm_channel(&self, channel: Arc<dyn LlmChannel>) {
+        if let Ok(mut slot) = self.llm_channel.write() {
+            *slot = Some(channel);
+        }
+    }
+
+    fn llm_channel(&self) -> Option<Arc<dyn LlmChannel>> {
+        self.llm_channel
+            .read()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(Arc::clone))
     }
 
     /// 回填装载表句柄（`AppState::new` 建好 `Host` 后调用一次）。
@@ -558,6 +636,7 @@ impl FsHostApi {
             decision,
             target,
             scope_key,
+            extra,
         } = entry;
         let mut detail = json!({
             "pluginId": plugin_id,
@@ -576,6 +655,12 @@ impl FsHostApi {
         // 只会让审计查询多一个永远为 null 的列。
         if let Some(key) = scope_key {
             detail["scopeKey"] = json!(key);
+        }
+        // `extra`：这次调用特有的计量（模型耗时 / token 数）。**只放数字与短标识**，
+        // 键名由闸门与 dispatch 侧决定，正文永远走不到这里——「审计要能回答插件
+        // 调了多少、调了多久，但读不到它说了什么」这条约束落在这一层。
+        for (key, value) in extra {
+            detail[key] = value;
         }
         let event = NewAuditEvent::by(
             audit_actor::PLUGIN,
@@ -1202,6 +1287,28 @@ impl HostApi for FsHostApi {
             }
         }
 
+        // 闸门 ②b：模型（`host/llm.chat` 专属）。与能力闸门分开是因为「有 llm.chat
+        // 能力」只说明用户批了「可以调模型」，具体能调**哪个**模型、最多要多少
+        // 输出，由清单决定。两件事分开记，审计里才看得出是用户收回了授权，还是
+        // 插件在试探清单外的模型。
+        let mut chat_plan: Option<ChatPlan> = None;
+        if capability == LLM_CHAT_CAPABILITY {
+            let policy = self.llm_policy_for(plugin_id);
+            match plugin_llm::plan_chat(params, &policy) {
+                Ok(plan) => chat_plan = Some(plan),
+                Err(err) => {
+                    // 记 `provider/model` 而不是正文：被拒的这次「想调哪个模型」
+                    // 才是要留的线索。
+                    let target = llm_audit_target(params);
+                    self.audit(
+                        HostCallAudit::new(plugin_id, method, capability, &call_id, DECISION_DENY)
+                            .target(target.as_deref()),
+                    );
+                    return Err(err);
+                }
+            }
+        }
+
         // 闸门 ③：路径（`workspace.info` / `search.content` 没有入参路径，
         // 搜索的遍历范围就是工作区根，越界问题由遍历本身保证）。
         let path_method = matches!(
@@ -1278,12 +1385,23 @@ impl HostApi for FsHostApi {
             ));
         }
 
-        let target = match (&fetch_plan, abs.as_deref()) {
+        // 模型调用另外收「耗时 + token 数」：token 是计费口径，耗时是「插件是不是
+        // 把模型当同步接口在刷」的线索。**不含消息正文与回包正文**。
+        let mut chat_notes: Vec<(&str, Value)> = Vec::new();
+        let target = match (&chat_plan, &fetch_plan, abs.as_deref()) {
             // 网络的「目标」就是 url，但落审计时要去掉 query / fragment：
             // 查询串里常带签名或令牌，写进审计库等于二次留存。
-            (Some(plan), _) => Some(plugin_net::audit_url(plan.url.as_str())),
-            (None, Some(path)) => Some(self.display_path(path)),
-            (None, None) => audit_target(params).map(str::to_string),
+            (Some(plan), _, _) => {
+                chat_notes.push((
+                    "model",
+                    json!(plugin_llm::audit_target(&plan.provider, &plan.model)),
+                ));
+                chat_notes.push(("maxTokens", json!(plan.max_tokens)));
+                Some(plugin_llm::audit_target(&plan.provider, &plan.model))
+            }
+            (None, Some(plan), _) => Some(plugin_net::audit_url(plan.url.as_str())),
+            (None, None, Some(path)) => Some(self.display_path(path)),
+            (None, None, None) => audit_target(params).map(str::to_string),
         };
         let outcome = match (abs.as_deref(), method) {
             (Some(path), "host/fs.read") => self.fs_read(path, params),
@@ -1299,7 +1417,34 @@ impl HostApi for FsHostApi {
             },
             (None, "host/workspace.info") => self.workspace_info(),
             (None, "host/search.content") => self.search_content(params),
-            (None, NET_FETCH_METHOD) => match fetch_plan {
+            (None, LLM_CHAT_METHOD) => match chat_plan.as_ref() {
+                Some(plan) => {
+                    let started = std::time::Instant::now();
+                    let result = match self.llm_channel() {
+                        // 通道没装：宿主侧配置没到位，不是插件的问题，按执行失败报。
+                        None => Err(HostApiError::new(
+                            HostApiError::IO,
+                            "模型调用通道未就绪（宿主侧未配置 provider）",
+                        )),
+                        Some(channel) => plugin_llm::execute(channel.as_ref(), plan),
+                    };
+                    chat_notes.push(("latencyMs", json!(started.elapsed().as_millis() as u64)));
+                    if let Ok(value) = &result {
+                        chat_notes.push(("promptTokens", value["usage"]["promptTokens"].clone()));
+                        chat_notes.push((
+                            "completionTokens",
+                            value["usage"]["completionTokens"].clone(),
+                        ));
+                    }
+                    result
+                }
+                // 走不到：模型闸门通过后一定会备好 plan。
+                None => Err(HostApiError::new(
+                    HostApiError::METHOD_NOT_FOUND,
+                    "模型调用参数缺失",
+                )),
+            },
+            (_, NET_FETCH_METHOD) => match fetch_plan {
                 Some(plan) => plugin_net::execute(self.net_transport(), &plan),
                 // 走不到：网络闸门通过后一定会备好 plan。
                 None => Err(HostApiError::new(
@@ -1317,14 +1462,22 @@ impl HostApi for FsHostApi {
         // 才看得出「插件是不是在试着往清单外跳」。
         let decision = match &outcome {
             Ok(_) => DECISION_ALLOW,
-            Err(err) if err.code == HostApiError::NET_DENIED => DECISION_DENY,
+            // 两个 6103 都记 `deny`：能力没批、模型不在清单，语义都是「拒绝」，
+            // 不是「执行失败」。混进 `error` 就看不出插件在试探边界。
+            Err(err)
+                if err.code == HostApiError::NET_DENIED || err.code == HostApiError::LLM_DENIED =>
+            {
+                DECISION_DENY
+            }
             Err(_) => DECISION_ERROR,
         };
-        self.audit(
-            HostCallAudit::new(plugin_id, method, capability, &call_id, decision)
-                .target(target.as_deref())
-                .scope_key(scope_key.as_deref()),
-        );
+        let mut entry = HostCallAudit::new(plugin_id, method, capability, &call_id, decision)
+            .target(target.as_deref())
+            .scope_key(scope_key.as_deref());
+        for (key, value) in chat_notes {
+            entry = entry.note(key, value);
+        }
+        self.audit(entry);
         outcome
     }
 
@@ -1461,6 +1614,19 @@ fn net_audit_target(params: &Value) -> Option<String> {
         return None;
     }
     Some(plugin_net::audit_url(raw))
+}
+
+/// 模型调用的审计 `target`：`provider/model`（两边都取小写原样）。
+///
+/// 不记消息正文：正文进审计等于把用户/插件的提示词长期留档。只记「它想调
+/// 哪个模型」，被拒时这一条就是全部结论。
+fn llm_audit_target(params: &Value) -> Option<String> {
+    let provider = params.get("provider").and_then(Value::as_str)?.trim();
+    let model = params.get("model").and_then(Value::as_str)?.trim();
+    if provider.is_empty() || model.is_empty() {
+        return None;
+    }
+    Some(plugin_llm::audit_target(provider, model))
 }
 
 /// 审计 `target`：有路径就记路径，搜索记查询词（路径无关）。
@@ -2284,16 +2450,15 @@ mod tests {
         let root = sandbox("unimpl");
         let (api, store) = api_with_store(&root, &["fs.read"], "unimpl").await;
 
-        // `host/net.fetch` 已在本切片接线（未授权时回 6103），所以只剩这两项：
-        // 一张「还没接线」的表必须随着接线一条条变短，否则它会从「进度看板」
-        // 退化成「谎话看板」。
-        for method in ["host/llm.chat", "host/progress"] {
-            let err = api
-                .call("demo", method, &json!({ "path": "a.txt" }))
-                .expect_err("v1 未实现");
-            assert_eq!(err.code, HostApiError::METHOD_NOT_FOUND, "{method}");
-            assert!(err.message.contains("v1 未实现"), "{}", err.message);
-        }
+        // `host/net.fetch` 与 `host/llm.chat` 都已接线（未授权时回 6103），所以
+        // 只剩这一项：一张「还没接线」的表必须随着接线一条条变短，否则它会从
+        // 「进度看板」退化成「谎话看板」。
+        let method = "host/progress";
+        let err = api
+            .call("demo", method, &json!({ "path": "a.txt" }))
+            .expect_err("v1 未实现");
+        assert_eq!(err.code, HostApiError::METHOD_NOT_FOUND, "{method}");
+        assert!(err.message.contains("v1 未实现"), "{}", err.message);
         assert_eq!(api.quota_used("demo"), 0);
         // 方法不存在 = 连「插件用了什么能力」都谈不上，审计表必须干净。
         let rows = store
@@ -2734,6 +2899,222 @@ mod tests {
             .expect_err("Host 头必须拒");
         assert_eq!(err.code, HostApiError::NET_DENIED);
         assert!(transport.sent().is_empty());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // `host/llm.chat`：能力闸门 → 模型闸门 → dispatch → 审计。模型通道用假实现，
+    // 一次上游都不连；要验的是「宿主这一侧怎么放行、怎么拒绝、怎么记账」。
+    // -----------------------------------------------------------------------
+
+    use crate::plugin_llm::{ChatPlan, ChatReply, LlmChannel};
+    use std::sync::Mutex;
+
+    /// 假模型通道：记下「谁被当成 provider/model 调了一次」，按预设回包。
+    struct FakeLlm {
+        calls: Mutex<Vec<(String, String)>>,
+        reply: ChatReply,
+    }
+
+    impl FakeLlm {
+        fn new(text: &str) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                reply: ChatReply {
+                    text: text.to_string(),
+                    truncated: false,
+                    prompt_tokens: Some(11),
+                    completion_tokens: Some(5),
+                },
+            })
+        }
+
+        fn calls(&self) -> Vec<(String, String)> {
+            self.calls
+                .lock()
+                .map(|calls| calls.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    impl LlmChannel for FakeLlm {
+        fn chat(&self, plan: &ChatPlan) -> Result<ChatReply, HostApiError> {
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push((plan.provider.clone(), plan.model.clone()));
+            }
+            Ok(self.reply.clone())
+        }
+    }
+
+    /// 专供审计断言用的正文标记：审计库里的任何一个字段都不该出现它。
+    const PROMPT_MARK: &str = "机密正文-绝不能进审计";
+
+    /// 造一个只关心模型调用的宿主。
+    fn llm_api(
+        root: &Path,
+        caps: &[&str],
+        models: &[&str],
+        max_tokens: u64,
+        channel: &Arc<FakeLlm>,
+    ) -> FsHostApi {
+        let api = api_with(root, caps);
+        api.set_llm_policy_for(
+            "demo",
+            models.iter().map(|model| model.to_string()).collect(),
+            max_tokens,
+        );
+        api.set_llm_channel(channel.clone());
+        api
+    }
+
+    fn chat_params() -> Value {
+        json!({
+            "provider": "openai",
+            "model": "gpt-4o-mini",
+            "messages": [{ "role": "user", "content": PROMPT_MARK }],
+        })
+    }
+
+    /// 能力映射：`host/llm.chat` 必须落到 `llm.chat`。
+    ///
+    /// `capability_of` 是唯一入口，映射写错等于「清单批了能力也进不了闸门」，
+    /// 而且会静默退化成 `-32601`（未实现），最难查。
+    #[test]
+    fn capability_map_covers_llm_chat() {
+        assert_eq!(capability_of("host/llm.chat"), Some("llm.chat"));
+    }
+
+    /// ① 未授权：能力闸门先回 6103，模型闸门与通道一次都不该被碰到。
+    #[test]
+    fn llm_chat_without_capability_is_denied() {
+        let root = sandbox("llm-unauth");
+        let channel = FakeLlm::new("不该出现");
+        let api = llm_api(&root, &[], &["openai/gpt-4o-mini"], 1024, &channel);
+
+        let err = api
+            .call("demo", "host/llm.chat", &chat_params())
+            .expect_err("没有 llm.chat 能力");
+        assert_eq!(err.code, HostApiError::UNAUTHORIZED);
+        assert!(err.message.contains("llm.chat"), "{}", err.message);
+        assert!(channel.calls().is_empty(), "未授权不该碰模型通道");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ② 模型不在清单：6103，且审计只留 `provider/model`。
+    #[test]
+    fn llm_chat_rejects_model_outside_manifest() {
+        let root = sandbox("llm-model");
+        let channel = FakeLlm::new("不该出现");
+        let api = llm_api(
+            &root,
+            &["llm.chat"],
+            &["openai/gpt-4o-mini"],
+            1024,
+            &channel,
+        );
+
+        let err = api
+            .call(
+                "demo",
+                "host/llm.chat",
+                &json!({
+                    "provider": "openai",
+                    "model": "gpt-4o",
+                    "messages": [{ "role": "user", "content": PROMPT_MARK }],
+                }),
+            )
+            .expect_err("清单外模型必须拒");
+        assert_eq!(err.code, HostApiError::LLM_DENIED);
+        assert!(channel.calls().is_empty(), "被拒的请求不该走到通道");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ③ `maxTokens` 越界：这是参数错（-32602），不是「拒绝」。
+    #[test]
+    fn llm_chat_rejects_max_tokens_over_manifest() {
+        let root = sandbox("llm-tokens");
+        let channel = FakeLlm::new("不该出现");
+        let api = llm_api(&root, &["llm.chat"], &["openai/gpt-4o-mini"], 256, &channel);
+
+        let err = api
+            .call(
+                "demo",
+                "host/llm.chat",
+                &json!({
+                    "provider": "openai",
+                    "model": "gpt-4o-mini",
+                    "messages": [{ "role": "user", "content": "hi" }],
+                    "maxTokens": 512,
+                }),
+            )
+            .expect_err("超上限必须拒");
+        assert_eq!(err.code, HostApiError::INVALID_PARAMS, "{}", err.message);
+        assert!(err.message.contains("maxTokens"), "{}", err.message);
+        assert!(channel.calls().is_empty(), "参数已错，不该走到通道");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ④ 成功路径 + 审计字段：耗时 / token 数要落库，正文一个字都不许进。
+    #[tokio::test]
+    async fn llm_chat_success_is_audited_without_prompt() {
+        let root = sandbox("llm-ok");
+        std::fs::create_dir_all(&root).ok();
+        let (api, store) = api_with_store(&root, &["llm.chat"], "llmok").await;
+        api.set_llm_policy_for("demo", vec!["openai/gpt-4o-mini".to_string()], 1024);
+        let channel = FakeLlm::new("回包正文");
+        api.set_llm_channel(channel.clone());
+
+        let reply = api
+            .call("demo", "host/llm.chat", &chat_params())
+            .expect("应当成功");
+        assert_eq!(reply["text"], json!("回包正文"));
+        assert_eq!(reply["model"], json!("openai/gpt-4o-mini"));
+        assert_eq!(reply["usage"]["promptTokens"], json!(11));
+        assert_eq!(reply["usage"]["completionTokens"], json!(5));
+        assert_eq!(
+            channel.calls(),
+            vec![("openai".to_string(), "gpt-4o-mini".to_string())],
+            "通道应当恰好被调一次，provider 与 model 分得清"
+        );
+
+        let rows =
+            FsHostApi::wait_audit(&store, |row| row.detail["decision"] == DECISION_ALLOW).await;
+        let detail = &rows
+            .iter()
+            .find(|row| row.detail["decision"] == DECISION_ALLOW)
+            .expect("应有 allow 审计")
+            .detail;
+        assert_eq!(detail["capability"], "llm.chat");
+        assert_eq!(detail["target"], "openai/gpt-4o-mini");
+        // 计量字段：插件调了多少、调了多久，审计要能回答。
+        assert!(detail["latencyMs"].is_u64(), "{detail}");
+        assert_eq!(detail["promptTokens"], json!(11));
+        assert_eq!(detail["completionTokens"], json!(5));
+        // 记的是**这次实际能用的上限**（未显式要就取默认 512），不是清单天花板。
+        assert_eq!(detail["maxTokens"], reply["usage"]["maxTokens"]);
+        // 正文一个字都不能进审计库（连"回包"也不行）。
+        let dump = serde_json::to_string(detail).expect("序列化");
+        assert!(!dump.contains(PROMPT_MARK), "审计里出现了提问正文：{dump}");
+        assert!(!dump.contains("回包正文"), "审计里出现了回包正文：{dump}");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ⑤ 宿主没接模型通道：报执行失败（6100 段），不能假装成功返回空文本。
+    #[test]
+    fn llm_chat_without_channel_fails_loudly() {
+        let root = sandbox("llm-nochannel");
+        let api = api_with(&root, &["llm.chat"]);
+        api.set_llm_policy_for("demo", vec!["openai/gpt-4o-mini".to_string()], 1024);
+
+        let err = api
+            .call("demo", "host/llm.chat", &chat_params())
+            .expect_err("没有通道必须报错");
+        assert_eq!(err.code, HostApiError::IO, "{}", err.message);
 
         std::fs::remove_dir_all(&root).ok();
     }
