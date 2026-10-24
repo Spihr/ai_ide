@@ -15,6 +15,12 @@ import type { SessionExportFormat, SessionView } from '@ai-ide/shared-types'
 
 import { useAi } from '../ai-store'
 import {
+  AUDIT_KIND_FILTERS,
+  auditKindLabel,
+  isDeniedDecision,
+  pluginAuditLine
+} from '../audit-view'
+import {
   createSession,
   deleteSession,
   dismissSessionHint,
@@ -25,6 +31,8 @@ import {
   refreshAudit,
   renameSession,
   selectSession,
+  setAuditKind,
+  setAuditScope,
   setSessionQuery,
   useSessions
 } from '../session-store'
@@ -282,57 +290,122 @@ export function SessionPanel(): React.JSX.Element {
             >
               导出
             </button>
-            <button
-              className="ai-button"
-              type="button"
-              data-testid="session-audit-toggle"
-              onClick={toggleAudit}
-            >
-              {auditOpen ? '收起审计' : '审计回执'}
-            </button>
           </div>
 
-          {auditOpen ? (
-            <ul className="ai-list" data-testid="session-audit">
-              {state.audit.length === 0 ? (
-                <li className="ai-note">这条会话还没有审计事件。</li>
-              ) : (
-                state.audit.map((event) => (
-                  <li
-                    key={event.event_id}
-                    className="ai-list__item"
-                    data-testid="session-audit-item"
-                    title={`${event.actor} · ${formatTime(event.created_at_ms)}`}
-                  >
-                    <span className="ai-list__meta">
-                      {event.kind} · {event.summary}
-                    </span>
-                    <span className="ai-note">{formatTime(event.created_at_ms)}</span>
-                  </li>
-                ))
-              )}
-              {state.auditTotal > state.audit.length ? (
-                <li className="ai-note">
-                  共 {state.auditTotal} 条，当前显示最近 {state.audit.length} 条。
-                  <button
-                    className="ai-button ai-button--tiny"
-                    type="button"
-                    data-testid="session-audit-more"
-                    disabled={state.auditLoading}
-                    title="再拉一页更早的审计事件"
-                    onClick={() => void loadMoreAudit()}
-                  >
-                    {state.auditLoading ? '加载中…' : '加载更多'}
-                  </button>
-                </li>
-              ) : null}
-            </ul>
-          ) : null}
         </>
       ) : (
         <div className="ai-note">
           没有选中会话：发一条消息会自动建一个（绑定当前工作区与模型）。
         </div>
+      )}
+
+      <h4 className="ai-section__subtitle">审计回执</h4>
+      <div className="ai-row">
+        <button
+          className="ai-button"
+          type="button"
+          data-testid="session-audit-toggle"
+          title="插件的能力变更与调用也记在这里（切到「全部（含插件）」）"
+          onClick={toggleAudit}
+        >
+          {auditOpen ? '收起审计' : '展开审计'}
+        </button>
+        <span className="ai-note">
+          {state.auditScope === 'session' ? '当前范围：本会话' : '当前范围：全部（含插件）'}
+        </span>
+      </div>
+        {auditOpen ? (
+          <>
+            {/*
+              插件事件（能力变更 / 插件调用）不挂会话，按会话过滤永远读不到——所以
+              这里必须有「全部」这一档，否则 P4 的审计在 UI 上等于不存在。
+              点插件类别的筛选项会自动把范围切到全局（见 session-store.setAuditKind）。
+            */}
+            <div className="ai-row" data-testid="session-audit-scope">
+              <button
+                className={`ai-button ai-button--tiny${state.auditScope === 'session' ? ' ai-button--primary' : ''}`}
+                type="button"
+                data-testid="session-audit-scope-session"
+                disabled={state.currentId === null}
+                title="只看这条会话的审计"
+                onClick={() => void setAuditScope('session')}
+              >
+                本会话
+              </button>
+              <button
+                className={`ai-button ai-button--tiny${state.auditScope === 'global' ? ' ai-button--primary' : ''}`}
+                type="button"
+                data-testid="session-audit-scope-global"
+                title="看全部审计，包含不挂会话的插件事件"
+                onClick={() => void setAuditScope('global')}
+              >
+                全部（含插件）
+              </button>
+              {AUDIT_KIND_FILTERS.filter((item) => item.kind !== null).map((item) => (
+                <button
+                  key={item.kind}
+                  className={`ai-button ai-button--tiny${state.auditKind === item.kind ? ' ai-button--primary' : ''}`}
+                  type="button"
+                  data-testid={`session-audit-kind-${item.kind}`}
+                  title={`只看 ${item.kind}`}
+                  onClick={() =>
+                    void setAuditKind(state.auditKind === item.kind ? null : item.kind)
+                  }
+                >
+                  {item.label}
+                </button>
+              ))}
+            </div>
+            <ul className="ai-list" data-testid="session-audit">
+              {state.audit.length === 0 ? (
+                <li className="ai-note">
+                  {state.auditScope === 'session'
+                    ? '这条会话还没有审计事件。插件的能力变更与调用不挂会话，切到「全部（含插件）」看。'
+                    : '这条会话还没有审计事件。'}
+                </li>
+              ) : (
+                state.audit.map((event) => {
+                  const line = pluginAuditLine(event)
+                  const denied = isDeniedDecision(event)
+                  return (
+                    <li
+                      key={event.event_id}
+                      className={`ai-list__item ai-list__item--audit${denied ? ' ai-list__item--bad' : ''}`}
+                      data-testid="session-audit-item"
+                      data-kind={event.kind}
+                      title={`${event.actor} · ${formatTime(event.created_at_ms)}`}
+                    >
+                      <span className="ai-list__meta">
+                        {auditKindLabel(event.kind)} · {event.summary}
+                      </span>
+                      {line !== null ? (
+                        <span className="ai-note" data-testid="session-audit-facts">
+                          {line}
+                        </span>
+                      ) : null}
+                      <span className="ai-note">{formatTime(event.created_at_ms)}</span>
+                    </li>
+                  )
+                })
+              )}
+            {state.auditTotal > state.audit.length ? (
+              <li className="ai-note">
+                共 {state.auditTotal} 条，当前显示最近 {state.audit.length} 条。
+                <button
+                  className="ai-button ai-button--tiny"
+                  type="button"
+                  data-testid="session-audit-more"
+                  disabled={state.auditLoading}
+                  title="再拉一页更早的审计事件"
+                  onClick={() => void loadMoreAudit()}
+                >
+                  {state.auditLoading ? '加载中…' : '加载更多'}
+                </button>
+              </li>
+            ) : null}
+          </ul>
+          </>
+        ) : null}
       )}
     </div>
   )

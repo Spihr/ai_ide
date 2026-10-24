@@ -1,5 +1,5 @@
 /**
- * P1/P2 渲染侧 API 封装：把 `window.aiide.request` 收窄成 `plugin.*` 七个动作。
+ * P1/P2/P4 渲染侧 API 封装：把 `window.aiide.request` 收窄成 `plugin.*` 九个动作。
  *
  * 与 `mcp-api.ts` / `git-api.ts` 同一套路——组件不拼方法名、不自己拼参数，
  * 错误码翻译也收在这里。内核给插件单开了一段错误码（docs/14 §6.6，
@@ -8,7 +8,7 @@
  * - `6101` 插件不存在 / 安装目录已消失（卸载/加载/看详情时目标没了）；
  * - `6102` 插件进程崩了或起不来（工具已下架；偶发崩溃由内核自动重启，走到这一步
  *   说明没救回来；面板要显示 `last_error`）；
- * - `6103` 清单申请的能力没授齐（**进程没起**，等 P4 的授权面板）；
+ * - `6103` 清单申请的能力没授齐（**进程没起**；P4 起面板可以直接补授权）；
  * - `6104` 清单里的 `pluginApi` 与宿主不兼容——安装时**只会出现在 6107 的 details 里**，
  *   加载时也会单独返回（目录里的清单被改过）；
  * - `6105` 握手超时（进程被内核杀掉，可重试）；
@@ -33,6 +33,8 @@
 
 import {
   Methods,
+  type PluginGrantParams,
+  type PluginGrantResult,
   type PluginInstallParams,
   type PluginInstallResult,
   type PluginListParams,
@@ -41,6 +43,8 @@ import {
   type PluginLoadResult,
   type PluginReloadParams,
   type PluginReloadResult,
+  type PluginRevokeParams,
+  type PluginRevokeResult,
   type PluginState,
   type PluginStatusParams,
   type PluginStatusResult,
@@ -54,7 +58,7 @@ import { decodeRpcErrorPayload, stripRpcErrorPayload } from '../../shared/ipc'
 const PLUGIN_ERROR_HINTS: Record<number, string> = {
   6101: '插件不存在：可能已被卸载，点「刷新」看最新清单。',
   6102: '插件进程崩了或起不来：工具已下架。偶发崩溃内核会自动重启（同一次装载最多 3 次），到这里说明没救回来——详情里是内核记的原因，修好后再点「加载」。',
-  6103: '插件申请的能力还没授权，进程没有启动：授权面板在 P4，暂时只能看能力清单。',
+  6103: '插件申请的能力还没授齐，进程没有启动：到详情里把能力逐项授权（或「全部授权」）后再点「加载」。',
   6104: '插件声明的 `pluginApi` 与宿主不兼容：需要插件作者按当前宿主 API 改版本号。',
   6105: '插件握手超时：进程已被停掉，可以点「加载」重试一次；连续超时要查插件启动逻辑。',
   6106: '插件违反协议（帧格式不对，或上报的工具与清单不一致）：重试没用，需要插件作者修。',
@@ -191,6 +195,33 @@ export function pluginCapabilityLabel(capability: string, granted: string[]): st
   return granted.includes(capability) ? capability : `${capability}?`
 }
 
+/**
+ * 「关键能力」白名单，与内核 `crates/core/src/plugin_api.rs::KEY_CAPABILITIES` 对齐。
+ *
+ * 关键与否决定**撤销的后果**：撤这三项会让内核当场把插件 `unload`（工具下架、进程停），
+ * 所以 UI 必须先说清「会连带卸载」再让用户点第二下。名单写死在前端是有意的——
+ * 它只用于「提前告知」，真正的判定在 `plugin.revoke` 返回的 `unloaded` 字段上，
+ * 前端不拿它当授权门槛（授权与否只认 `granted_capabilities`）。
+ */
+export const PLUGIN_KEY_CAPABILITIES: readonly string[] = ['fs.write', 'net.fetch', 'llm.chat']
+
+/** 是否关键能力（撤销会连带卸载）。 */
+export function isKeyCapability(capability: string): boolean {
+  return PLUGIN_KEY_CAPABILITIES.includes(capability)
+}
+
+/**
+ * 撤销一项能力会发生什么——给二次确认用的那句实话。
+ *
+ * 关键能力：撤了内核立刻 `unload`，工具从模型工具表消失，正在跑的调用拿 6103/3001；
+ * 普通能力：插件还在跑，只是下次碰这项能力被拒（网关先查能力再查路径/审批）。
+ */
+export function describeRevokeImpact(capability: string): string {
+  return isKeyCapability(capability)
+    ? `撤销 ${capability}（关键能力）：内核会立即卸载该插件——进程停掉、工具从工具表下架，正在进行的调用会被拒。撤销后要重新授权并「加载」才能再用。`
+    : `撤销 ${capability}：插件继续运行，但下一次调用该能力会被拒绝（能力闸门在路径检查与审批之前）。`
+}
+
 export const pluginApi = {
   /** 已安装插件清单。只读，随时可拉。 */
   list: (): Promise<PluginListResult> =>
@@ -253,5 +284,33 @@ export const pluginApi = {
   reload: (pluginId: string): Promise<PluginReloadResult> =>
     window.aiide.request(Methods.plugin.reload, {
       plugin_id: pluginId
-    } satisfies PluginReloadParams) as Promise<PluginReloadResult>
+    } satisfies PluginReloadParams) as Promise<PluginReloadResult>,
+
+  /**
+   * 授权（P4）。`capabilities` 传空数组表示「把清单申请的全部能力授齐」。
+   *
+   * 内核只接受清单里声明过的能力，且会**重新校验清单**：非法项或清单外项一律拒绝
+   * （`-32602`）。成功后 `granted_capabilities` 更新，状态从 `needs_grant` 回到
+   * `disabled`——此时才允许 `load`。
+   */
+  grant: (pluginId: string, capabilities: string[] = []): Promise<PluginGrantResult> =>
+    window.aiide.request(Methods.plugin.grant, {
+      plugin_id: pluginId,
+      capabilities
+    } satisfies PluginGrantParams) as Promise<PluginGrantResult>,
+
+  /**
+   * 撤销（P4）。注意后果不对等：
+   *
+   * - 撤普通能力：插件照跑，下次调用该能力被拒；
+   * - 撤**关键能力**（`fs.write` / `net.fetch` / `llm.chat`）：内核当场 `unload`，
+   *   返回的 `unloaded` 为 `true`——调用方必须把这件事回执给用户，不能只报「已撤销」。
+   *
+   * 所以 UI 侧是两段式确认，见 `plugin-store.revokeCapability`。
+   */
+  revoke: (pluginId: string, capabilities: string[]): Promise<PluginRevokeResult> =>
+    window.aiide.request(Methods.plugin.revoke, {
+      plugin_id: pluginId,
+      capabilities
+    } satisfies PluginRevokeParams) as Promise<PluginRevokeResult>
 }

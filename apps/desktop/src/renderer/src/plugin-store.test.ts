@@ -29,14 +29,17 @@ import {
 import type { AiIdeApi } from '../../shared/ipc'
 import { encodeRpcErrorPayload } from '../../shared/ipc'
 import {
+  cancelRevoke,
   dismissPluginError,
   getPluginState,
+  grantCapabilities,
   initPlugins,
   installPlugin,
   loadPlugin,
   refreshPlugins,
   reloadPlugin,
   resetPluginState,
+  revokeCapability,
   selectPlugin,
   setInstallPath,
   uninstallPlugin,
@@ -172,6 +175,42 @@ function installHarness(): Harness {
             last_error: undefined
           }
           return { plugin_id: id, removed_tools: 1 }
+        }
+        case Methods.plugin.grant: {
+          const id = String(p.plugin_id)
+          const index = plugins.findIndex((item) => item.id === id)
+          if (index < 0) throw new Error('[6101] plugin not found')
+          const current = plugins[index] as PluginSummary
+          const asked = (p.capabilities ?? []) as string[]
+          const wanted = asked.length > 0 ? asked : current.capabilities
+          const merged = [
+            ...current.granted_capabilities,
+            ...wanted.filter((item) => !current.granted_capabilities.includes(item))
+          ]
+          const complete = current.capabilities.every((item) => merged.includes(item))
+          plugins[index] = {
+            ...current,
+            granted_capabilities: merged,
+            state: complete ? 'disabled' : current.state
+          }
+          return { plugin: { ...plugins[index] } }
+        }
+        case Methods.plugin.revoke: {
+          const id = String(p.plugin_id)
+          const index = plugins.findIndex((item) => item.id === id)
+          if (index < 0) throw new Error('[6101] plugin not found')
+          const current = plugins[index] as PluginSummary
+          const asked = (p.capabilities ?? []) as string[]
+          const granted = current.granted_capabilities.filter((item) => !asked.includes(item))
+          // 内核判定：撤掉关键能力必然连带卸载，进程停 + 工具下架 + 退回 needs_grant
+          const unloaded = asked.some((item) => ['fs.write', 'net.fetch', 'llm.chat'].includes(item))
+          plugins[index] = {
+            ...current,
+            granted_capabilities: granted,
+            state: unloaded ? 'needs_grant' : current.state,
+            tool_count: unloaded ? 0 : current.tool_count
+          }
+          return { plugin: { ...plugins[index] }, unloaded }
         }
         default:
           throw new Error(`测试收到了意外方法：${method}`)
@@ -541,5 +580,229 @@ describe('装载与停止', () => {
     await first
 
     expect(harness.count(Methods.plugin.load)).toBe(1)
+  })
+})
+
+/**
+ * P4 授权/撤销。
+ *
+ * 这一组的重点是**撤销的两段式**：第一次点只上膛、绝不发请求。内核撤关键能力会
+ * 连带卸载插件（进程停、工具下架），点错没法反悔，所以「问一声」必须发生在
+ * 请求之前，而且上膛态要跟着 `(插件, 能力)` 走。
+ */
+describe('能力授权与撤销', () => {
+  function credPlugin(): PluginSummary {
+    return plugin('demo.hello', {
+      name: 'Demo Hello',
+      capabilities: ['fs.read', 'fs.write'],
+      granted_capabilities: [],
+      state: 'needs_grant'
+    })
+  }
+
+  it('全部授权：只传 plugin_id，成功后拉清单与详情、状态离开 needs_grant', async () => {
+    const harness = installHarness()
+    harness.setPlugins([credPlugin()])
+    await refreshPlugins()
+    await selectPlugin('demo.hello')
+
+    const ok = await grantCapabilities('demo.hello')
+    expect(ok).toBe(true)
+
+    // 空数组就是内核的「全授」语义（`wanted.is_empty()` → 取清单声明），不要自己展开成清单
+    const grant = harness.calls.find((call) => call.method === Methods.plugin.grant)
+    expect(grant?.params).toEqual({ plugin_id: 'demo.hello', capabilities: [] })
+
+    const state = getPluginState()
+    expect(state.busyPlugin).toBeNull()
+    expect(state.busyAction).toBeNull()
+    expect(state.plugins[0]?.granted_capabilities).toEqual(['fs.read', 'fs.write'])
+    expect(state.plugins[0]?.state).toBe('disabled')
+    expect(state.detail?.plugin.granted_capabilities).toEqual(['fs.read', 'fs.write'])
+    // 授权不拉起进程：提示必须把下一步指到「加载」
+    expect(state.hint).toContain('加载')
+  })
+
+  it('逐项授权：只授予点名那一项，剩下没授的要明说还差几项', async () => {
+    const harness = installHarness()
+    harness.setPlugins([credPlugin()])
+    await refreshPlugins()
+
+    const ok = await grantCapabilities('demo.hello', ['fs.read'])
+    expect(ok).toBe(true)
+
+    const grant = harness.calls.find((call) => call.method === Methods.plugin.grant)
+    expect(grant?.params).toEqual({ plugin_id: 'demo.hello', capabilities: ['fs.read'] })
+
+    const state = getPluginState()
+    expect(state.plugins[0]?.granted_capabilities).toEqual(['fs.read'])
+    expect(state.plugins[0]?.state).toBe('needs_grant')
+    expect(state.hint).toContain('还差 1 项')
+  })
+
+  it('全空白的授权请求不发出去：错误落在本地', async () => {
+    const harness = installHarness()
+    harness.setPlugins([credPlugin()])
+    await refreshPlugins()
+
+    const ok = await grantCapabilities('demo.hello', ['  ', ''])
+    expect(ok).toBe(false)
+    expect(harness.count(Methods.plugin.grant)).toBe(0)
+    expect(getPluginState().error).toContain('不能是空字符串')
+  })
+
+  it('授权被拒：busy 复位、错误留下，并重拉清单对齐账本', async () => {
+    const harness = installHarness()
+    harness.setPlugins([credPlugin()])
+    await refreshPlugins()
+    harness.failNext('[6106] capability not requested', { method: Methods.plugin.grant })
+
+    const ok = await grantCapabilities('demo.hello', ['net.fetch'])
+    expect(ok).toBe(false)
+
+    const state = getPluginState()
+    expect(state.busyPlugin).toBeNull()
+    expect(state.busyAction).toBeNull()
+    expect(state.error).toContain('[6106]')
+    // 失败分支也刷新：别的窗口可能刚改过账本
+    expect(harness.count(Methods.plugin.list)).toBe(2)
+  })
+
+  it('撤销第一下只上膛：不发请求、不动账本', async () => {
+    const harness = installHarness()
+    harness.setPlugins([credPlugin()])
+    await refreshPlugins()
+
+    const ok = await revokeCapability('demo.hello', 'fs.write')
+    expect(ok).toBe(false)
+    expect(harness.count(Methods.plugin.revoke)).toBe(0)
+
+    const state = getPluginState()
+    expect(state.pendingRevoke).toEqual({ pluginId: 'demo.hello', capability: 'fs.write' })
+    expect(state.error).toBeNull()
+  })
+
+  it('撤销第二下才发请求；关键能力连带卸载后提示要说清后果', async () => {
+    const harness = installHarness()
+    harness.setPlugins([
+      plugin('demo.hello', {
+        name: 'Demo Hello',
+        capabilities: ['fs.read', 'fs.write'],
+        granted_capabilities: ['fs.read', 'fs.write'],
+        state: 'disabled'
+      })
+    ])
+    await refreshPlugins()
+    await selectPlugin('demo.hello')
+
+    await revokeCapability('demo.hello', 'fs.write')
+    const ok = await revokeCapability('demo.hello', 'fs.write')
+    expect(ok).toBe(true)
+
+    const revoke = harness.calls.find((call) => call.method === Methods.plugin.revoke)
+    expect(revoke?.params).toEqual({ plugin_id: 'demo.hello', capabilities: ['fs.write'] })
+
+    const state = getPluginState()
+    expect(state.pendingRevoke).toBeNull()
+    expect(state.busyPlugin).toBeNull()
+    expect(state.plugins[0]?.granted_capabilities).toEqual(['fs.read'])
+    expect(state.plugins[0]?.state).toBe('needs_grant')
+    expect(state.hint).toContain('连带卸载')
+    expect(state.hint).toContain('待授权')
+  })
+
+  it('撤非关键能力不说卸载：插件仍在跑，只是下一次调用被拒', async () => {
+    const harness = installHarness()
+    harness.setPlugins([
+      plugin('demo.hello', {
+        capabilities: ['fs.read', 'fs.write'],
+        granted_capabilities: ['fs.read', 'fs.write'],
+        state: 'ready'
+      })
+    ])
+    await refreshPlugins()
+
+    await revokeCapability('demo.hello', 'fs.read')
+    const ok = await revokeCapability('demo.hello', 'fs.read')
+    expect(ok).toBe(true)
+
+    const state = getPluginState()
+    expect(state.plugins[0]?.state).toBe('ready')
+    expect(state.hint).not.toContain('连带卸载')
+    expect(state.hint).toContain('拒绝')
+  })
+
+  it('上膛态跟着能力走：点了 A 再点 B，确认撤的是 B', async () => {
+    const harness = installHarness()
+    harness.setPlugins([
+      plugin('demo.hello', {
+        capabilities: ['fs.read', 'fs.write'],
+        granted_capabilities: ['fs.read', 'fs.write'],
+        state: 'ready'
+      })
+    ])
+    await refreshPlugins()
+
+    await revokeCapability('demo.hello', 'fs.write')
+    await revokeCapability('demo.hello', 'fs.read')
+    expect(getPluginState().pendingRevoke).toEqual({
+      pluginId: 'demo.hello',
+      capability: 'fs.read'
+    })
+
+    // 这一下才是真撤，撤的是 fs.read；fs.write 仍在上膛位置之外，没被动过
+    const ok = await revokeCapability('demo.hello', 'fs.read')
+    expect(ok).toBe(true)
+    expect(harness.count(Methods.plugin.revoke)).toBe(1)
+    expect(getPluginState().plugins[0]?.granted_capabilities).toEqual(['fs.write'])
+  })
+
+  it('cancelRevoke 收起上膛态，之后再点仍需重新确认', async () => {
+    const harness = installHarness()
+    harness.setPlugins([
+      plugin('demo.hello', {
+        capabilities: ['fs.write'],
+        granted_capabilities: ['fs.write'],
+        state: 'ready'
+      })
+    ])
+    await refreshPlugins()
+
+    await revokeCapability('demo.hello', 'fs.write')
+    cancelRevoke()
+    expect(getPluginState().pendingRevoke).toBeNull()
+
+    const ok = await revokeCapability('demo.hello', 'fs.write')
+    expect(ok).toBe(false)
+    expect(harness.count(Methods.plugin.revoke)).toBe(0)
+  })
+
+  it('换选中插件会清掉上膛态：别让用户在 A 上的确认落到 B 上', async () => {
+    const harness = installHarness()
+    harness.setPlugins([plugin('demo.hello', { capabilities: ['fs.write'] }), plugin('other.one')])
+    await refreshPlugins()
+
+    await revokeCapability('demo.hello', 'fs.write')
+    await selectPlugin('other.one')
+
+    expect(getPluginState().pendingRevoke).toBeNull()
+  })
+
+  it('撤销失败：上膛态清掉、错误留下，不让用户停在一个假确认里', async () => {
+    const harness = installHarness()
+    harness.setPlugins([
+      plugin('demo.hello', { capabilities: ['fs.write'], granted_capabilities: ['fs.write'] })
+    ])
+    await refreshPlugins()
+    harness.failNext('[6106] capability not granted', { method: Methods.plugin.revoke })
+
+    await revokeCapability('demo.hello', 'fs.write')
+    const ok = await revokeCapability('demo.hello', 'fs.write')
+    expect(ok).toBe(false)
+
+    const state = getPluginState()
+    expect(state.pendingRevoke).toBeNull()
+    expect(state.busyPlugin).toBeNull()
+    expect(state.error).toContain('[6106]')
   })
 })

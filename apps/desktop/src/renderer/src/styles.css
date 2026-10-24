@@ -775,6 +775,17 @@ button {
   background: var(--panel-2);
 }
 
+/* 审计行：摘要在第一行，插件明细字段折行到第二行（明细可能很长）。 */
+.ai-list__item--audit {
+  flex-wrap: wrap;
+  align-items: baseline;
+}
+
+/* 被拒的裁决（grant deny / revoke deny / call deny）标红。 */
+.ai-list__item--bad .ai-list__meta {
+  color: var(--warn);
+}
+
 .ai-list__meta {
   flex: 1;
   overflow: hidden;

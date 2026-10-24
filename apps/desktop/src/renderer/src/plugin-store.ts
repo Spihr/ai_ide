@@ -1,5 +1,5 @@
 ﻿/**
- * P1/P2 渲染侧状态：已安装插件清单、选中项详情，以及安装/卸载/装载/停止/重载的结果。
+ * P1/P2/P4 渲染侧状态：已安装插件清单、选中项详情、装卸载结果，以及能力授权/撤销。
  *
  * 与 `mcp-store` / `permission-store` 同一形态：单例 + `useSyncExternalStore`，
  * 动作返回布尔表示「是否真的做成了」，失败原因落到 `error`（外加 6107 的
@@ -29,8 +29,28 @@ import {
   type PluginIssue
 } from './plugin-api'
 
-/** 一次只跑一个的装卸/装载动作（`installing` 单独一位，安装不针对某一行）。 */
-export type PluginBusyAction = 'install' | 'uninstall' | 'load' | 'unload' | 'reload'
+/** 一次只跑一个的装卸/装载/授权动作（`installing` 单独一位，安装不针对某一行）。 */
+export type PluginBusyAction =
+  | 'install'
+  | 'uninstall'
+  | 'load'
+  | 'unload'
+  | 'reload'
+  | 'grant'
+  | 'revoke'
+
+/**
+ * 待二次确认的撤销（P4）。
+ *
+ * **为什么确认态放在 store 而不是组件里**：撤销关键能力会连带卸载插件（进程停、
+ * 工具下架），属于「点错了没法反悔」的动作。把「第一次点击只是上膛」这件事放进
+ * 状态机，动作函数自己就能保证「没上膛不发请求」——组件漏写一个 if、或者别处
+ * 直接调 `revokeCapability`，也不会绕过确认。
+ */
+export interface PendingRevoke {
+  pluginId: string
+  capability: string
+}
 
 export interface PluginStoreState {
   /** 已安装插件（内核按安装时间排序）。 */
@@ -61,6 +81,8 @@ export interface PluginStoreState {
   error: string | null
   /** 6107 的 `details[]`；其他错误为空数组。 */
   errorDetails: PluginIssue[]
+  /** 正在等第二次点击确认的撤销；`null` 表示没有上膛的撤销。 */
+  pendingRevoke: PendingRevoke | null
 }
 
 function initialState(): PluginStoreState {
@@ -76,7 +98,8 @@ function initialState(): PluginStoreState {
     detailLoading: false,
     hint: null,
     error: null,
-    errorDetails: []
+    errorDetails: [],
+    pendingRevoke: null
   }
 }
 
@@ -122,13 +145,18 @@ export async function refreshPlugins(): Promise<boolean> {
     const result = await pluginApi.list()
     const stillThere =
       state.selectedId !== null && result.plugins.some((plugin) => plugin.id === state.selectedId)
+    // 上膛的撤销也要跟着清单校验：插件被别的窗口卸掉了，确认按钮就无处可点。
+    const armed = state.pendingRevoke
+    const armedStillThere =
+      armed !== null && result.plugins.some((plugin) => plugin.id === armed.pluginId)
 
     setState({
       loading: false,
       plugins: result.plugins,
       selectedId: stillThere ? state.selectedId : null,
       detail: stillThere ? state.detail : null,
-      detailLoading: stillThere ? state.detailLoading : false
+      detailLoading: stillThere ? state.detailLoading : false,
+      pendingRevoke: armedStillThere ? armed : null
     })
     return true
   } catch (error) {
@@ -312,6 +340,135 @@ async function runRuntimeAction(pluginId: string, action: RuntimeAction): Promis
 }
 
 /**
+ * 授权（P4）：把清单申请到的能力写进账本，并当场灌进运行态。
+ *
+ * `capabilities` 留空表示「清单申请的全部能力」——面板的「全部授权」走这条。授权
+ * **不会**把插件拉起来（内核只记账本 + 运行态快照），所以提示里要说清下一步是
+ * 「加载」，否则用户会以为授完就该在工具表里看到它。
+ */
+export async function grantCapabilities(
+  pluginId: string,
+  capabilities: string[] = []
+): Promise<boolean> {
+  if (state.busyPlugin !== null) return false
+  const wanted = capabilities.map((item) => item.trim()).filter((item) => item.length > 0)
+  if (capabilities.length > 0 && wanted.length === 0) {
+    setState({ error: '要授予的能力不能是空字符串：逐项授权就传具体能力名，全部授权传空数组。', errorDetails: [] })
+    return false
+  }
+
+  setState({
+    busyPlugin: pluginId,
+    busyAction: 'grant',
+    error: null,
+    errorDetails: [],
+    hint: null,
+    pendingRevoke: null
+  })
+  try {
+    const result = await pluginApi.grant(pluginId, wanted)
+    const granted = result.plugin.granted_capabilities
+    const requested = result.plugin.capabilities
+    const added = wanted.length > 0 ? wanted.join('、') : `清单申请的全部能力（${requested.join('、')}）`
+    const complete = requested.every((capability) => granted.includes(capability))
+    setState({
+      busyPlugin: null,
+      busyAction: null,
+      hint: complete
+        ? `已授予「${result.plugin.name}」：${added}。授权只记账本，进程还没起——点「加载」启动它。`
+        : `已授予「${result.plugin.name}」：${added}。还差 ${requested.length - granted.length} 项没授，授齐后才能加载。`
+    })
+  } catch (error) {
+    setState({
+      busyPlugin: null,
+      busyAction: null,
+      error: describePluginError(error),
+      errorDetails: pluginErrorIssues(error)
+    })
+    // 被拒的授权内核也会落一行审计（`decision = deny`），但账本没变；拉一次只为对齐
+    // 「别的窗口刚改过」这类偏差，失败信息本身仍以 error 为准。
+    await refreshPlugins()
+    await fetchPluginDetail(pluginId)
+    return false
+  }
+
+  await refreshPlugins()
+  await fetchPluginDetail(pluginId)
+  return true
+}
+
+/**
+ * 撤销（P4）：**两段式**——第一次调用只上膛，第二次才发请求。
+ *
+ * 关键能力（`fs.write` / `net.fetch` / `llm.chat`）一撤，内核立刻卸载插件：进程停、
+ * 工具下架、状态退回 `needs_grant`。这种「点错没法反悔」的动作必须问一声，而且
+ * 问的话得在**发请求之前**说清楚（`describeRevokeImpact`）。
+ *
+ * 确认态按 `(插件, 能力)` 配对：点了 A 又点 B，等于把准星移到 B 上，A 自动撤回
+ * 上膛状态——否则用户以为自己在确认 B，实际撤的是 A。
+ *
+ * 返回值：`true` 只在真正发出去并成功时为真；只上膛或失败都返回 `false`。
+ */
+export async function revokeCapability(pluginId: string, capability: string): Promise<boolean> {
+  if (state.busyPlugin !== null) return false
+  const name = capability.trim()
+  if (name.length === 0) {
+    setState({ error: '要撤销的能力不能为空。', errorDetails: [] })
+    return false
+  }
+
+  const armed =
+    state.pendingRevoke !== null &&
+    state.pendingRevoke.pluginId === pluginId &&
+    state.pendingRevoke.capability === name
+  if (!armed) {
+    setState({ pendingRevoke: { pluginId, capability: name }, error: null, errorDetails: [] })
+    return false
+  }
+
+  setState({
+    busyPlugin: pluginId,
+    busyAction: 'revoke',
+    error: null,
+    errorDetails: [],
+    hint: null,
+    pendingRevoke: null
+  })
+  try {
+    const result = await pluginApi.revoke(pluginId, [name])
+    // `unloaded` 是内核的权威结论，不是外壳按名单猜的：关键能力被撤时它才为真。
+    setState({
+      busyPlugin: null,
+      busyAction: null,
+      hint: result.unloaded
+        ? `已撤销「${name}」：这是关键能力，插件已连带卸载——进程已停、工具已下架、状态退回「待授权」。要再用请重新授权后点「加载」。`
+        : `已撤销「${name}」：插件仍在运行，但下一次调用这项能力会被内核拒绝。要再用请重新授权。`
+    })
+  } catch (error) {
+    setState({
+      busyPlugin: null,
+      busyAction: null,
+      pendingRevoke: null,
+      error: describePluginError(error),
+      errorDetails: pluginErrorIssues(error)
+    })
+    await refreshPlugins()
+    await fetchPluginDetail(pluginId)
+    return false
+  }
+
+  await refreshPlugins()
+  await fetchPluginDetail(pluginId)
+  return true
+}
+
+/** 收起「上膛」状态（用户点「取消」或换了选中项）。 */
+export function cancelRevoke(): void {
+  if (state.pendingRevoke === null) return
+  setState({ pendingRevoke: null })
+}
+
+/**
  * 选中一个插件并拉详情；传 `null` 收起详情。
  *
  * 详情是「工具/命令清单」的唯一来源——账本只存计数，`plugin.status` 才回读安装
@@ -320,11 +477,12 @@ async function runRuntimeAction(pluginId: string, action: RuntimeAction): Promis
 export async function selectPlugin(pluginId: string | null): Promise<void> {
   if (pluginId === state.selectedId) return
   if (pluginId === null) {
-    setState({ selectedId: null, detail: null, detailLoading: false })
+    setState({ selectedId: null, detail: null, detailLoading: false, pendingRevoke: null })
     return
   }
 
-  setState({ selectedId: pluginId, detail: null, detailLoading: true })
+  // 换选中项时把上膛的撤销撤回：准星换了，用户以为自己确认的是新插件的能力。
+  setState({ selectedId: pluginId, detail: null, detailLoading: true, pendingRevoke: null })
   await fetchPluginDetail(pluginId)
 }
 

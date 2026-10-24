@@ -38,6 +38,8 @@ import {
   renameSession,
   resetSessionState,
   selectSession,
+  setAuditKind,
+  setAuditScope,
   setSessionQuery,
   startNewChat
 } from './session-store'
@@ -55,6 +57,8 @@ interface Harness {
   setSavePath: (path: string | null) => void
   /** 让下一次请求失败；给了 `method` 就只让该方法的请求失败。 */
   failNext: (message: string, method?: string) => void
+  /** 让审计账本在首屏 2 条之外再挂 `count` 条（翻页用例才走得到 offset > 0）。 */
+  setAuditTail: (count: number) => void
 }
 
 function session(id: string, title: string, updatedAt = 1): SessionView {
@@ -125,6 +129,8 @@ function installHarness(options: { seedSessions?: number } = {}): Harness {
   let savePath: string | null = 'C:\\out\\会话.md'
   let failure: { message: string; method: string | null } | null = null
   let created = 0
+  /** 审计账本首屏之后还挂几条；翻页用例用它把 `total` 撑过第一页。 */
+  let auditTail = 0
   /** 最近一次分叉请求带的截断点，供「消息级分叉」用例断言。 */
   let lastForkFrom: string | null = null
 
@@ -196,8 +202,22 @@ function installHarness(options: { seedSessions?: number } = {}): Harness {
           messages['s-fork'] = [message('m-f1', 's-fork', 'user', '接口 500 了')]
           return { new_session_id: 's-fork', session: next, messages: 1 }
         }
-        case Methods.audit.list:
-          return { events: [auditEvent(2, 'session.created'), auditEvent(1, 'message.appended')], total: 2 }
+        case Methods.audit.list: {
+          // 审计是倒序账本：offset 0 给最新的两条，之后按 `auditTail` 续。
+          const offset = (p.offset as number | undefined) ?? 0
+          if (offset === 0) {
+            return {
+              events: [auditEvent(2, 'session.created'), auditEvent(1, 'message.appended')],
+              total: 2 + auditTail
+            }
+          }
+          return {
+            events: Array.from({ length: auditTail }, (_, index) =>
+              auditEvent(100 + offset + index, 'plugin.call')
+            ),
+            total: 2 + auditTail
+          }
+        }
         default:
           return { ok: true }
       }
@@ -234,6 +254,9 @@ function installHarness(options: { seedSessions?: number } = {}): Harness {
     },
     failNext: (text, method) => {
       failure = { message: text, method: method ?? null }
+    },
+    setAuditTail: (count) => {
+      auditTail = count
     }
   }
 }
@@ -552,6 +575,120 @@ describe('列表与审计翻页', () => {
     expect(typeof ok).toBe('boolean')
     // mock 的审计恒为 2 条、total=2：已到到底，不该再发请求。
     expect(callsOf(Methods.audit.list)).toHaveLength(before)
+  })
+})
+
+describe('审计范围与类别', () => {
+  it('默认按本会话取审计：带当前会话 id，且不夹类别', async () => {
+    await refreshAudit('s-1')
+
+    const params = callsOf(Methods.audit.list).at(-1)?.params
+    expect(params?.session_id).toBe('s-1')
+    expect(params?.kind).toBeNull()
+    expect(getSessionState().auditScope).toBe('session')
+    expect(getSessionState().auditKind).toBeNull()
+  })
+
+  it('没有选中会话时本会话范围下层 id 为 null，不会退化成「全部」以外的怪值', async () => {
+    await refreshAudit()
+
+    expect(callsOf(Methods.audit.list).at(-1)?.params?.session_id).toBeNull()
+  })
+
+  it('切到全局范围后立刻重拉，且不再按会话过滤', async () => {
+    await selectSession('s-1')
+    const before = callsOf(Methods.audit.list).length
+
+    const ok = await setAuditScope('global')
+
+    expect(ok).toBe(true)
+    expect(callsOf(Methods.audit.list)).toHaveLength(before + 1)
+    const params = callsOf(Methods.audit.list).at(-1)?.params
+    // 插件事件不挂会话：全局范围必须把 session_id 置空，否则永远筛不到它们。
+    expect(params?.session_id).toBeNull()
+    expect(getSessionState().auditScope).toBe('global')
+    expect(getSessionState().audit.map((item) => item.kind)).toEqual([
+      'session.created',
+      'message.appended'
+    ])
+  })
+
+  it('范围没变时不重复请求', async () => {
+    const before = callsOf(Methods.audit.list).length
+
+    expect(await setAuditScope('session')).toBe(true)
+    expect(callsOf(Methods.audit.list)).toHaveLength(before)
+  })
+
+  it('筛插件事件时自动把范围切到全局：本会话里根本没有那些行', async () => {
+    await selectSession('s-1')
+    const ok = await setAuditKind('plugin.call')
+
+    expect(ok).toBe(true)
+    const state = getSessionState()
+    expect(state.auditKind).toBe('plugin.call')
+    expect(state.auditScope).toBe('global')
+    const params = callsOf(Methods.audit.list).at(-1)?.params
+    expect(params?.kind).toBe('plugin.call')
+    expect(params?.session_id).toBeNull()
+  })
+
+  it('非插件类别不改变范围，仍按当前会话取', async () => {
+    await selectSession('s-1')
+    await setAuditKind('session.created')
+
+    const params = callsOf(Methods.audit.list).at(-1)?.params
+    expect(params?.kind).toBe('session.created')
+    expect(params?.session_id).toBe('s-1')
+    expect(getSessionState().auditScope).toBe('session')
+  })
+
+  it('空白类别归一为 null（不筛），并保留已切好的全局范围', async () => {
+    await setAuditScope('global')
+
+    await setAuditKind('   ')
+
+    expect(getSessionState().auditKind).toBeNull()
+    expect(getSessionState().auditScope).toBe('global')
+    expect(callsOf(Methods.audit.list).at(-1)?.params?.kind).toBeNull()
+  })
+
+  it('重复设同一个类别不重复请求', async () => {
+    await setAuditKind('plugin.call')
+    const before = callsOf(Methods.audit.list).length
+
+    expect(await setAuditKind('plugin.call')).toBe(true)
+    expect(callsOf(Methods.audit.list)).toHaveLength(before)
+  })
+
+  it('翻页沿用当前的范围与类别：否则第二页会把别的类别混进来', async () => {
+    h.setAuditTail(3)
+    await setAuditKind('plugin.call')
+    expect(getSessionState().audit).toHaveLength(2)
+
+    const ok = await loadMoreAudit()
+
+    expect(ok).toBe(true)
+    const params = callsOf(Methods.audit.list).at(-1)?.params
+    expect(params?.offset).toBe(2)
+    expect(params?.kind).toBe('plugin.call')
+    expect(params?.session_id).toBeNull()
+    expect(getSessionState().audit).toHaveLength(5)
+  })
+
+  it('切范围失败时清空旧回执并留下错误：不能拿上一档的账本冒充新范围', async () => {
+    await refreshAudit('s-1')
+    expect(getSessionState().audit).toHaveLength(2)
+    h.failNext('审计库忙', Methods.audit.list)
+
+    const ok = await setAuditScope('global')
+
+    expect(ok).toBe(false)
+    expect(getSessionState().audit).toHaveLength(0)
+    expect(getSessionState().auditTotal).toBe(0)
+    expect(getSessionState().error).toContain('审计库忙')
+    // 范围本身要保留用户的选择，便于重试。
+    expect(getSessionState().auditScope).toBe('global')
   })
 })
 

@@ -1,5 +1,6 @@
 /**
- * 插件面板（P1/P2 外壳侧入口）：看已装清单、按本地目录安装、装载/停止/重载、卸载。
+ * 插件面板（P1/P2/P4 外壳侧入口）：看已装清单、按本地目录安装、装载/停止/重载、
+ * 卸载，以及**能力授权/撤销**。
  *
  * 分工与 `McpPanel` / `PermissionPanel` 一致：状态与动作在 `plugin-store`，这里只做
  * 「用户点了什么」的转发与确认交互。
@@ -11,8 +12,13 @@
  * | `disabled`（装好没跑/手动停了） | 加载、卸载 |
  * | `ready` | 停止、重载、卸载 |
  * | `crashed` | 加载（人工重来一次）、重载、卸载；并显示崩溃原因与自动重启次数 |
- * | `needs_grant` | 只有卸载；加载按钮置灰并说明「授权在 P4」——内核会直接回 6103 且不 spawn |
+ * | `needs_grant` | 卸载 + **详情里逐项授权**；授齐后重新加载才会亮 |
  * | `loading` | 动作全置灰，等内核落账本 |
+ *
+ * P4 的验收点在详情里的能力表：清单申请了什么、哪几项已授予、缺的那一项点一下就补。
+ * 撤销是**两段式**（第一下上膛、第二下才发请求），关键能力（`fs.write` /
+ * `net.fetch` / `llm.chat`）的上膛态把「撤了会连带卸载」直接写在按钮旁边——因为内核
+ * 撤关键能力会当场 `unload`，事后再解释就晚了。
  *
  * `crashed` 的展示是 P2 的验收点：光有红色标记不够，得说清**为什么崩**（`last_error`
  * 是内核写进账本的原话）与**自动重启过几次**（`restarts`，只在崩溃后自动重启成功时 +1，
@@ -22,26 +28,31 @@
  * （`crates/plugin/src/host.rs::auto_restart` + `crates/core/src/plugin_api.rs::sweep_crashed`），
  * 外壳只在下一轮 `plugin.list` / `plugin.status` 读到落好的账本。
  *
- * 唯一的行内二次确认是**卸载**：它会删掉账本条目与安装目录，属于不可撤销的动作，
- * 第一下只把按钮变成「确认卸载」。停止（`unload`）不删文件，所以不确认。
+ * 行内二次确认有两处：**卸载**（删账本 + 删安装目录）与**撤销关键能力**（连带卸载）。
+ * 停止（`unload`）不删文件、不撤能力，所以不确认。
  */
 
 import { useEffect, useState } from 'react'
 
 import {
+  describeRevokeImpact,
+  isKeyCapability,
   pluginCapabilityLabel,
   pluginIssueKindLabel,
   pluginStateLabel,
   pluginStateTone
 } from '../plugin-api'
 import {
+  cancelRevoke,
   dismissPluginError,
   dismissPluginHint,
+  grantCapabilities,
   initPlugins,
   installPlugin,
   loadPlugin,
   refreshPlugins,
   reloadPlugin,
+  revokeCapability,
   selectPlugin,
   setInstallPath,
   uninstallPlugin,
@@ -64,6 +75,13 @@ export function PluginPanel(): React.JSX.Element {
       ? null
       : (state.plugins.find((plugin) => plugin.id === state.selectedId) ?? null)
 
+  /**
+   * 详情里的授权/撤销按钮：任何一个动作在飞就全禁用（同一时刻只允许一个动作）。
+   * 单独取一份 `detail`：它是可变属性，箭头函数里读 `state.detail` 收窄不到。
+   */
+  const detailBusy = state.busyPlugin !== null
+  const detail = state.detail
+
   function onUninstall(pluginId: string): void {
     if (confirming === pluginId) {
       setConfirming(null)
@@ -78,8 +96,8 @@ export function PluginPanel(): React.JSX.Element {
       <h3 className="ai-section__title">插件</h3>
       <div className="ai-note">
         安装 = 校验清单 → 复制包目录 → 记账本，<strong>不启动进程</strong>；点行内「加载」才起子进程并握手，
-        成功后工具才进模型可见的工具表。授权（P4）与工具调用（P3）还没开放，所以「待授权」的插件
-        暂不能加载。
+        成功后工具才进模型可见的工具表。授权在「详情」里：逐项授权或「全部授权」，
+        <strong>撤销关键能力（fs.write / net.fetch / llm.chat）会让插件连带卸载</strong>，所以要确认第二下。
       </div>
 
       <div className="ai-note">
@@ -240,7 +258,7 @@ export function PluginPanel(): React.JSX.Element {
                   </button>
                   {/*
                     `needs_grant` 也摆一个「加载」，但**置灰**：内核会回 6103 且不 spawn
-                    （docs/14 §4.2 第 4 条），授权入口在 P4。摆而不点，比藏起来少一次困惑。
+                    （docs/14 §4.2 第 4 条）。点它之前得先到详情里把能力授齐。
                   */}
                   {plugin.state === 'needs_grant' ? (
                     <button
@@ -248,7 +266,7 @@ export function PluginPanel(): React.JSX.Element {
                       type="button"
                       data-testid={`plugin-load-${plugin.id}`}
                       disabled
-                      title="清单申请的能力还没授齐：内核会拒绝装载（6103），授权面板在 P4"
+                      title="清单申请的能力还没授齐：内核会拒绝装载（6103）。先在「详情」里授权"
                     >
                       加载
                     </button>
@@ -322,20 +340,148 @@ export function PluginPanel(): React.JSX.Element {
           </h3>
           {state.detailLoading ? (
             <p className="panel__hint">正在读取插件详情…</p>
-          ) : state.detail === null ? (
+          ) : detail === null ? (
             <p className="panel__hint">详情没拉回来，点「详情」重试。</p>
           ) : (
             <>
-              <div className="ai-list__meta">
-                已授予 {state.detail.plugin.granted_capabilities.length} 项 / 申请{' '}
-                {state.detail.plugin.capabilities.length} 项
-              </div>
-              <h4 className="plugin-detail__title">工具（{state.detail.tools.length}）</h4>
-              {state.detail.tools.length === 0 ? (
+              {/*
+                P4 验收点：能力清单要**能操作**。每行一项，已授予的给「撤销」，
+                未授予的给「授权」；撤销是两段式，上膛后这一行换成「确认撤销」+ 影响说明。
+                关键能力用 is-warn 的「关键」标记：它决定「撤了会不会连带卸载」，用户
+                必须在动手前看见，而不是在回执里才知道。
+              */}
+              <h4 className="plugin-detail__title">
+                能力（已授予 {detail.plugin.granted_capabilities.length} / 申请{' '}
+                {detail.plugin.capabilities.length}）
+              </h4>
+              {detail.plugin.capabilities.length === 0 ? (
+                <p className="panel__hint">清单没有申请任何能力：它只能做纯计算，碰不了文件与网络。</p>
+              ) : (
+                <>
+                  <div className="ai-row">
+                    <button
+                      className="ai-button ai-button--tiny ai-button--primary"
+                      type="button"
+                      data-testid="plugin-grant-all"
+                      disabled={
+                        detailBusy ||
+                        detail.plugin.capabilities.every((capability) =>
+                          detail.plugin.granted_capabilities.includes(capability)
+                        )
+                      }
+                      title="把清单申请的全部能力一次性授予（内核按清单逐项校验）"
+                      onClick={() => void grantCapabilities(detail.plugin.id)}
+                    >
+                      {detailBusy && state.busyAction === 'grant' ? '授权中…' : '全部授权'}
+                    </button>
+                  </div>
+                  <div className="ai-list" data-testid="plugin-capability-list">
+                    {detail.plugin.capabilities.map((capability) => {
+                      const granted = detail.plugin.granted_capabilities.includes(capability)
+                      const armed =
+                        state.pendingRevoke !== null &&
+                        state.pendingRevoke.pluginId === detail.plugin.id &&
+                        state.pendingRevoke.capability === capability
+                      const key = isKeyCapability(capability)
+                      return (
+                        <div
+                          className="ai-list__item"
+                          key={capability}
+                          data-testid={`plugin-cap-${capability}`}
+                        >
+                          <span className="plugin-item__name">
+                            <code>{capability}</code>{' '}
+                            <span className={`plugin-state ${granted ? 'is-ok' : 'is-warn'}`}>
+                              {granted ? '已授予' : '未授予'}
+                            </span>
+                            {key ? (
+                              <span
+                                className="plugin-state is-warn"
+                                title="关键能力：撤销会让插件连带卸载（进程停、工具下架）"
+                              >
+                                关键
+                              </span>
+                            ) : null}
+                          </span>
+
+                          {armed ? (
+                            <>
+                              <div
+                                className="ai-result ai-result--bad"
+                                data-testid={`plugin-revoke-impact-${capability}`}
+                              >
+                                {describeRevokeImpact(capability)}
+                              </div>
+                              <div className="ai-row">
+                                <button
+                                  className="ai-button ai-button--tiny ai-button--danger"
+                                  type="button"
+                                  data-testid={`plugin-revoke-confirm-${capability}`}
+                                  disabled={detailBusy}
+                                  onClick={() =>
+                                    void revokeCapability(detail.plugin.id, capability)
+                                  }
+                                >
+                                  {detailBusy && state.busyAction === 'revoke'
+                                    ? '撤销中…'
+                                    : key
+                                      ? '确认撤销并卸载'
+                                      : '确认撤销'}
+                                </button>
+                                <button
+                                  className="ai-button ai-button--tiny"
+                                  type="button"
+                                  data-testid={`plugin-revoke-cancel-${capability}`}
+                                  onClick={cancelRevoke}
+                                >
+                                  取消
+                                </button>
+                              </div>
+                            </>
+                          ) : (
+                            <div className="ai-row">
+                              {granted ? (
+                                <button
+                                  className="ai-button ai-button--tiny"
+                                  type="button"
+                                  data-testid={`plugin-revoke-${capability}`}
+                                  disabled={detailBusy}
+                                  title={
+                                    key
+                                      ? '撤销关键能力会让插件连带卸载，第一下只上膛'
+                                      : '撤销后下一次调用这项能力会被拒绝，第一下只上膛'
+                                  }
+                                  onClick={() =>
+                                    void revokeCapability(detail.plugin.id, capability)
+                                  }
+                                >
+                                  撤销
+                                </button>
+                              ) : (
+                                <button
+                                  className="ai-button ai-button--tiny"
+                                  type="button"
+                                  data-testid={`plugin-grant-${capability}`}
+                                  disabled={detailBusy}
+                                  onClick={() => void grantCapabilities(detail.plugin.id, [capability])}
+                                >
+                                  {detailBusy && state.busyAction === 'grant' ? '授权中…' : '授权'}
+                                </button>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      )
+                    })}
+                  </div>
+                </>
+              )}
+              <h4 className="plugin-detail__title">工具（{detail.tools.length}）</h4>
+              {detail.tools.length === 0 ? (
                 <p className="panel__hint">清单没有声明工具，或安装目录里的清单已不可读。</p>
               ) : (
                 <div className="ai-list">
-                  {state.detail.tools.map((tool) => (
+                  {detail.tools.map((tool) => (
                     <div className="ai-list__item" key={tool.namespaced_name}>
                       <span className="plugin-item__name">{tool.name}</span>
                       <span className="ai-list__meta">
@@ -345,12 +491,12 @@ export function PluginPanel(): React.JSX.Element {
                   ))}
                 </div>
               )}
-              <h4 className="plugin-detail__title">命令（{state.detail.commands.length}）</h4>
-              {state.detail.commands.length === 0 ? (
+              <h4 className="plugin-detail__title">命令（{detail.commands.length}）</h4>
+              {detail.commands.length === 0 ? (
                 <p className="panel__hint">没有声明命令。</p>
               ) : (
                 <div className="ai-list">
-                  {state.detail.commands.map((command) => (
+                  {detail.commands.map((command) => (
                     <div className="ai-list__item" key={command.name}>
                       <span className="plugin-item__name">{command.title}</span>
                       <span className="ai-list__meta">

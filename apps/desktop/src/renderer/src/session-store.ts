@@ -36,6 +36,12 @@ const SESSION_PAGE = 50
 /** 审计面板只看最近这些条：它是「刚才发生了什么」的回执，不是全量账本。 */
 const AUDIT_PAGE = 20
 
+/**
+ * 审计范围。插件事件（授权 / 调用）不挂会话，按会话过滤永远读不到——所以视图
+ * 必须能切到全局。
+ */
+export type AuditScope = 'session' | 'global'
+
 export interface SessionState {
   sessions: SessionView[]
   total: number
@@ -47,6 +53,10 @@ export interface SessionState {
   messagesTotal: number
   audit: AuditEventView[]
   auditTotal: number
+  /** 审计范围：本会话 / 全局（插件事件只在这里出现）。 */
+  auditScope: AuditScope
+  /** 审计类别过滤；`null` 表示不筛。 */
+  auditKind: string | null
   /** 列表首次加载 / 刷新中。 */
   loading: boolean
   /** 「加载更多」进行中：与首屏 `loading` 分开，否则翻页会把整列表打成占位文案。 */
@@ -70,6 +80,8 @@ function initialState(): SessionState {
     messagesTotal: 0,
     audit: [],
     auditTotal: 0,
+    auditScope: 'session',
+    auditKind: null,
     loading: false,
     loadingMore: false,
     auditLoading: false,
@@ -428,13 +440,58 @@ export async function forkSession(
 /** 拉当前会话的审计回执；`session_id` 为空时看全局（含跨会话事件）。 */
 export async function refreshAudit(sessionId: string | null = state.currentId): Promise<boolean> {
   try {
-    const result = await sessionApi.auditList({ session_id: sessionId, limit: AUDIT_PAGE, offset: 0 })
+    const result = await sessionApi.auditList({
+      ...auditQuery(sessionId),
+      limit: AUDIT_PAGE,
+      offset: 0
+    })
     setState({ audit: result.events ?? [], auditTotal: result.total ?? 0 })
     return true
   } catch (error) {
     setState({ audit: [], auditTotal: 0, error: describe(error) })
     return false
   }
+}
+
+/**
+ * 审计查询的「范围 + 类别」两组条件。
+ *
+ * 插件事件（`plugin.capability_changed` / `plugin.call` / `plugin.lifecycle`）**不挂
+ * 在任何会话上**——授权与调用是全局账本，所以按会话过滤永远看不到它们。视图因此
+ * 提供两档范围：本会话，或全局（含插件）。
+ */
+function auditQuery(sessionId: string | null): { session_id: string | null; kind: string | null } {
+  const scoped = state.auditScope === 'session'
+  return {
+    session_id: scoped ? (sessionId ?? null) : null,
+    kind: state.auditKind
+  }
+}
+
+/** 切换审计范围（本会话 / 全部含插件）并立即重拉第一页。 */
+export async function setAuditScope(scope: AuditScope): Promise<boolean> {
+  if (state.auditScope === scope) return true
+  setState({ auditScope: scope, audit: [], auditTotal: 0 })
+  return refreshAudit()
+}
+
+/**
+ * 切换审计类别过滤（`null` = 不筛）。
+ *
+ * 筛插件事件时必须把范围切到全局：本会话里根本没有那几行，筛完只会是空列表，
+ * 用户会以为「插件没记审计」。
+ */
+export async function setAuditKind(kind: string | null): Promise<boolean> {
+  const next = kind === null || kind.trim().length === 0 ? null : kind
+  const needGlobal = next !== null && next.startsWith('plugin.')
+  if (state.auditKind === next && !(needGlobal && state.auditScope === 'session')) return true
+  setState({
+    auditKind: next,
+    auditScope: needGlobal ? 'global' : state.auditScope,
+    audit: [],
+    auditTotal: 0
+  })
+  return refreshAudit()
 }
 
 /**
@@ -448,7 +505,7 @@ export async function loadMoreAudit(): Promise<boolean> {
   setState({ auditLoading: true, error: null })
   try {
     const result = await sessionApi.auditList({
-      session_id: state.currentId,
+      ...auditQuery(state.currentId),
       limit: AUDIT_PAGE,
       offset
     })
