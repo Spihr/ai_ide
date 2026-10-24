@@ -66,12 +66,18 @@ use ai_ide_protocol::dto::{
     PluginUnloadParams, PluginUnloadResult,
 };
 use ai_ide_protocol::{ErrorCode, ErrorObject, Request};
-use ai_ide_store::{plugin_status, NewPlugin, PluginRecord, Store, StoreError};
+use ai_ide_store::{audit_kind, plugin_status, NewPlugin, PluginRecord, Store, StoreError};
 use serde::de::DeserializeOwned;
+use serde_json::json;
 
 use crate::dispatch::parse_params;
 use crate::llm_runtime::default_data_dir;
 use crate::peer::Peer;
+use crate::plugin_audit::{
+    self, PluginAuditRow, ACTION_CALL, ACTION_GRANT, ACTION_LOAD, ACTION_RELOAD, ACTION_REVOKE,
+    ACTION_UNLOAD,
+};
+use crate::plugin_host::{DECISION_ALLOW, DECISION_DENY, DECISION_ERROR};
 use crate::session_api::store_of;
 use crate::state::AppState;
 
@@ -402,8 +408,39 @@ pub async fn load(peer: &Peer, state: &AppState, req: &Request) {
     sweep_crashed(state, store).await;
 
     match load_into(state, store, &plugin_id).await {
-        Ok(result) => peer.respond(&req.id, &result).await,
-        Err(err) => peer.respond_error(&req.id, &err).await,
+        Ok(result) => {
+            plugin_audit::record_user(
+                store,
+                PluginAuditRow::new(
+                    audit_kind::PLUGIN_LIFECYCLE,
+                    &plugin_id,
+                    ACTION_LOAD,
+                    DECISION_ALLOW,
+                )
+                .target(Some(result.plugin.id.as_str()))
+                .note("tools", json!(result.tools.len()))
+                .note("state", json!(result.plugin.state)),
+            )
+            .await;
+            peer.respond(&req.id, &result).await
+        }
+        Err(err) => {
+            // 起不来也是事件：审计里要能对上「面板上这个插件从 ready 掉成 crashed」
+            // 的那一刻，而不是只看到一次工具调用失败。
+            plugin_audit::record_user(
+                store,
+                PluginAuditRow::new(
+                    audit_kind::PLUGIN_LIFECYCLE,
+                    &plugin_id,
+                    ACTION_LOAD,
+                    DECISION_DENY,
+                )
+                .note("code", json!(err.code.as_i32()))
+                .note("message", json!(err.message)),
+            )
+            .await;
+            peer.respond_error(&req.id, &err).await
+        }
     }
 }
 
@@ -423,7 +460,20 @@ pub async fn unload(peer: &Peer, state: &AppState, req: &Request) {
 
     match store.get_plugin(&plugin_id).await {
         Ok(Some(_)) => {}
-        Ok(None) => return peer.respond_error(&req.id, &not_found(&plugin_id)).await,
+        Ok(None) => {
+            plugin_audit::record_user(
+                store,
+                PluginAuditRow::new(
+                    audit_kind::PLUGIN_LIFECYCLE,
+                    &plugin_id,
+                    ACTION_UNLOAD,
+                    DECISION_DENY,
+                )
+                .note("code", json!(ErrorCode::PLUGIN_NOT_FOUND.as_i32())),
+            )
+            .await;
+            return peer.respond_error(&req.id, &not_found(&plugin_id)).await;
+        }
         Err(err) => return peer.respond_error(&req.id, &store_error(err)).await,
     }
 
@@ -447,6 +497,19 @@ pub async fn unload(peer: &Peer, state: &AppState, req: &Request) {
     // 卸载后它的 host/* 授权一并作废：进程已经没了，留着这份授权只会让下一次
     // 同名重装继承上一轮的权限。
     state.plugin_host().set_granted_for(&plugin_id, Vec::new());
+
+    plugin_audit::record_user(
+        store,
+        PluginAuditRow::new(
+            audit_kind::PLUGIN_LIFECYCLE,
+            &plugin_id,
+            ACTION_UNLOAD,
+            DECISION_ALLOW,
+        )
+        .target(Some(plugin_id.as_str()))
+        .note("removedTools", json!(removed_tools)),
+    )
+    .await;
 
     tracing::info!(plugin_id = %plugin_id, removed_tools, "插件已卸载");
     peer.respond(
@@ -485,6 +548,19 @@ pub async fn reload(peer: &Peer, state: &AppState, req: &Request) {
 
     match load_into(state, store, &plugin_id).await {
         Ok(result) => {
+            plugin_audit::record_user(
+                store,
+                PluginAuditRow::new(
+                    audit_kind::PLUGIN_LIFECYCLE,
+                    &plugin_id,
+                    ACTION_RELOAD,
+                    DECISION_ALLOW,
+                )
+                .target(Some(result.plugin.id.as_str()))
+                .note("tools", json!(result.tools.len()))
+                .note("restarts", json!(result.plugin.restarts)),
+            )
+            .await;
             peer.respond(
                 &req.id,
                 &PluginReloadResult {
@@ -494,7 +570,21 @@ pub async fn reload(peer: &Peer, state: &AppState, req: &Request) {
             )
             .await
         }
-        Err(err) => peer.respond_error(&req.id, &err).await,
+        Err(err) => {
+            plugin_audit::record_user(
+                store,
+                PluginAuditRow::new(
+                    audit_kind::PLUGIN_LIFECYCLE,
+                    &plugin_id,
+                    ACTION_RELOAD,
+                    DECISION_DENY,
+                )
+                .note("code", json!(err.code.as_i32()))
+                .note("message", json!(err.message)),
+            )
+            .await;
+            peer.respond_error(&req.id, &err).await
+        }
     }
 }
 
@@ -996,23 +1086,98 @@ fn call_error(plugin_id: &str, method: &str, err: CallError) -> ErrorObject {
     }
 }
 
+/// 给 `plugin.call` 落一行审计（kind = `plugin.call`，`action` = `call`）。
+///
+/// `target` 记**方法名**而不是插件 id：插件 id 已经在 `pluginId` 里，而
+/// 「这个插件被要求干什么」才是排查时真正要看的（同一个插件十几个工具，
+/// 拒绝率往往集中在其中一两个）。`callId` 用请求 id——外壳拿它跟自己的日志对号。
+///
+/// 库没连上就跳过：审计写不进时不能让「调用本来成功了」变成失败。
+async fn audit_call(
+    state: &AppState,
+    call_id: &str,
+    plugin_id: &str,
+    method: &str,
+    decision: &str,
+    code: Option<i32>,
+    truncated: Option<bool>,
+) {
+    let Some(store) = state.store() else {
+        return;
+    };
+    let mut row = PluginAuditRow::new(audit_kind::PLUGIN_CALL, plugin_id, ACTION_CALL, decision)
+        .target(if method.is_empty() {
+            None
+        } else {
+            Some(method)
+        })
+        .call_id(Some(call_id));
+    if let Some(code) = code {
+        row = row.note("code", json!(code));
+    }
+    if let Some(truncated) = truncated {
+        row = row.note("truncated", json!(truncated));
+    }
+    plugin_audit::record(store, row).await;
+}
+
 /// `plugin.call`：调用网关（六步定序见 [`check_call`]）。
+///
+/// 每一次请求都落一行审计，**包括被拒的**：网关的四种拒绝（畸形请求 / 6101 /
+/// 6102 / 6106）在审计里各留一行 `deny`，否则「模型一直调不动某个插件」这件事
+/// 只能从插件自己的日志里猜——而插件恰恰是不可信的那一侧。
 pub async fn call(peer: &Peer, state: &AppState, req: &Request) {
     let Some(params) = require_params::<PluginCallParams>(peer, req).await else {
         return;
     };
     // ① 先校验、再碰库：畸形请求不该产生一次账本读。
     if let Err(err) = check_call_params(&params) {
+        // 畸形请求没有可信的 plugin_id / method，就按原始值记：审计要能看出
+        // 「有人发过一条指名不到插件的调用」，但不能替它编一个。
+        audit_call(
+            state,
+            &req.id,
+            params.plugin_id.trim(),
+            params.method.trim(),
+            DECISION_DENY,
+            Some(err.code.as_i32()),
+            None,
+        )
+        .await;
         return peer.respond_error(&req.id, &err).await;
     }
 
     let snapshot = match call_snapshot(state, params.plugin_id.trim()).await {
         Ok(snapshot) => snapshot,
-        Err(err) => return peer.respond_error(&req.id, &err).await,
+        Err(err) => {
+            audit_call(
+                state,
+                &req.id,
+                params.plugin_id.trim(),
+                params.method.trim(),
+                DECISION_DENY,
+                Some(err.code.as_i32()),
+                None,
+            )
+            .await;
+            return peer.respond_error(&req.id, &err).await;
+        }
     };
     let (plugin_id, method) = match check_call(&params, &snapshot) {
         Ok(pair) => pair,
-        Err(err) => return peer.respond_error(&req.id, &err).await,
+        Err(err) => {
+            audit_call(
+                state,
+                &req.id,
+                params.plugin_id.trim(),
+                params.method.trim(),
+                DECISION_DENY,
+                Some(err.code.as_i32()),
+                None,
+            )
+            .await;
+            return peer.respond_error(&req.id, &err).await;
+        }
     };
 
     // ⑤ 转发 `plugin/tool-invoke`：`params` 缺省按 `{}`，与插件侧的 schema 校验一致。
@@ -1023,9 +1188,21 @@ pub async fn call(peer: &Peer, state: &AppState, req: &Request) {
     let value = match state.plugins().call_tool(&plugin_id, &method, args).await {
         Ok(value) => value,
         Err(err) => {
-            return peer
-                .respond_error(&req.id, &call_error(&plugin_id, &method, err))
-                .await
+            let error = call_error(&plugin_id, &method, err);
+            // 插件自己失败（超时 / 协议 / 回包错误）记 `error` 而不是 `deny`：
+            // `deny` 是「内核不让」，`error` 是「内核放行了但插件没干成」，两者
+            // 的处理动作完全不同（前者改授权，后者修插件）。
+            audit_call(
+                state,
+                &req.id,
+                &plugin_id,
+                &method,
+                DECISION_ERROR,
+                Some(error.code.as_i32()),
+                None,
+            )
+            .await;
+            return peer.respond_error(&req.id, &error).await;
         }
     };
 
@@ -1039,6 +1216,16 @@ pub async fn call(peer: &Peer, state: &AppState, req: &Request) {
             "plugin.call 结果超限，已截断"
         );
     }
+    audit_call(
+        state,
+        &req.id,
+        &plugin_id,
+        &method,
+        DECISION_ALLOW,
+        None,
+        Some(truncated),
+    )
+    .await;
     peer.respond(
         &req.id,
         &PluginCallResult {
@@ -1154,8 +1341,45 @@ pub async fn grant(peer: &Peer, state: &AppState, req: &Request) {
     };
 
     match grant_capabilities(state, store, &plugin_id, &params.capabilities).await {
-        Ok(plugin) => peer.respond(&req.id, &PluginGrantResult { plugin }).await,
-        Err(err) => peer.respond_error(&req.id, &err).await,
+        Ok(plugin) => {
+            let granted = plugin.granted_capabilities.join(",");
+            plugin_audit::record_user(
+                store,
+                PluginAuditRow::new(
+                    audit_kind::PLUGIN_CAPABILITY_CHANGED,
+                    &plugin_id,
+                    ACTION_GRANT,
+                    DECISION_ALLOW,
+                )
+                .target(Some(&granted))
+                .note("capabilities", json!(plugin.granted_capabilities)),
+            )
+            .await;
+            peer.respond(&req.id, &PluginGrantResult { plugin }).await
+        }
+        Err(err) => {
+            // 失败的授权同样要留痕：审计要能回答「有人试图把这项能力开给这个插件，
+            // 但被拒了」。`target` 记用户想动的那几项，`capabilities` 留原样。
+            let wanted = params.capabilities.join(",");
+            plugin_audit::record_user(
+                store,
+                PluginAuditRow::new(
+                    audit_kind::PLUGIN_CAPABILITY_CHANGED,
+                    &plugin_id,
+                    ACTION_GRANT,
+                    DECISION_DENY,
+                )
+                .target(if wanted.is_empty() {
+                    None
+                } else {
+                    Some(&wanted)
+                })
+                .note("capabilities", json!(params.capabilities))
+                .note("code", json!(err.code.as_i32())),
+            )
+            .await;
+            peer.respond_error(&req.id, &err).await
+        }
     }
 }
 
@@ -1220,10 +1444,47 @@ pub async fn revoke(peer: &Peer, state: &AppState, req: &Request) {
 
     match revoke_capabilities(state, store, &plugin_id, &params.capabilities).await {
         Ok((plugin, unloaded)) => {
+            let revoked = params.capabilities.join(",");
+            plugin_audit::record_user(
+                store,
+                PluginAuditRow::new(
+                    audit_kind::PLUGIN_CAPABILITY_CHANGED,
+                    &plugin_id,
+                    ACTION_REVOKE,
+                    DECISION_ALLOW,
+                )
+                .target(Some(&revoked))
+                .note("capabilities", json!(params.capabilities))
+                // 撤前提能力会连带卸载，这件事必须在同一行里看得见——否则审计上
+                // 只剩「撤销了 fs.write」，解释不了插件进程为什么跟着没了。
+                .note("unloaded", json!(unloaded))
+                .note("granted", json!(plugin.granted_capabilities)),
+            )
+            .await;
             peer.respond(&req.id, &PluginRevokeResult { plugin, unloaded })
                 .await
         }
-        Err(err) => peer.respond_error(&req.id, &err).await,
+        Err(err) => {
+            let wanted = params.capabilities.join(",");
+            plugin_audit::record_user(
+                store,
+                PluginAuditRow::new(
+                    audit_kind::PLUGIN_CAPABILITY_CHANGED,
+                    &plugin_id,
+                    ACTION_REVOKE,
+                    DECISION_DENY,
+                )
+                .target(if wanted.is_empty() {
+                    None
+                } else {
+                    Some(&wanted)
+                })
+                .note("capabilities", json!(params.capabilities))
+                .note("code", json!(err.code.as_i32())),
+            )
+            .await;
+            peer.respond_error(&req.id, &err).await
+        }
     }
 }
 
@@ -1825,5 +2086,269 @@ mod tests {
         assert!(!snapshot.running);
         let err = check_call(&call_params("nope", "echo"), &snapshot).expect_err("不存在应 6101");
         assert_eq!(err.code, ErrorCode::PLUGIN_NOT_FOUND);
+    }
+
+    // ---------------------------------------------------------------- 审计闭环
+    //
+    // 这一节验的是**处理器**而不是业务内核：审计行由 `grant` / `revoke` / `call` /
+    // `load` / `unload` 这些 `Peer` 入口落库，只测 `*_capabilities` 看不到任何一行。
+
+    use ai_ide_store::{audit_actor, AuditQuery};
+
+    fn request(id: &str, method: &str, params: serde_json::Value) -> Request {
+        Request::new(id, method, Some(params))
+    }
+
+    /// 取某个 kind 下的全部审计行。`audit.list` 的实现就是这条查询
+    /// （`AuditQuery::kind` + `list_audit`），所以这里查得到就等于协议侧查得到。
+    async fn rows_of_kind(store: &Store, kind: &str) -> Vec<ai_ide_store::AuditEvent> {
+        store
+            .list_audit(AuditQuery::new().kind(kind).with_limit(100))
+            .await
+            .expect("审计查询应成功")
+    }
+
+    /// 授权成功与被拒各留一行，五个基础字段齐全。
+    #[tokio::test]
+    async fn grant_records_allow_and_deny_rows() {
+        let (state, store) = seeded(&["fs.read", "search"]).await;
+        let peer = Peer::new();
+
+        let ok = request(
+            "req-grant-ok",
+            ai_ide_protocol::methods::plugin::GRANT,
+            json!({ "plugin_id": PLUGIN_ID, "capabilities": ["fs.read"] }),
+        );
+        grant(&peer, &state, &ok).await;
+
+        // 清单外的能力：业务侧拒了，但审计必须留下「有人试图开 shell.exec」。
+        let deny = request(
+            "req-grant-deny",
+            ai_ide_protocol::methods::plugin::GRANT,
+            json!({ "plugin_id": PLUGIN_ID, "capabilities": ["shell.exec"] }),
+        );
+        grant(&peer, &state, &deny).await;
+
+        let rows = rows_of_kind(&store, audit_kind::PLUGIN_CAPABILITY_CHANGED).await;
+        assert_eq!(
+            rows.len(),
+            2,
+            "成功与失败各一行，一次请求不能两行也不能零行"
+        );
+
+        let allow = rows
+            .iter()
+            .find(|row| row.detail["decision"] == DECISION_ALLOW)
+            .expect("授权成功必须留行");
+        assert_eq!(
+            allow.actor,
+            audit_actor::USER,
+            "是用户点的，不是插件自己开的"
+        );
+        assert_eq!(allow.detail["pluginId"], PLUGIN_ID);
+        assert_eq!(allow.detail["action"], ACTION_GRANT);
+        assert_eq!(allow.detail["target"], "fs.read");
+        assert_eq!(allow.detail["capabilities"], json!(["fs.read"]));
+        assert!(
+            allow.detail["callId"].is_null(),
+            "能力变更不是调用，callId 要留空而不是编一个"
+        );
+
+        let rejected = rows
+            .iter()
+            .find(|row| row.detail["decision"] == DECISION_DENY)
+            .expect("被拒的授权也要留行");
+        assert_eq!(rejected.detail["action"], ACTION_GRANT);
+        assert_eq!(rejected.detail["target"], "shell.exec");
+        assert_eq!(
+            rejected.detail["code"],
+            json!(ErrorCode::INVALID_PARAMS.as_i32())
+        );
+    }
+
+    /// 撤销同样一行：`target` 是撤掉的那项能力，`unloaded` 说清有没有连带下架。
+    #[tokio::test]
+    async fn revoke_records_capability_row_with_unloaded_flag() {
+        let (state, store) = seeded(&["fs.read", "fs.write"]).await;
+        let peer = Peer::new();
+
+        grant_capabilities(&state, &store, PLUGIN_ID, &[])
+            .await
+            .expect("先全部授权");
+
+        let revoke_req = request(
+            "req-revoke",
+            ai_ide_protocol::methods::plugin::REVOKE,
+            json!({ "plugin_id": PLUGIN_ID, "capabilities": ["fs.write"] }),
+        );
+        revoke(&peer, &state, &revoke_req).await;
+
+        let rows = rows_of_kind(&store, audit_kind::PLUGIN_CAPABILITY_CHANGED).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "只该有撤销这一行（授权走的是业务内核，没经过处理器）"
+        );
+        let row = &rows[0];
+        assert_eq!(row.detail["action"], ACTION_REVOKE);
+        assert_eq!(row.detail["decision"], DECISION_ALLOW);
+        assert_eq!(row.detail["target"], "fs.write");
+        assert_eq!(
+            row.detail["unloaded"],
+            json!(false),
+            "插件本来就没在跑，不能谎报卸载过"
+        );
+        assert_eq!(row.detail["granted"], json!(["fs.read"]));
+    }
+
+    /// 网关的三种拒绝各留一行，`callId` 用请求 id，能从审计对回外壳日志。
+    #[tokio::test]
+    async fn call_gateway_records_deny_rows_with_call_id() {
+        let (state, store) = seeded(&["fs.read"]).await;
+        let peer = Peer::new();
+
+        let not_found = request(
+            "req-call-404",
+            ai_ide_protocol::methods::plugin::CALL,
+            json!({ "plugin_id": "ghost", "method": "echo" }),
+        );
+        call(&peer, &state, &not_found).await;
+
+        // 装了但没装载：6102，同样要留痕。
+        let crashed = request(
+            "req-call-6102",
+            ai_ide_protocol::methods::plugin::CALL,
+            json!({ "plugin_id": PLUGIN_ID, "method": "echo" }),
+        );
+        call(&peer, &state, &crashed).await;
+
+        // 畸形请求：method 是空的，仍要能看出「发生过一次指名不到工具的调用」。
+        let malformed = request(
+            "req-call-bad",
+            ai_ide_protocol::methods::plugin::CALL,
+            json!({ "plugin_id": PLUGIN_ID, "method": "  " }),
+        );
+        call(&peer, &state, &malformed).await;
+
+        let rows = rows_of_kind(&store, audit_kind::PLUGIN_CALL).await;
+        assert_eq!(rows.len(), 3, "被拒的调用同样是一次尝试");
+
+        for row in &rows {
+            assert_eq!(row.detail["action"], ACTION_CALL);
+            assert_eq!(row.detail["decision"], DECISION_DENY);
+            assert_eq!(row.actor, audit_actor::PLUGIN);
+        }
+
+        let row = rows
+            .iter()
+            .find(|row| row.detail["callId"] == "req-call-404")
+            .expect("callId 必须与请求 id 一致");
+        assert_eq!(row.detail["pluginId"], "ghost");
+        assert_eq!(row.detail["target"], "echo");
+        assert_eq!(
+            row.detail["code"],
+            json!(ErrorCode::PLUGIN_NOT_FOUND.as_i32())
+        );
+
+        let row = rows
+            .iter()
+            .find(|row| row.detail["callId"] == "req-call-6102")
+            .expect("6102 那次也要留行");
+        assert_eq!(row.detail["pluginId"], PLUGIN_ID);
+        assert_eq!(
+            row.detail["code"],
+            json!(ErrorCode::PLUGIN_CRASHED.as_i32())
+        );
+
+        let row = rows
+            .iter()
+            .find(|row| row.detail["callId"] == "req-call-bad")
+            .expect("畸形请求也要留行");
+        assert!(row.detail["target"].is_null(), "空方法不能编出一个 target");
+    }
+
+    /// 生命周期：卸载成功与被拒（插件不存在）都落 `plugin.lifecycle`。
+    #[tokio::test]
+    async fn unload_records_lifecycle_rows() {
+        let (state, store) = seeded(&["fs.read"]).await;
+        let peer = Peer::new();
+
+        let ok = request(
+            "req-unload",
+            ai_ide_protocol::methods::plugin::UNLOAD,
+            json!({ "plugin_id": PLUGIN_ID }),
+        );
+        unload(&peer, &state, &ok).await;
+
+        let deny = request(
+            "req-unload-404",
+            ai_ide_protocol::methods::plugin::UNLOAD,
+            json!({ "plugin_id": "ghost" }),
+        );
+        unload(&peer, &state, &deny).await;
+
+        let rows = rows_of_kind(&store, audit_kind::PLUGIN_LIFECYCLE).await;
+        assert_eq!(rows.len(), 2);
+
+        let allowed = rows
+            .iter()
+            .find(|row| row.detail["decision"] == DECISION_ALLOW)
+            .expect("卸载成功要留行");
+        assert_eq!(allowed.detail["action"], ACTION_UNLOAD);
+        assert_eq!(allowed.detail["target"], PLUGIN_ID);
+        assert_eq!(allowed.detail["removedTools"], json!(0));
+        assert_eq!(allowed.actor, audit_actor::USER);
+
+        let rejected = rows
+            .iter()
+            .find(|row| row.detail["decision"] == DECISION_DENY)
+            .expect("卸载一个不存在的插件也要留行");
+        assert_eq!(rejected.detail["pluginId"], "ghost");
+        assert_eq!(
+            rejected.detail["code"],
+            json!(ErrorCode::PLUGIN_NOT_FOUND.as_i32())
+        );
+    }
+
+    /// 审计对插件是只读且不可达的：`HostApi` 里没有任何 `audit.*` 方法，
+    /// 仓储层也没有删改接口——插件既查不到别人干了什么，也擦不掉自己那一行。
+    #[tokio::test]
+    async fn plugins_cannot_reach_or_rewrite_audit() {
+        let (state, store) = seeded(&["fs.read"]).await;
+        let peer = Peer::new();
+
+        let grant_req = request(
+            "req-audit-proof",
+            ai_ide_protocol::methods::plugin::GRANT,
+            json!({ "plugin_id": PLUGIN_ID, "capabilities": [] }),
+        );
+        grant(&peer, &state, &grant_req).await;
+
+        // `audit.list` 的查询条件：kind + 分页，能查到刚才那一行。
+        let query = AuditQuery::new().kind(audit_kind::PLUGIN_CAPABILITY_CHANGED);
+        assert_eq!(
+            store.count_audit(&query.filter).await.expect("计数应成功"),
+            1
+        );
+
+        // 插件侧：连方法都没有，谈不上删改。
+        for method in ["host/audit.list", "host/audit.clear", "host/audit.prune"] {
+            let err = gate(&state, method, json!({})).expect_err("插件不该有审计入口");
+            assert_eq!(
+                err.code,
+                HostApiError::METHOD_NOT_FOUND,
+                "{method} 不该存在于宿主能力表"
+            );
+        }
+
+        // 行数只增：再发生一次事件只会多一行，没有任何「覆盖」的路径。
+        let revoke_req = request(
+            "req-audit-proof-2",
+            ai_ide_protocol::methods::plugin::REVOKE,
+            json!({ "plugin_id": PLUGIN_ID, "capabilities": ["fs.read"] }),
+        );
+        revoke(&peer, &state, &revoke_req).await;
+        let rows = rows_of_kind(&store, audit_kind::PLUGIN_CAPABILITY_CHANGED).await;
+        assert_eq!(rows.len(), 2, "旧行不能被新事件顶掉");
     }
 }

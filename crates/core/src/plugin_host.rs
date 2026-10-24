@@ -395,6 +395,11 @@ impl FsHostApi {
         } = entry;
         let mut detail = json!({
             "pluginId": plugin_id,
+            // `action` 与 `method` 同值：P4 切片四把能力变更 / 工具调用 / 生命周期
+            // 的明细字段统一成 `pluginId / action / target / decision / callId`，
+            // 审计面板一条渲染逻辑就能覆盖全部插件事件。`method` 保留是为了不
+            // 打破 P3.5 已有的查询与测试。
+            "action": method,
             "method": method,
             "capability": capability,
             "target": target,

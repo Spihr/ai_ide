@@ -315,6 +315,18 @@ pub mod audit_kind {
     /// 每一次 `host/*` 都记一行，包括被拒（能力/路径）与配额超限——审计要能
     /// 回答「这个插件试过什么」，而不只是「它成功读了什么」。
     pub const PLUGIN_HOST_CALL: &str = "plugin.host_call";
+    /// 插件能力位变更（P4 切片四）：`plugin.grant` / `plugin.revoke` 各落一行。
+    ///
+    /// 能力面的每一次开 / 关都要能回答「谁在什么时候把 `fs.write` 给了这个插件」。
+    /// 只记成功的变更不够——一次被拒的撤销同样是值得留痕的意图。
+    pub const PLUGIN_CAPABILITY_CHANGED: &str = "plugin.capability_changed";
+    /// 通过 `plugin.call` 网关发起的一次工具调用（P4 切片四）。
+    ///
+    /// 与 [`PLUGIN_HOST_CALL`] 的区别是**方向**：这条是外面的调用进来（模型 /
+    /// 外壳 → 插件工具），那条是插件向外要能力（插件 → 宿主）。
+    pub const PLUGIN_CALL: &str = "plugin.call";
+    /// 插件进程生命周期（P4 切片四）：`plugin.load` / `unload` / `reload`。
+    pub const PLUGIN_LIFECYCLE: &str = "plugin.lifecycle";
 }
 
 /// 审计事件的发起方。
