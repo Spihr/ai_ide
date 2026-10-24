@@ -12,8 +12,10 @@
 //! | `plugin.load` | 授权齐备 → 起子进程 → 握手 → 校验工具集合 → 落 `ready`；失败按类落账本 |
 //! | `plugin.unload` | 停进程 → 工具下架 → 落 `installed` |
 //! | `plugin.reload` | 停 + 起，账本 `restarts` 不变（那计数只记崩溃后的自动重启） |
+//! | `plugin.grant` | 授权位落账本 → 当场回写运行态授权集（不 reload 即生效） |
+//! | `plugin.revoke` | 撤授权位 → 回写授权集；撤掉关键能力则连带 `unload` 并退回 `needs_grant` |
 //!
-//! `call` / `grant` / `revoke` 仍是 6101：它们属于 P3/P4（网关与授权面板）。
+//! `call` 仍是 6101：它属于 P4 的网关切片，本切片只做授权面。
 //! 「安装全程不产生进程」这条 P1 验收仍成立——只有 `load` / `reload` 与崩溃后的
 //! 自动重启会 `spawn`。
 //!
@@ -56,11 +58,12 @@ use std::path::{Path, PathBuf};
 use ai_ide_plugin::host::{LoadError, LoadSpec, Restart};
 use ai_ide_plugin::{details_json, install as install_package, manifest, PackageError};
 use ai_ide_protocol::dto::{
-    PluginCallParams, PluginCommandSummary, PluginGrantParams, PluginInstallParams,
-    PluginInstallResult, PluginListParams, PluginListResult, PluginLoadParams, PluginLoadResult,
-    PluginReloadParams, PluginReloadResult, PluginRevokeParams, PluginState, PluginStatusParams,
-    PluginStatusResult, PluginSummary, PluginToolRisk, PluginToolSummary, PluginUninstallParams,
-    PluginUninstallResult, PluginUnloadParams, PluginUnloadResult,
+    PluginCallParams, PluginCommandSummary, PluginGrantParams, PluginGrantResult,
+    PluginInstallParams, PluginInstallResult, PluginListParams, PluginListResult, PluginLoadParams,
+    PluginLoadResult, PluginReloadParams, PluginReloadResult, PluginRevokeParams,
+    PluginRevokeResult, PluginState, PluginStatusParams, PluginStatusResult, PluginSummary,
+    PluginToolRisk, PluginToolSummary, PluginUninstallParams, PluginUninstallResult,
+    PluginUnloadParams, PluginUnloadResult,
 };
 use ai_ide_protocol::{methods, ErrorCode, ErrorObject, Request};
 use ai_ide_store::{plugin_status, NewPlugin, PluginRecord, Store, StoreError};
@@ -830,26 +833,247 @@ pub async fn call(peer: &Peer, _state: &AppState, req: &Request) {
     not_wired(peer, req, methods::plugin::CALL).await;
 }
 
-/// `plugin.grant`：授予能力（P2）。
-pub async fn grant(peer: &Peer, _state: &AppState, req: &Request) {
-    if require_params::<PluginGrantParams>(peer, req)
-        .await
-        .is_none()
-    {
-        return;
-    }
-    not_wired(peer, req, methods::plugin::GRANT).await;
+// ---------------------------------------------------------------------------
+// 授权面（P4 切片一：grant / revoke）
+// ---------------------------------------------------------------------------
+
+/// 关键能力：撤销后插件已经无法履行清单承诺，必须连带卸载（docs/14 §4.2 硬规则 3）。
+///
+/// 判据是「撤掉之后工具还能不能干活」，不是「名字看起来像不像写操作」：
+///
+/// - 读类（`fs.read` / `search` / `workspace.info`）撤销只是**收窄可读面**：插件照常
+///   跑，撞上闸门的那一次 `host/*` 当场拿 6103，模型读得懂「这条路被封了」；
+/// - 写 / 网络 / 外部模型能力是**工具承诺的前提**（清单里 `risk=write` 的工具没有
+///   `fs.write` 必然失败）。继续把它挂在工具表里，只会让模型陷进「调用→6103」的
+///   重试循环，所以整个插件下架。
+const KEY_CAPABILITIES: &[&str] = &["fs.write", "net.fetch", "llm.chat"];
+
+fn is_key_capability(capability: &str) -> bool {
+    KEY_CAPABILITIES.contains(&capability)
 }
 
-/// `plugin.revoke`：撤销能力（P2）。
-pub async fn revoke(peer: &Peer, _state: &AppState, req: &Request) {
-    if require_params::<PluginRevokeParams>(peer, req)
-        .await
-        .is_none()
-    {
-        return;
+/// 把请求里的能力名折成「这次真正要动的清单项」。
+///
+/// 三条规则，都在防「静默成功」：
+///
+/// 1. 空串不接受：`[""]` 看着像「一项没指定」，写进 SQL 却是一行都改不到，
+///    回头报成功就成了撒谎；
+/// 2. 清单没申请过的能力直接拒（`-32602` + `capability` 字段）：`set_plugin_capability`
+///    的 `Ok(None)` 就是这个意思，不能让拼错的名字被当成「撤掉了」；
+/// 3. 去重但保序：一次请求里重复写同一能力不该产生两行 UPDATE。
+fn resolve_capabilities(
+    plugin_id: &str,
+    wanted: &[String],
+    requested: &[String],
+    empty_means_all: bool,
+) -> Result<Vec<String>, ErrorObject> {
+    if wanted.iter().any(|capability| capability.trim().is_empty()) {
+        return Err(ErrorObject::invalid_params(
+            "capabilities 里不能有空字符串；留空数组才表示「全部」",
+        )
+        .with_data(serde_json::json!({ "plugin_id": plugin_id })));
     }
-    not_wired(peer, req, methods::plugin::REVOKE).await;
+
+    let source: Vec<String> = if wanted.is_empty() {
+        if empty_means_all {
+            requested.to_vec()
+        } else {
+            return Err(ErrorObject::invalid_params(
+                "capabilities 不能为空：撤销至少要指名一项能力",
+            )
+            .with_data(serde_json::json!({ "plugin_id": plugin_id })));
+        }
+    } else {
+        wanted
+            .iter()
+            .map(|capability| capability.trim().to_string())
+            .collect()
+    };
+
+    let mut targets: Vec<String> = Vec::new();
+    for capability in source {
+        if !requested.iter().any(|applied| applied == &capability) {
+            return Err(ErrorObject::invalid_params(format!(
+                "插件 {plugin_id} 的清单里没有申请能力 {capability}"
+            ))
+            .with_data(serde_json::json!({
+                "plugin_id": plugin_id,
+                "capability": capability,
+                "requested": requested,
+            })));
+        }
+        if !targets.contains(&capability) {
+            targets.push(capability);
+        }
+    }
+    Ok(targets)
+}
+
+/// 读账本里的插件记录，顺带把「不存在」折成 6100。
+async fn plugin_record(store: &Store, plugin_id: &str) -> Result<PluginRecord, ErrorObject> {
+    match store.get_plugin(plugin_id).await {
+        Ok(Some(record)) => Ok(record),
+        Ok(None) => Err(not_found(plugin_id)),
+        Err(err) => Err(store_error(err)),
+    }
+}
+
+/// `plugin.grant`：授予能力。
+///
+/// 两步都要做，缺一步就是「账本说授权了、插件却还用不了」：
+/// 先把授权位写进 `plugin_capability`（持久化，重启后仍在），再把当前授权集
+/// `set_granted_for` 灌进 `FsHostApi`（运行态，下一次 `host/*` 当场生效）。
+pub async fn grant(peer: &Peer, state: &AppState, req: &Request) {
+    let Some(params) = require_params::<PluginGrantParams>(peer, req).await else {
+        return;
+    };
+    let Some(plugin_id) = require_plugin_id(peer, req, &params.plugin_id).await else {
+        return;
+    };
+    let store = match store_of(state) {
+        Ok(store) => store,
+        Err(err) => return peer.respond_error(&req.id, &err).await,
+    };
+
+    match grant_capabilities(state, store, &plugin_id, &params.capabilities).await {
+        Ok(plugin) => peer.respond(&req.id, &PluginGrantResult { plugin }).await,
+        Err(err) => peer.respond_error(&req.id, &err).await,
+    }
+}
+
+/// `grant` 的业务内核（不碰 `Peer`，便于单测直接驱动）。
+pub async fn grant_capabilities(
+    state: &AppState,
+    store: &Store,
+    plugin_id: &str,
+    wanted: &[String],
+) -> Result<PluginSummary, ErrorObject> {
+    let record = plugin_record(store, plugin_id).await?;
+    let requested = capabilities_of(&record);
+    // 空数组 = 授予清单里申请的全部能力（面板「一键同意」走的这条路）。
+    let targets = resolve_capabilities(plugin_id, wanted, &requested, true)?;
+
+    for capability in &targets {
+        match store
+            .set_plugin_capability(plugin_id, capability, true)
+            .await
+        {
+            Ok(Some(_)) => {}
+            // 上面已按清单一对一校验过，走到这里说明记录在两步之间被删了。
+            Ok(None) => return Err(not_found(plugin_id)),
+            Err(err) => return Err(store_error(err)),
+        }
+    }
+
+    // 授权只增不减，直接按账本重算：不差分比差分安全（漏算一项就白授权了）。
+    let granted = store
+        .granted_capabilities(plugin_id)
+        .await
+        .map_err(store_error)?;
+    // 落账本只是「记下来」，运行态要单独灌：`FsHostApi` 的授权集是内存快照，
+    // 不回写的话新授权的插件得等到下次 `reload` 才拿得到能力。
+    state
+        .plugin_host()
+        .set_granted_for(plugin_id, granted.clone());
+
+    let record = plugin_record(store, plugin_id).await?;
+    Ok(summary_from_record(&record, &requested, &granted))
+}
+
+/// `plugin.revoke`：撤销能力。
+///
+/// 与 `grant` 对称，但多了两件撤销特有的事：
+///
+/// 1. **关键能力连带卸载**：撤掉 `fs.write` 之类的前提能力后，插件已无法履行清单
+///    承诺，规则是立刻 `unload`（不重启），工具下架、状态退回 `needs_grant`；
+/// 2. **运行态授权集当场回写**：非关键能力撤销时进程还在跑，如果不回写，
+///    插件能一直用到下次 `reload` 才被拦——那等于撤销按钮是假的。
+pub async fn revoke(peer: &Peer, state: &AppState, req: &Request) {
+    let Some(params) = require_params::<PluginRevokeParams>(peer, req).await else {
+        return;
+    };
+    let Some(plugin_id) = require_plugin_id(peer, req, &params.plugin_id).await else {
+        return;
+    };
+    let store = match store_of(state) {
+        Ok(store) => store,
+        Err(err) => return peer.respond_error(&req.id, &err).await,
+    };
+
+    match revoke_capabilities(state, store, &plugin_id, &params.capabilities).await {
+        Ok((plugin, unloaded)) => {
+            peer.respond(&req.id, &PluginRevokeResult { plugin, unloaded })
+                .await
+        }
+        Err(err) => peer.respond_error(&req.id, &err).await,
+    }
+}
+
+/// `revoke` 的业务内核，返回（撤销后的摘要，是否连带卸载）。
+pub async fn revoke_capabilities(
+    state: &AppState,
+    store: &Store,
+    plugin_id: &str,
+    wanted: &[String],
+) -> Result<(PluginSummary, bool), ErrorObject> {
+    let record = plugin_record(store, plugin_id).await?;
+    let requested = capabilities_of(&record);
+    let targets = resolve_capabilities(plugin_id, wanted, &requested, false)?;
+
+    for capability in &targets {
+        match store
+            .set_plugin_capability(plugin_id, capability, false)
+            .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => return Err(not_found(plugin_id)),
+            Err(err) => return Err(store_error(err)),
+        }
+    }
+
+    let granted = store
+        .granted_capabilities(plugin_id)
+        .await
+        .map_err(store_error)?;
+
+    let critical = targets
+        .iter()
+        .any(|capability| is_key_capability(capability));
+    let was_running = state.plugins().is_running(plugin_id);
+    let unloaded = critical && was_running;
+    if unloaded {
+        // 不重启：撤掉前提能力的插件起来也只会一路 6103，重试没有意义。
+        state.plugins().unload(plugin_id).await;
+        tracing::info!(plugin_id = %plugin_id, capabilities = ?targets, "撤销关键能力，连带卸载插件");
+    }
+
+    if critical {
+        // 撤销前它是 `ready`（刚被停掉），就不能再对外报「就绪」：清单缺了一项，
+        // 只能退回 `needs_grant` 重新征询。`installed` / `needs_grant` 已由仓储层的
+        // `refresh_grant_status` 处理；`crashed` 保留原样——崩溃原因比这次撤销更
+        // 值得留在面板上。
+        let current = plugin_record(store, plugin_id).await?;
+        if current.status == plugin_status::READY {
+            store
+                .set_plugin_status(plugin_id, plugin_status::NEEDS_GRANT, None)
+                .await
+                .map_err(store_error)?;
+        }
+    }
+
+    // 连带卸载时清空（与 `unload` 同一口径），否则把剩余授权集灌回去 —— 下一次
+    // `host/*` 就地撞 6103，不必等 reload。
+    state.plugin_host().set_granted_for(
+        plugin_id,
+        if unloaded {
+            Vec::new()
+        } else {
+            granted.clone()
+        },
+    );
+
+    let record = plugin_record(store, plugin_id).await?;
+    Ok((summary_from_record(&record, &requested, &granted), unloaded))
 }
 
 // ---------------------------------------------------------------------------
@@ -969,5 +1193,224 @@ fn store_error(err: StoreError) -> ErrorObject {
     match err {
         StoreError::PluginNotFound(id) => not_found(&id),
         other => ErrorObject::new(ErrorCode::STORE_ERROR, format!("插件账本读写失败：{other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ai_ide_plugin::{HostApi, HostApiError};
+    use ai_ide_store::NewPlugin;
+
+    const PLUGIN_ID: &str = "demo-plugin";
+
+    /// 造一条「已安装、能力全未授权」的账本记录，并把它挂进 `AppState`。
+    ///
+    /// 用真库（内存 SQLite）而不是桩：授权位写入与 `refresh_grant_status` 的状态
+    /// 迁移本身就是这次要验的行为，桩掉就只剩「函数被调用过」这种什么也证明不了的断言。
+    async fn seeded(capabilities: &[&str]) -> (AppState, Store) {
+        let store = Store::open_in_memory().await.expect("内存库应能打开");
+        let capabilities_json = serde_json::to_string(capabilities).unwrap();
+        let flags: Vec<(&str, bool)> = capabilities
+            .iter()
+            .map(|capability| (*capability, false))
+            .collect();
+        store
+            .save_plugin(
+                NewPlugin {
+                    id: PLUGIN_ID,
+                    name: "演示插件",
+                    version: "1.0.0",
+                    description: None,
+                    plugin_api: "1.0",
+                    main: "index.mjs",
+                    install_dir: "C:/tmp/demo-plugin",
+                    manifest_json: "{}",
+                    capabilities_json: &capabilities_json,
+                    commands_json: "[]",
+                    subscriptions_json: "[]",
+                    tool_count: 1,
+                    status: plugin_status::NEEDS_GRANT,
+                    installed_at: None,
+                },
+                &flags,
+            )
+            .await
+            .expect("账本写入应成功");
+
+        let state = AppState::new();
+        state.install_store(store.clone());
+        (state, store)
+    }
+
+    /// 直接撞宿主能力闸门，只关心「放行 / 6103」。
+    fn gate(
+        state: &AppState,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, HostApiError> {
+        state.plugin_host().call(PLUGIN_ID, method, &params)
+    }
+
+    /// 授权一次之后，运行态授权集立刻生效：不必 reload，`host/fs.read` 不再撞 6103。
+    #[tokio::test]
+    async fn grant_writes_ledger_and_runtime_grants_without_reload() {
+        let (state, store) = seeded(&["fs.read", "search"]).await;
+
+        // 授权前：运行态还没有这个插件 → 6103。
+        let err = gate(
+            &state,
+            "host/fs.read",
+            serde_json::json!({ "path": "a.txt" }),
+        )
+        .expect_err("未授权的插件不该读到任何东西");
+        assert_eq!(err.code, HostApiError::UNAUTHORIZED);
+
+        // 空数组 = 授予清单里的全部能力。
+        let summary = grant_capabilities(&state, &store, PLUGIN_ID, &[])
+            .await
+            .expect("一键授权应成功");
+        assert_eq!(
+            summary.granted_capabilities,
+            vec!["fs.read".to_string(), "search".to_string()]
+        );
+        // 状态从 `needs_grant` 走回 `installed`（协议侧叫 `Disabled`：装好了但没加载）。
+        assert_eq!(summary.state, PluginState::Disabled);
+
+        // 账本落盘：换个读法再确认一次，防「返回值对、库没写」。
+        let persisted = store.granted_capabilities(PLUGIN_ID).await.unwrap();
+        assert_eq!(persisted, vec!["fs.read".to_string(), "search".to_string()]);
+
+        // 运行态：能力闸门已放行，接下来的失败只可能是别的原因（没开工作区 / 文件不存在），
+        // 绝不能还是 6103。
+        let err = gate(
+            &state,
+            "host/fs.read",
+            serde_json::json!({ "path": "a.txt" }),
+        )
+        .expect_err("没开工作区，读不到文件");
+        assert_ne!(err.code, HostApiError::UNAUTHORIZED);
+    }
+
+    /// 撤销读类能力：插件还在跑（不卸载），但下一次 `host/*` 当场 6103。
+    #[tokio::test]
+    async fn revoke_takes_effect_on_next_host_call_without_reload() {
+        let (state, store) = seeded(&["fs.read", "search"]).await;
+        grant_capabilities(&state, &store, PLUGIN_ID, &[])
+            .await
+            .expect("一键授权应成功");
+        // 授权后闸门放行：没开工作区，撞的是 1001 而不是能力 6103。
+        let err = gate(
+            &state,
+            "host/fs.read",
+            serde_json::json!({ "path": "a.txt" }),
+        )
+        .expect_err("没开工作区，读不到文件");
+        assert_ne!(err.code, HostApiError::UNAUTHORIZED);
+
+        let (summary, unloaded) =
+            revoke_capabilities(&state, &store, PLUGIN_ID, &["fs.read".to_string()])
+                .await
+                .expect("撤销应成功");
+
+        assert!(!unloaded, "读类能力不是关键能力，不该连带卸载");
+        assert_eq!(summary.granted_capabilities, vec!["search".to_string()]);
+        assert_eq!(summary.state, PluginState::NeedsGrant);
+
+        // 撤销即时生效：没有 reload、没有 unload，下一次调用就已经被拦。
+        let err = gate(
+            &state,
+            "host/fs.read",
+            serde_json::json!({ "path": "a.txt" }),
+        )
+        .expect_err("撤销后必须拒绝");
+        assert_eq!(err.code, HostApiError::UNAUTHORIZED);
+    }
+
+    /// 撤销关键能力：即使插件没在跑，也要退回 `needs_grant`（工具不该再被路由）。
+    #[tokio::test]
+    async fn revoke_key_capability_flips_ready_plugin_back_to_needs_grant() {
+        let (state, store) = seeded(&["fs.read", "fs.write"]).await;
+        grant_capabilities(&state, &store, PLUGIN_ID, &[])
+            .await
+            .expect("一键授权应成功");
+
+        // 伪造「已加载」：真起进程要看 node，本机不一定有；这里验的是「撤销关键能力后
+        // 账本与打授权集的走向」，真实装载由 plugin_flow 集成测试覆盖。
+        store
+            .set_plugin_status(PLUGIN_ID, plugin_status::READY, None)
+            .await
+            .expect("状态写入应成功");
+
+        let (summary, unloaded) =
+            revoke_capabilities(&state, &store, PLUGIN_ID, &["fs.write".to_string()])
+                .await
+                .expect("撤销应成功");
+
+        // 进程本来就不在，谈不上卸载；但状态必须退回 `needs_grant`。
+        assert!(!unloaded);
+        assert_eq!(summary.state, PluginState::NeedsGrant);
+        assert_eq!(summary.granted_capabilities, vec!["fs.read".to_string()]);
+        // 写侧能力已从账本撤下（`host/fs.write` 属于 P4 写侧切片，本切片尚未挂载，
+        // 所以这里只验账本，运行态回写由上面读侧的用例覆盖）。
+    }
+
+    /// 空 `capabilities` 对 `grant` 是「全部」，对 `revoke` 是「没说清楚」。
+    #[tokio::test]
+    async fn empty_capabilities_mean_all_for_grant_but_are_rejected_for_revoke() {
+        let (state, store) = seeded(&["fs.read"]).await;
+
+        let err = revoke_capabilities(&state, &store, PLUGIN_ID, &[])
+            .await
+            .expect_err("撤销不能空手来");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+
+        let summary = grant_capabilities(&state, &store, PLUGIN_ID, &[])
+            .await
+            .expect("空数组应理解为全部授权");
+        assert_eq!(summary.granted_capabilities, vec!["fs.read".to_string()]);
+    }
+
+    /// 清单没申请过的能力、空字符串都要拒，不能静默成功。
+    #[tokio::test]
+    async fn unknown_and_blank_capabilities_are_rejected() {
+        let (state, store) = seeded(&["fs.read"]).await;
+
+        let err = grant_capabilities(&state, &store, PLUGIN_ID, &["shell.exec".to_string()])
+            .await
+            .expect_err("清单外的能力必须拒");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+        // 拒了就不能留下半张授权：库里的授权位还是全 0。
+        assert!(store
+            .granted_capabilities(PLUGIN_ID)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let err = grant_capabilities(&state, &store, PLUGIN_ID, &["  ".to_string()])
+            .await
+            .expect_err("空字符串必须拒");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+    }
+
+    /// 插件不存在时是 6100，不是「授权成功」也不是 5003。
+    #[tokio::test]
+    async fn missing_plugin_reports_not_found() {
+        let (state, store) = seeded(&["fs.read"]).await;
+        let err = grant_capabilities(&state, &store, "nope", &[])
+            .await
+            .expect_err("不存在的插件不能授权");
+        assert_eq!(err.code, ErrorCode::PLUGIN_NOT_FOUND);
+    }
+
+    /// 关键能力清单就是「撤了工具干不了活」的那三个。
+    #[test]
+    fn key_capabilities_cover_write_network_and_llm_only() {
+        for capability in ["fs.write", "net.fetch", "llm.chat"] {
+            assert!(is_key_capability(capability), "{capability} 应算关键能力");
+        }
+        for capability in ["fs.read", "search", "workspace.info"] {
+            assert!(!is_key_capability(capability), "{capability} 不该连带卸载");
+        }
     }
 }
