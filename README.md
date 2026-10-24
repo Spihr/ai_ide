@@ -1,14 +1,3 @@
----
-AIGC:
-    Label: "1"
-    ContentProducer: 001191440300708461136T1XGW3
-    ProduceID: 04526fdd866a8c5c9aceee6b83ed2c05_c3c28b8ecb5d11f18e0e52540064ee0f
-    ReservedCode1: iMQU+M3l+Nemh2SBP+wNxuo62CntVD5M1UZnuDR9sSoknT6QsOyMHgm1pJx0WXt/bNlkb7FNjDO3LmUPWOWaPFJp3mYYmX7Y9sCruOUtqG+Mayg6JJ/qBC9B5C67FLWMVCVrecWvIl1J8s/wY7Op/4zr7wuXFfFQmhoRhDMH4sWfznzSnZn+53A1YFY=
-    ContentPropagator: 001191440300708461136T1XGW3
-    PropagateID: 04526fdd866a8c5c9aceee6b83ed2c05_c3c28b8ecb5d11f18e0e52540064ee0f
-    ReservedCode2: iMQU+M3l+Nemh2SBP+wNxuo62CntVD5M1UZnuDR9sSoknT6QsOyMHgm1pJx0WXt/bNlkb7FNjDO3LmUPWOWaPFJp3mYYmX7Y9sCruOUtqG+Mayg6JJ/qBC9B5C67FLWMVCVrecWvIl1J8s/wY7Op/4zr7wuXFfFQmhoRhDMH4sWfznzSnZn+53A1YFY=
----
-
 # AI IDE
 
 本地优先、模型可插拔的 AI 原生代码编辑器。
@@ -172,4 +161,3 @@ pnpm verify:ci
 ## 许可
 
 MIT，见 [LICENSE](./LICENSE)。
-*（内容由AI生成，仅供参考）*

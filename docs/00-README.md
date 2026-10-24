@@ -1,14 +1,3 @@
----
-AIGC:
-    Label: "1"
-    ContentProducer: 001191440300708461136T1XGW3
-    ProduceID: 04526fdd866a8c5c9aceee6b83ed2c05_9ebb950dcc2511f1b76f525400638852
-    ReservedCode1: Z+N/W7l7xLhUhT08wX5NFzPkx/KwubLMGT5AGxir3HMbBbVpBv7uQG9NJHmOepx2IKIB6dbUYR48yoOWQu5GvZl/lQCmGAVuHBquq4tcYGFcM8s/U9zOBEsjDW3UbMeOEAsrzNDwXuvEJorScoM2vdpQysKm1vybRfyX7Vw7DDJRGdRFOSZRY5jEia4=
-    ContentPropagator: 001191440300708461136T1XGW3
-    PropagateID: 04526fdd866a8c5c9aceee6b83ed2c05_9ebb950dcc2511f1b76f525400638852
-    ReservedCode2: Z+N/W7l7xLhUhT08wX5NFzPkx/KwubLMGT5AGxir3HMbBbVpBv7uQG9NJHmOepx2IKIB6dbUYR48yoOWQu5GvZl/lQCmGAVuHBquq4tcYGFcM8s/U9zOBEsjDW3UbMeOEAsrzNDwXuvEJorScoM2vdpQysKm1vybRfyX7Vw7DDJRGdRFOSZRY5jEia4=
----
-
 # AI IDE · 设计文档集
 
 模型可插拔的 AI 原生代码编辑器。技术栈：**Electron + React + TypeScript（外壳/UI） + Rust（内核）**。
