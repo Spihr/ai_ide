@@ -109,6 +109,39 @@ function isAiEvent(method: string): boolean {
   return method === Methods.event.providerChanged || method.startsWith('llm.')
 }
 
+/**
+ * 内核通知 → IPC 通道。
+ *
+ * 工作区事件各走专用通道，M2 的 `provider.changed` / `llm.*` 与 M4 的 `agent.*`
+ * 走统一 AI 事件通道，M6 的 `terminal.data` / `terminal.exit`、插件的三条遥测
+ * 与语言服务的 `lsp.diagnostics` 各走专用通道——它们要么是高频流（终端字节、
+ * 进度帧），要么是「服务器主动推、一次编辑一批」（诊断），混进 `ai:event`
+ * 只会让对话面板无谓唤醒。认不出的通知返回 `null`，由调用方只写内核日志。
+ *
+ * 写成 `switch` 而不是嵌套三元：这一跳每帧通知都要走，可读性比行数重要，
+ * 之前那串三元已经加到「读不出哪个方法落哪条通道」了。
+ */
+function eventChannel(method: string): string | null {
+  switch (method) {
+    case Methods.event.workspaceChanged:
+      return IpcChannels.workspaceChanged
+    case Methods.event.workspaceIndexed:
+      return IpcChannels.workspaceIndexed
+    case Methods.event.terminalData:
+      return IpcChannels.terminalData
+    case Methods.event.terminalExit:
+      return IpcChannels.terminalExit
+    case Methods.event.lspDiagnostics:
+      return IpcChannels.lspDiagnostics
+    case Methods.event.pluginLog:
+    case Methods.event.pluginProgress:
+    case Methods.event.pluginStateChanged:
+      return pluginEventChannel(method)
+    default:
+      return isAiEvent(method) ? IpcChannels.aiEvent : null
+  }
+}
+
 function requireVault(): CredentialVault {
   if (!vault) throw new Error('密钥托管尚未初始化')
   return vault
@@ -191,24 +224,9 @@ async function startCore(): Promise<CoreStatus> {
 
   instance.on('stderr', (chunk) => pushLog(chunk))
   instance.on('notification', (method, params) => {
-    // 工作区事件走各自专用通道，M2 的 `provider.changed` / `llm.*` 与 M4 的
-    // `agent.*` 走统一 AI 事件通道，M6 的 `terminal.data` / `terminal.exit`
-    // 走终端专用通道（高频字节流，不能混进 AI 事件）；其余通知只留在内核日志里。
-    const pluginChannel = pluginEventChannel(method)
-    const channel =
-      method === Methods.event.workspaceChanged
-        ? IpcChannels.workspaceChanged
-        : method === Methods.event.workspaceIndexed
-          ? IpcChannels.workspaceIndexed
-          : method === Methods.event.terminalData
-            ? IpcChannels.terminalData
-            : method === Methods.event.terminalExit
-              ? IpcChannels.terminalExit
-              : pluginChannel !== null
-                ? pluginChannel
-                : isAiEvent(method)
-                  ? IpcChannels.aiEvent
-                  : null
+    // 通道映射统一收在 `eventChannel` 里（见上方），这里只负责投递：
+    // 有专用通道就直接发，没有的只留在内核日志里。
+    const channel = eventChannel(method)
 
     if (channel && mainWindow && !mainWindow.isDestroyed()) {
       const payload = channel === IpcChannels.aiEvent ? ({ method, params } satisfies AiEvent) : params

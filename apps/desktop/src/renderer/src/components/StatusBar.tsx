@@ -1,8 +1,9 @@
-/** 底部状态栏：内核状态 + 自检 + 当前文件信息。 */
+/** 底部状态栏：内核状态 + 自检 + 语言服务 + 当前文件信息。 */
 
 import { useState } from 'react'
 
 import type { CoreStatus } from '../../../shared/ipc'
+import { currentFileDiagnostics, statusLabel, useLspState } from '../lsp-store'
 import { useEditor } from '../store'
 
 interface StatusBarProps {
@@ -19,11 +20,26 @@ const CORE_LABEL: Record<CoreStatus['state'], string> = {
 
 export function StatusBar({ core }: StatusBarProps) {
   const state = useEditor()
+  const lsp = useLspState()
   const [selfCheck, setSelfCheck] = useState<string | null>(null)
   const [checking, setChecking] = useState(false)
 
   const active = state.tabs.find((tab) => tab.path === state.activePath) ?? null
   const dirty = active ? active.content !== active.savedContent : false
+
+  // 语言服务只在「有话说」时占位：`idle`（还没开过文件）不显示，免得空工作区
+  // 里挂一条「语言服务器不可用」吓人。`unavailable` / `error` 走 tooltip 说明，
+  // 不弹框——没装某个语言服务器是常态，不是故障。
+  const lspLabel = statusLabel(lsp)
+  const lspProblems = currentFileDiagnostics(lsp)
+  const lspTone =
+    lsp.status === 'ready'
+      ? 'ready'
+      : lsp.status === 'error'
+        ? 'failed'
+        : lsp.status === 'starting'
+          ? 'starting'
+          : 'idle'
 
   const runSelfCheck = async (): Promise<void> => {
     setChecking(true)
@@ -62,6 +78,15 @@ export function StatusBar({ core }: StatusBarProps) {
       )}
 
       <span className="status__spacer" />
+
+      {lspLabel.length > 0 && (
+        <span className={`status__item status__item--${lspTone}`} title={lsp.notice ?? lspLabel}>
+          {lspLabel}
+          {lspProblems !== null && lspProblems.total > 0
+            ? ` · ${lspProblems.problems} 问题/${lspProblems.total} 条`
+            : ''}
+        </span>
+      )}
 
       {active && (
         <>

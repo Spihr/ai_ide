@@ -201,6 +201,37 @@ describe('checkRendererCall', () => {
   })
 
   /*
+   * 语言服务五条放行：内核侧五个 handler 已接线（能力表 74 → 79），外壳才跟着放。
+   * 放行边界写在 `policy.ts` 的注释里：`start` 拿不到「任意 shell 命令」，
+   * `request` 的 `method` 是枚举，`sync` / `stop` 不写盘。
+   */
+  it('放行语言服务五条协议方法', () => {
+    const methods = [
+      Methods.lsp.start,
+      Methods.lsp.stop,
+      Methods.lsp.servers,
+      Methods.lsp.request,
+      Methods.lsp.sync
+    ]
+
+    for (const method of methods) {
+      const decision = checkRendererCall(method)
+      expect(decision.allowed, `${method} 应被放行`).toBe(true)
+      expect(decision.reason, `${method} 放行时不应带拒绝原因`).toBeUndefined()
+    }
+  })
+
+  /*
+   * 反过来钉住「放行的都是内核已实现的方法」：五个 `lsp.*` 都在 `IMPLEMENTED` 里，
+   * 谁把某个方法退回 `DECLARED` 却忘了收紧白名单，这条会先炸。
+   */
+  it('语言服务方法已全部实现', () => {
+    const lspMethods = IMPLEMENTED_METHODS.filter((method) => method.startsWith('lsp.'))
+
+    expect(lspMethods.length).toBe(5)
+  })
+
+  /*
    * MCP 的「配置面」不进白名单：面板只能连 `mcp.json` 里已有的 Server，不能自己
    * 塞一个进去。这条用例钉的就是「UI 拿不到改配置 / 绕过已连接清单」的能力。
    */
@@ -279,6 +310,13 @@ describe('checkRendererCall', () => {
       'llm.chat_stream',
       'llm.count_tokens',
       'llm.list_models',
+      // 语言服务：五条都对应「编辑器状态变化」这类显式动作——开文件起服务、
+      // 切/存文件同步正文、关掉才 stop、按下跳转才 request。
+      'lsp.request',
+      'lsp.servers',
+      'lsp.start',
+      'lsp.stop',
+      'lsp.sync',
       'mcp.call',
       'mcp.connect',
       'mcp.disconnect',

@@ -14,6 +14,7 @@ import {
   type CoreLogChunk,
   type CoreStatus,
   type CredentialStatus,
+  type LspDiagnosticsEvent,
   type PingBenchmarkResult,
   type PluginLogEvent,
   type PluginProgressEvent,
@@ -141,6 +142,14 @@ const api: AiIdeApi = {
     ipcRenderer.on(IpcChannels.pluginStateChanged, handler)
     return () => {
       ipcRenderer.removeListener(IpcChannels.pluginStateChanged, handler)
+    }
+  },
+
+  onLspDiagnostics: (listener: (event: LspDiagnosticsEvent) => void): (() => void) => {
+    const handler = (_event: IpcRendererEvent, payload: LspDiagnosticsEvent): void => listener(payload)
+    ipcRenderer.on(IpcChannels.lspDiagnostics, handler)
+    return () => {
+      ipcRenderer.removeListener(IpcChannels.lspDiagnostics, handler)
     }
   }
 }

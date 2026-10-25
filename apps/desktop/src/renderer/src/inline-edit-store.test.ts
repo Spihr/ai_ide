@@ -154,7 +154,8 @@ function installHarness(): void {
     onTerminalExit: () => () => undefined,
     onPluginLog: () => () => undefined,
     onPluginProgress: () => () => undefined,
-    onPluginStateChanged: () => () => undefined
+    onPluginStateChanged: () => () => undefined,
+    onLspDiagnostics: () => () => undefined
   } satisfies AiIdeApi
 
   vi.stubGlobal('window', { aiide: api, confirm: () => true })

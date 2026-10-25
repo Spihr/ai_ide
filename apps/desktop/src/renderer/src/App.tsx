@@ -13,6 +13,7 @@ import { EditorTabs } from './components/EditorTabs'
 import { FileTree } from './components/FileTree'
 import { GitPanel } from './components/GitPanel'
 import { InlineEditOverlay } from './components/InlineEditOverlay'
+import { LspBridge } from './components/LspBridge'
 import { McpPanel } from './components/McpPanel'
 import { PermissionPanel } from './components/PermissionPanel'
 import { PluginPanel } from './components/PluginPanel'
@@ -220,6 +221,7 @@ export function App() {
             <>
               <EditorTabs />
               <CodeEditor />
+              <LspBridge />
             </>
           ) : (
             <div className="welcome">

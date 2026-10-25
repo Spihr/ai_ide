@@ -192,7 +192,8 @@ function installHarness(): Harness {
     // P5 切片七：插件遥测三条与终端输出同一范式，这些用例不驱动它们，但接口要全。
     onPluginLog: () => () => undefined,
     onPluginProgress: () => () => undefined,
-    onPluginStateChanged: () => () => undefined
+    onPluginStateChanged: () => () => undefined,
+    onLspDiagnostics: () => () => undefined
   }
 
   vi.stubGlobal('window', { aiide: api })
