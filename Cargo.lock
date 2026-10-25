@@ -36,6 +36,7 @@ dependencies = [
  "ai-ide-git",
  "ai-ide-indexer",
  "ai-ide-llm",
+ "ai-ide-lsp",
  "ai-ide-mcp",
  "ai-ide-plugin",
  "ai-ide-protocol",

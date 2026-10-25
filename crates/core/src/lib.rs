@@ -61,6 +61,9 @@ pub mod git_api;
 pub mod inline_edit_api;
 pub mod llm_api;
 pub mod llm_runtime;
+/// LSP 协议处理器（LSP 切片二）：`lsp.start` / `stop` / `servers` / `request` / `sync`，
+/// 连接本体在 `crates/lsp`，这里只管「按需起、按 id 复用、按 id 关」。
+pub mod lsp_api;
 /// 结构化日志（M5 任务 4）：JSONL 按天滚动 + 出口脱敏。
 pub mod logging;
 /// MCP 协议处理器（M7 切片二）：`mcp.servers` / `connect` / `disconnect` / `tools` / `call`。
