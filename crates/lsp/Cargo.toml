@@ -1,0 +1,23 @@
+[package]
+name = "ai-ide-lsp"
+description = "LSP 客户端基础层：Content-Length 分帧的 stdio JSON-RPC 2.0 传输 / 请求 id 关联 / 通知广播 / 子进程生命周期 / 握手 / 文档同步"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+
+# 单测与集成测试要驱动一个真正的语言服务器子进程（handshake / 往返 / 中途退出 /
+# 非法帧 / 超时），用它做 stdio 端到端验证。该二进制只服务于本 crate 的测试
+# （见 src/bin/lsp_mock_server.rs 的模块注释）。
+[[bin]]
+name = "lsp-mock-server"
+path = "src/bin/lsp_mock_server.rs"
