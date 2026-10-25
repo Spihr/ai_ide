@@ -14,6 +14,8 @@
 //! | `6101`–`6199` | 插件宿主 |
 //! | `7xxx` | Git 操作 |
 //! | `8xxx` | MCP 连接与工具 |
+//! | `9xxx` | Inline Edit |
+//! | `10001`–`10099` | 语言服务（LSP） |
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -168,6 +170,33 @@ impl ErrorCode {
     pub const INLINE_EDIT_EMPTY_REPLACEMENT: Self = Self(9003);
     /// 目标文件超过读取上限被截断，行号与内容都不再可信，无法安全地算补丁。
     pub const INLINE_EDIT_FILE_TOO_LARGE: Self = Self(9004);
+
+    // --- 语言服务 LSP（10xxx，切片一：协议面先行）---------------------------
+    //
+    // 三个码刻意分开，因为外壳对它们的处置完全不同：
+    //
+    // - `10001` 机器上没装（或不在 PATH）：唯一的出路是**装**，重试一万次也一样，
+    //   所以 `data` 里带 `install_hint`（注册表里那句 `npm i -g ...`），面板直接
+    //   把它当命令展示。合成 `10002` 会让面板提示「换语言」，用户换了语言还是不行。
+    // - `10002` 语言不认识：注册表里没有这个 `language_id` / 扩展名，出路是
+    //   **换配置或换实现**（`command` 逃生口），装什么都没用。
+    // - `10003` `server_id` 不认识：连接从来不存在、或已经 `stop` 掉了，出路是
+    //   回 `lsp.servers` 重新捡回句柄。这与「服务器崩溃」（连接在、进程没了）
+    //   不是一回事，后者该由 `lsp.servers` 的 `status: crashed` 表达而不是报错，
+    //   否则外壳会把一次可自愈的崩溃画成致命弹窗。
+
+    /// 语言服务器未安装：注册表命中了语言，但主命令与全部备选都不在 PATH 上。
+    ///
+    /// `data` 带 `language_id` 与 `install_hint`。
+    pub const LSP_SERVER_NOT_INSTALLED: Self = Self(10001);
+    /// 语言不支持：`language_id` 与文件扩展名都不在注册表里。
+    ///
+    /// `data` 带 `language_id` / `path`（给了哪个就带哪个）。
+    pub const LSP_LANGUAGE_UNSUPPORTED: Self = Self(10002);
+    /// `server_id` 未知：没有这条连接（从没起过，或已经关掉）。
+    ///
+    /// `data` 带 `server_id`，供外壳清掉本地那份已失效的句柄。
+    pub const LSP_SERVER_UNKNOWN: Self = Self(10003);
 
     pub const fn as_i32(self) -> i32 {
         self.0
@@ -386,6 +415,47 @@ mod tests {
         // 一个是「报文不合协议」（属于调用方 bug），外壳的反应不一样。
         assert_ne!(
             ErrorCode::INLINE_EDIT_SELECTION_INVALID.as_i32(),
+            ErrorCode::INVALID_PARAMS.as_i32()
+        );
+    }
+
+    /// LSP 错误码占 10001-10003：三个码各对应一种「用户该做什么」，
+    /// 合并任意两个都会让面板给出错误建议（去装 vs 去换 vs 去重连）。
+    ///
+    /// 同时钉住不与 9xxx（Inline Edit）、8xxx（MCP）重叠——外壳按段分流提示文案。
+    #[test]
+    fn lsp_error_codes_use_their_own_10xxx_band() {
+        let codes = [
+            ErrorCode::LSP_SERVER_NOT_INSTALLED,
+            ErrorCode::LSP_LANGUAGE_UNSUPPORTED,
+            ErrorCode::LSP_SERVER_UNKNOWN,
+        ];
+        for (index, code) in codes.iter().enumerate() {
+            let raw = code.as_i32();
+            assert!((10001..=10099).contains(&raw), "{raw} 不在 10xxx 段");
+            assert!(!code.is_standard(), "{raw} 不该被当成标准码");
+            assert!(
+                !(9001..=9099).contains(&raw),
+                "{raw} 落进了 Inline Edit 占用的 9xxx 段"
+            );
+            assert!(
+                !(8001..=8099).contains(&raw),
+                "{raw} 落进了 MCP 占用的 8xxx 段"
+            );
+            assert!(
+                !codes[..index].contains(code),
+                "{raw} 重复定义，同段内码值必须唯一"
+            );
+        }
+        assert_eq!(ErrorCode::LSP_SERVER_NOT_INSTALLED.as_i32(), 10001);
+        // 「没装」与「语言不支持」必须可分：前者让用户去装，后者让用户去换。
+        assert_ne!(
+            ErrorCode::LSP_SERVER_NOT_INSTALLED.as_i32(),
+            ErrorCode::LSP_LANGUAGE_UNSUPPORTED.as_i32()
+        );
+        // 「server_id 未知」也不能退化成参数错误：那是句柄过期，不是报文写错。
+        assert_ne!(
+            ErrorCode::LSP_SERVER_UNKNOWN.as_i32(),
             ErrorCode::INVALID_PARAMS.as_i32()
         );
     }

@@ -3095,6 +3095,403 @@ pub struct PluginRevokeResult {
     pub unloaded: bool,
 }
 
+// ---------------------------------------------------------------------------
+// lsp.* —— 语言服务（切片一：协议面先行，dispatch 待接线）
+// ---------------------------------------------------------------------------
+//
+// 坐标口径：**行列都从 1 起算**。LSP 线格式（`textDocument/position`）是 0-based，
+// 但那是内核与服务器之间的私事：`crates/lsp::features` 已经把入参换算成 0-based、
+// 出参统一回 1-based。协议面对外壳只暴露一套基数，避免 UI 每处都要记得「行 +1、
+// 列 +0」，也避免 `range` 与 `position` 用两套口径而互相错位。
+//
+// 本文件不复刻 LSP 的 `textDocument/*` 线格式：外壳不该知道 `LocationLink`、
+// `MarkupContent`、`CompletionItemKind` 这些方言细节，只该知道「跳哪去、显示什么」。
+
+/// 编辑器位置，**行列均从 1 起算**（列是 UTF-16 码元计数，与 Monaco 一致）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LspPosition {
+    /// 行号，从 1 开始。
+    #[ts(type = "number")]
+    pub line: u32,
+    /// 行内偏移，从 1 开始。
+    #[ts(type = "number")]
+    pub character: u32,
+}
+
+/// 编辑器区间，**半开**：含 `start`、不含 `end`（与 LSP `Range` 同构，仍用 1-based）。
+///
+/// 半开是刻意的：空区间（`start == end`）能表达「光标插入点」，闭区间表达不了；
+/// 跨行选中时 `end.character` 也不会多算一个字符。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LspRange {
+    /// 起点（含）。
+    pub start: LspPosition,
+    /// 终点（不含）。
+    pub end: LspPosition,
+}
+
+/// 一条语言服务器连接的状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "lowercase")]
+pub enum LspServerStatus {
+    /// 进程已起、正在 `initialize` 握手（此时发查询会排队或失败）。
+    Starting,
+    /// 握手完成，可以收查询与文档同步。
+    Ready,
+    /// 已正常关闭（`stop` 之后，或用户手动关掉）。
+    Stopped,
+    /// 进程异常退出（崩溃 / 握手被拒）。`last_error` 有原因。
+    Crashed,
+}
+
+/// 一条语言服务器的摘要（`lsp.start` / `lsp.servers` 回传）。
+///
+/// 字段刻意只放「外壳要显示、要据此决策」的东西：`server_id` 是后续每次调用的
+/// 句柄，`status` 决定面板按钮是「启动」还是「停止」，`restarts` 与 `last_error`
+/// 回答「它为什么一直在重连」。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LspServerInfo {
+    /// 连接句柄，由内核分配（同一 `(language_id, root)` 复用同一条）。
+    pub server_id: String,
+    /// 语言 id（`typescript` / `python` / `rust` …，取自注册表）。
+    pub language_id: String,
+    /// 实际执行的命令（可能是备选实现，例如 `pyright-langserver` 缺失时退到 `pylsp`）。
+    pub command: String,
+    /// 工作区根目录绝对路径；服务器不要求根时为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub root: Option<String>,
+    /// 连接状态。
+    pub status: LspServerStatus,
+    /// 进程号（`starting` / `ready` 时给出，其余为空）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub pid: Option<u32>,
+    /// 本会话内自动重启次数（到上限就停在 `crashed`）。
+    #[ts(type = "number")]
+    pub restarts: u32,
+    /// 最近一次失败原因（只保留文本，不含栈）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub last_error: Option<String>,
+}
+
+/// `lsp.start` 参数。
+///
+/// `path` 与 `language_id` 至少给一个：给 `path` 时由注册表按扩展名推语言并决定
+/// 命令，给 `language_id` 时按语言直接取注册表条目。两者都给时 `language_id`
+/// 优先（用户显式指定的方言不该被扩展名覆盖）。
+///
+/// `command` / `args` 是逃生口：注册表里没有的语言、或想用 `vtsls` 替
+/// `typescript-language-server` 时用。参数走数组，**不拼 shell 字符串**——
+/// 拼字符串等于把命令注入的口子开给渲染进程。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LspStartParams {
+    /// 目标文件绝对路径（据此推语言、定根）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub path: Option<String>,
+    /// 目标语言 id；与 `path` 至少给一个。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub language_id: Option<String>,
+    /// 工作区根目录；缺省取 `path` 所在项目的根（找不到则用文件所在目录）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub root: Option<String>,
+    /// 覆盖注册表里的命令（可执行文件路径或 PATH 上的名字）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub command: Option<String>,
+    /// 覆盖启动参数（配合 `command` 用）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+}
+
+/// `lsp.start` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LspStartResult {
+    /// 起好（或复用）的连接摘要。
+    pub server: LspServerInfo,
+    /// 是否是复用已有连接（`true` 时 `restarts` 与 `pid` 保持原值）。
+    pub reused: bool,
+}
+
+/// `lsp.stop` 参数。
+///
+/// 只认 `server_id`：进程归内核管，外壳没有「指定 pid / 强制杀」的入参。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LspStopParams {
+    /// 要关掉的连接句柄（来自 `lsp.start` / `lsp.servers`）。
+    pub server_id: String,
+}
+
+/// `lsp.stop` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LspStopResult {
+    /// 被关闭的连接句柄（回显）。
+    pub server_id: String,
+    /// 是否真的关掉了一条活着的连接（`false` 表示本来就已关闭，幂等不报错）。
+    pub stopped: bool,
+}
+
+/// `lsp.servers` 参数（无入参，留空对象占位）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LspServersParams {}
+
+/// `lsp.servers` 响应结果。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LspServersResult {
+    /// 当前活着的连接（按 `server_id` 升序，顺序稳定便于前端 diff）。
+    pub servers: Vec<LspServerInfo>,
+}
+
+/// `lsp.request` 支持的方法。
+///
+/// **枚举而非自由字符串**：语言服务器的线格式方法名（`textDocument/hover` 等）
+/// 不许从渲染进程透传——否则外壳能借这条通道问任意东西（包括 `workspace/executeCommand`
+/// 这类有副作用的）。查询面只开四个只读动作，与 `crates/lsp::features` 一一对应。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum LspRequestMethod {
+    /// 跳转定义。
+    Definition,
+    /// 查找引用。
+    References,
+    /// 悬停信息。
+    Hover,
+    /// 补全候选。
+    Completion,
+}
+
+/// `lsp.request` 参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LspRequestParams {
+    /// 连接句柄。
+    pub server_id: String,
+    /// 查询类型。
+    pub method: LspRequestMethod,
+    /// 目标文件绝对路径。
+    pub path: String,
+    /// 查询位置（**1-based**）。`completion` 用它定补全上下文，`references` 用它定符号。
+    pub position: LspPosition,
+    /// 仅 `references` 有效：是否把符号声明本身算进结果。
+    ///
+    /// 缺省交给服务器默认值——各服务器不一致（TypeScript 默认含、Pyright 默认不含），
+    /// 所以想要确定结果时显式给。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub include_declaration: Option<bool>,
+}
+
+/// 一个可跳转位置（`definition` / `references` 结果）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LspLocation {
+    /// 原始 uri（服务器给的，可能是 `git:` / `untitled:` 等非文件 scheme）。
+    pub uri: String,
+    /// 能落回磁盘时给出绝对路径；非文件 scheme 时为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub path: Option<String>,
+    /// 1-based 半开区间。
+    pub range: LspRange,
+}
+
+/// 悬停内容（`hover` 结果）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LspHover {
+    /// 内容正文（服务器给 Markdown 时原样保留，交给前端渲染）。
+    pub contents: String,
+    /// 悬停实际作用的区间；服务器可省。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub range: Option<LspRange>,
+}
+
+/// 一个补全候选（只保留上层会展示 / 插入的字段）。
+///
+/// 不复刻 LSP 的 `textEdit` / `additionalTextEdits`：跨区改写由编辑器侧
+/// 自己决定要不要采纳，协议面先只给「插入什么文本」。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LspCompletionItem {
+    /// 展示文本，也是唯一的必填字段。
+    pub label: String,
+    /// LSP `CompletionItemKind`（1 文本、3 函数、6 变量…），原样透传供前端选图标。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[ts(type = "number")]
+    pub kind: Option<u32>,
+    /// 右侧灰字说明（类型签名等）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub detail: Option<String>,
+    /// 文档说明（Markdown 或纯文本）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub documentation: Option<String>,
+    /// 插入文本（服务器要求替换 `label` 时给）；为空时插 `label` 本身。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub insert_text: Option<String>,
+    /// 排序键（服务器指定优先级时给）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub sort_text: Option<String>,
+}
+
+/// 补全列表（`completion` 结果）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LspCompletionList {
+    /// 服务器是否认为结果不完整（`true` 时编辑器应继续按前缀本地过滤）。
+    pub is_incomplete: bool,
+    /// 候选项。
+    pub items: Vec<LspCompletionItem>,
+}
+
+/// `lsp.request` 响应结果。
+///
+/// 四个方法共用一个信封：`method` 回显决定哪个字段非空。不用
+/// `serde(untagged)` 的四选一——那会让「空结果」与「查错字段」无法区分，
+/// 前端还要靠猜来判断是该画跳转列表还是补全面板。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LspRequestResult {
+    /// 连接句柄（回显）。
+    pub server_id: String,
+    /// 查询类型（回显；前端据此选渲染分支）。
+    pub method: LspRequestMethod,
+    /// 目标文件绝对路径（回显）。
+    pub path: String,
+    /// `definition` / `references` 的结果；其他方法为空数组。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub locations: Vec<LspLocation>,
+    /// `hover` 的结果；没有可展示内容时为空（不是错误）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub hover: Option<LspHover>,
+    /// `completion` 的结果；其他方法为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub completions: Option<LspCompletionList>,
+}
+
+/// `lsp.sync` 参数。
+///
+/// `content` 缺省表示「从磁盘读」：改了没保存的文件要把编辑器缓冲传上来，
+/// 否则服务器看到的还是旧文本，定义跳转会跳到已经删掉的行上。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LspSyncParams {
+    /// 连接句柄。
+    pub server_id: String,
+    /// 目标文件绝对路径。
+    pub path: String,
+    /// 编辑器里的当前文本；为空则读磁盘。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub content: Option<String>,
+}
+
+/// `lsp.sync` 响应结果。
+///
+/// 幂等：同一份文本重复同步不会推版本号、也不会重发 `didChange`，所以
+/// 外壳不必自己维护「上次发的是哪版」。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LspSyncResult {
+    /// 连接句柄（回显）。
+    pub server_id: String,
+    /// 目标文件绝对路径（回显）。
+    pub path: String,
+    /// 文档 uri（同步用的键，后续查询按它定位）。
+    pub uri: String,
+    /// 同步后的版本号（`didOpen` 为 1，之后每次真变更 +1）。
+    #[ts(type = "number")]
+    pub version: i32,
+    /// 本次是否真的发了 `didOpen`。
+    pub opened: bool,
+    /// 本次是否真的发了 `didChange`。
+    pub changed: bool,
+}
+
+/// 诊断严重度。
+///
+/// LSP 线格式是 1..4 的数字，这里换成枚举：数字 `1` 与 `Error` 谁看都得查表，
+/// 而 UI 分支写 `severity === 'error'` 一眼就懂。`0`／缺省／越界一律归一成
+/// [`LspDiagnosticSeverity::Unknown`]——不猜成 `error`，免得把提示画成红点。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "lowercase")]
+pub enum LspDiagnosticSeverity {
+    /// 错误（LSP `1`）。
+    Error,
+    /// 警告（LSP `2`）。
+    Warning,
+    /// 信息（LSP `3`）。
+    Information,
+    /// 提示（LSP `4`）。
+    Hint,
+    /// 服务器没给严重度，或给了越界值。
+    Unknown,
+}
+
+/// 一条诊断。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LspDiagnostic {
+    /// 出问题的区间（1-based 半开）。
+    pub range: LspRange,
+    /// 严重度。
+    pub severity: LspDiagnosticSeverity,
+    /// 服务器给的错误码（`TS2304` 这类）；可直接展示，但不要拿来分支。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub code: Option<String>,
+    /// 来源（`ts` / `pyright` / `rust-analyzer` …）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub source: Option<String>,
+    /// 文案。
+    pub message: String,
+}
+
+/// `event::LSP_DIAGNOSTICS` 通知载荷。
+///
+/// **整篇替换**：每次推送都是某文件的完整诊断清单，前端拿到就直接覆盖该文件
+/// 的标记集合。空数组是有效载荷（表示问题已全部消失），不能被当成「没内容」丢掉
+/// ——那样旧的红点会永久残留。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LspDiagnosticsEvent {
+    /// 连接句柄。
+    pub server_id: String,
+    /// 目标文件绝对路径。
+    pub path: String,
+    /// 这批诊断对应的文档版本；服务器没给时为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[ts(type = "number")]
+    pub version: Option<i32>,
+    /// 该文件的全部诊断（可能为空）。
+    pub diagnostics: Vec<LspDiagnostic>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3562,5 +3959,145 @@ mod tests {
             serde_json::from_value::<PluginSummary>(json).unwrap(),
             summary
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // lsp.*（切片一）
+    // -----------------------------------------------------------------------
+
+    /// `method` 是枚举而不是自由字符串：透传线格式方法名等于把
+    /// `workspace/executeCommand` 这类有副作用的方法也开给渲染进程。
+    #[test]
+    fn lsp_request_method_rejects_unknown_string() {
+        assert_eq!(
+            serde_json::to_string(&LspRequestMethod::Hover).unwrap(),
+            "\"hover\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LspRequestMethod::Definition).unwrap(),
+            "\"definition\""
+        );
+        for bad in [
+            "textDocument/hover",
+            "workspace/executeCommand",
+            "HOVER",
+            "",
+        ] {
+            assert!(
+                serde_json::from_value::<LspRequestMethod>(serde_json::json!(bad)).is_err(),
+                "非法 method 应被拒: {bad}"
+            );
+        }
+    }
+
+    /// 入参位置原样透传 1-based，不做任何 ±1 —— 换算只在内核侧做一次。
+    /// 这里钉住的是「协议层不偷偷改坐标」，改了会让外壳每次差一行。
+    #[test]
+    fn lsp_request_params_keep_one_based_position() {
+        let params: LspRequestParams = serde_json::from_value(serde_json::json!({
+            "server_id": "lsp-1",
+            "method": "references",
+            "path": "E:/ai_ide/crates/protocol/src/dto.rs",
+            "position": { "line": 1, "character": 1 },
+            "include_declaration": true
+        }))
+        .unwrap();
+        assert_eq!(params.position.line, 1);
+        assert_eq!(params.position.character, 1);
+        assert_eq!(params.method, LspRequestMethod::References);
+        assert_eq!(params.include_declaration, Some(true));
+
+        let json = serde_json::to_value(&params).unwrap();
+        assert_eq!(json["position"]["line"], 1);
+        assert_eq!(json["position"]["character"], 1);
+
+        // `include_declaration` 缺省时不出现：让服务器默认值生效，
+        // 而不是被我们悄悄写成 `false`。
+        let json = serde_json::to_value(LspRequestParams {
+            server_id: "lsp-1".into(),
+            method: LspRequestMethod::Hover,
+            path: "E:/a.ts".into(),
+            position: LspPosition {
+                line: 3,
+                character: 7,
+            },
+            include_declaration: None,
+        })
+        .unwrap();
+        assert!(json.get("include_declaration").is_none(), "{json}");
+    }
+
+    /// 空诊断清单是有效载荷（问题已消失），必须能被反序列化并保留「空」这个事实。
+    #[test]
+    fn lsp_diagnostics_event_allows_empty_list() {
+        let event: LspDiagnosticsEvent = serde_json::from_value(serde_json::json!({
+            "server_id": "lsp-1",
+            "path": "E:/a.ts",
+            "diagnostics": []
+        }))
+        .unwrap();
+        assert!(event.diagnostics.is_empty());
+        assert_eq!(event.version, None);
+
+        // 空列表序列化后字段仍在：丢了 `diagnostics` 前端就无法清标记。
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["diagnostics"], serde_json::json!([]));
+        assert!(json.get("version").is_none(), "{json}");
+    }
+
+    #[test]
+    fn lsp_diagnostic_severity_is_lowercase_and_roundtrips() {
+        let dto = LspDiagnostic {
+            range: LspRange {
+                start: LspPosition {
+                    line: 10,
+                    character: 5,
+                },
+                end: LspPosition {
+                    line: 10,
+                    character: 12,
+                },
+            },
+            severity: LspDiagnosticSeverity::Warning,
+            code: Some("TS2304".into()),
+            source: Some("ts".into()),
+            message: "找不到名称 'foo'".into(),
+        };
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json["severity"], serde_json::json!("warning"));
+        assert_eq!(serde_json::from_value::<LspDiagnostic>(json).unwrap(), dto);
+    }
+
+    /// `lsp.servers` 无入参，但要能从 `{}` 读出来（宿主可能补 `{}` 也可能不发 params）。
+    #[test]
+    fn lsp_servers_params_deserialize_from_empty_object() {
+        let params: LspServersParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(params, LspServersParams {});
+    }
+
+    /// `lsp.start` 一次只给 `path` 也要能跑：可选字段不出现时不能被当成缺参。
+    #[test]
+    fn lsp_start_params_defaults_and_optional_fields() {
+        let params: LspStartParams = serde_json::from_value(serde_json::json!({
+            "path": "E:/a.py"
+        }))
+        .unwrap();
+        assert_eq!(params.path.as_deref(), Some("E:/a.py"));
+        assert_eq!(params.language_id, None);
+        assert!(params.args.is_empty());
+
+        let json = serde_json::to_value(&params).unwrap();
+        for absent in ["language_id", "root", "command", "args"] {
+            assert!(json.get(absent).is_none(), "{absent} 不应出现: {json}");
+        }
+    }
+
+    /// `lsp.stop` 只认 `server_id`：多余入参该被拒，避免「顺手带个 pid 强杀」的口子。
+    #[test]
+    fn lsp_stop_params_require_server_id_only() {
+        let params: LspStopParams =
+            serde_json::from_value(serde_json::json!({ "server_id": "lsp-1" })).unwrap();
+        assert_eq!(params.server_id, "lsp-1");
+        assert!(serde_json::from_value::<LspStopParams>(serde_json::json!({})).is_err());
     }
 }

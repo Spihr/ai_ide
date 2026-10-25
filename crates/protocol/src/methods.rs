@@ -239,6 +239,34 @@ pub mod plugin {
     pub const REVOKE: &str = "plugin.revoke";
 }
 
+/// 语言服务（LSP，切片一：协议面先行，内核尚未接线）。
+///
+/// 五个动作覆盖一条语言服务器连接的完整生命周期：`start` 起进程并握手、`sync`
+/// 把编辑缓冲推过去、`request` 发一次查询、`servers` 自查存活、`stop` 收掉。
+/// 形状与 [`terminal`] 同构，但有两点不同：
+///
+/// 1. **没有字节流**：语言服务器的输出是结构化结果（诊断 / 补全 / 悬停），
+///    诊断走 [`event::LSP_DIAGNOSTICS`] 单向推送，不需要 `lsp.data` 那种基座。
+/// 2. **`stop` 只认 `server_id`**：终端杀会话同理，但这里没有 `pid` 这类入参——
+///    进程归内核管，客户端能决定的只有「关哪一条连接」。
+///
+/// 五个方法目前整组待在 [`DECLARED_NOT_IMPLEMENTED`]：DTO 与常量先定稿，
+/// `crates/core` 的 dispatch 分支随后接线，接线时整组移进 [`IMPLEMENTED`]，
+/// 能力数才会从 74 变 79。**在此之前它们不在 `core.hello` 的能力清单里**——
+/// 外壳拿着一个没接线的名字去调，只会拿到 `-32601`。
+pub mod lsp {
+    /// 为某个文件（或显式 `language_id`）起一条语言服务器连接。
+    pub const START: &str = "lsp.start";
+    /// 关掉一条连接（`shutdown` → `exit`，超时强杀兜底）。幂等：已关再关不报错。
+    pub const STOP: &str = "lsp.stop";
+    /// 列当前活着的连接（掉线重连后靠它捡回 `server_id`）。
+    pub const SERVERS: &str = "lsp.servers";
+    /// 发一次查询：定义 / 引用 / 悬停 / 补全（方法由枚举限定，不收自由字符串）。
+    pub const REQUEST: &str = "lsp.request";
+    /// 把编辑器里的文本同步给服务器（必要时自动 `didOpen` / `didChange`）。
+    pub const SYNC: &str = "lsp.sync";
+}
+
 /// Core → Main 的通知（事件）。
 pub mod event {
     /// 内核日志转发，便于 Main 侧统一落盘。
@@ -273,6 +301,13 @@ pub mod event {
     pub const TERMINAL_DATA: &str = "terminal.data";
     /// 终端子进程退出（M6）：自然结束、崩溃、被 `terminal.kill` 杀掉都走它。
     pub const TERMINAL_EXIT: &str = "terminal.exit";
+
+    /// 语言服务器推来一批诊断（切片一）。
+    ///
+    /// **整篇替换，不做增量**：服务器每次 `publishDiagnostics` 给的都是某文件的
+    /// 全量清单，按增量下发会让外壳自己维护「上一条还在不在」，一旦漏掉一条
+    /// 就永久残留一个红点。空数组表示「这个文件现在没毛病了」，必须转发。
+    pub const LSP_DIAGNOSTICS: &str = "lsp.diagnostics";
 }
 
 /// 内核**真正接线并可路由**的方法全集，用于单测与能力声明。
@@ -379,16 +414,23 @@ pub const IMPLEMENTED: &[&str] = &[
 
 /// 协议面**已定义、但内核尚未接线**的方法。
 ///
-/// **M2 收尾后本表为空**：`provider.*` / `model.*` / `llm.*` 都已接进
-/// `crates/core` 的 `dispatch.rs`（M4 的 `agent.*` 也已接线，直接进
-/// [`IMPLEMENTED`]）。空表不是「这个机制没用」——它是给后续里程碑
-/// （M5 持久化、M6 终端与 Git、M7 MCP…）留的位置：协议先行定义、实现后补，
-/// 谁没接线谁就待在这里。
+/// 本表在 M2 收尾时曾经清空，现在重新装进 LSP 切片一的五个方法：`lsp.*` 的
+/// 常量与 DTO 先定稿（外壳可以先把面板、命令面板入口接起来），`crates/core`
+/// 的 dispatch 分支随后落地。**先定义方法名而不是等实现完再补**，是为了让
+/// 「未实现」在协议层就有一等公民的位置，而不是让人误以为名字写错了。
 ///
 /// 它们**不能**出现在 [`IMPLEMENTED`] 里：`IMPLEMENTED` 会经 `core.hello`
 /// 回报给 Main 作为能力清单，一旦虚报，Main 会照单调用、然后拿到一片 `-32601`。
 /// 接线时把对应常量从本表移入 [`IMPLEMENTED`]，两张表始终互斥。
-pub const DECLARED_NOT_IMPLEMENTED: &[&str] = &[];
+pub const DECLARED_NOT_IMPLEMENTED: &[&str] = &[
+    // LSP 切片一：协议先行，dispatch 待接线（接线后整组挪进 IMPLEMENTED，
+    // 能力数 74 → 79）。
+    lsp::START,
+    lsp::STOP,
+    lsp::SERVERS,
+    lsp::REQUEST,
+    lsp::SYNC,
+];
 
 #[cfg(test)]
 mod tests {
@@ -497,14 +539,42 @@ mod tests {
         assert!(!IMPLEMENTED.iter().any(|name| name.starts_with("plugin/")));
     }
 
+    /// LSP 切片一：五个方法名先定稿，但**不进**能力清单。
+    ///
+    /// 这条测试同时钉住三件事：字面量（外壳按这些字符串发请求）、
+    /// 落表位置（在 `DECLARED_NOT_IMPLEMENTED` 而非 `IMPLEMENTED`）、
+    /// 以及「能力数保持 74」——虚报能力比不报更糟，Main 会照单调用。
     #[test]
-    fn declared_table_is_empty_after_m2_wiring() {
-        // M2 把 `llm.*` 接进 dispatch 后，没有「定义了但没接线」的方法了。
-        // 一旦有人新增协议方法却忘了接线，这里会先响——比 Main 侧收到
-        // 一片 `-32601` 才发现要好得多。
-        assert!(
-            DECLARED_NOT_IMPLEMENTED.is_empty(),
-            "M2 收尾后待接线方法表应为空，实际：{DECLARED_NOT_IMPLEMENTED:?}"
+    fn lsp_methods_are_declared_but_not_yet_implemented() {
+        assert_eq!(lsp::START, "lsp.start");
+        assert_eq!(lsp::STOP, "lsp.stop");
+        assert_eq!(lsp::SERVERS, "lsp.servers");
+        assert_eq!(lsp::REQUEST, "lsp.request");
+        assert_eq!(lsp::SYNC, "lsp.sync");
+        for name in [lsp::START, lsp::STOP, lsp::SERVERS, lsp::REQUEST, lsp::SYNC] {
+            assert!(
+                DECLARED_NOT_IMPLEMENTED.contains(&name),
+                "{name} 应待在待接线表里"
+            );
+            assert!(
+                !IMPLEMENTED.contains(&name),
+                "{name} 还没接线，不能进能力清单"
+            );
+        }
+        // 诊断是单向通知，永远不进能力清单（见 events_are_not_part_of_the_capability_surface）。
+        assert_eq!(event::LSP_DIAGNOSTICS, "lsp.diagnostics");
+        assert!(!DECLARED_NOT_IMPLEMENTED.contains(&event::LSP_DIAGNOSTICS));
+    }
+
+    #[test]
+    fn declared_table_holds_the_unwired_lsp_five_and_nothing_wired() {
+        // M2 收尾时本表为空；LSP 切片一重新装入五个未接线方法。
+        // 一旦有人新增协议方法却忘了接线、或接线后忘了挪表，这里会先响——
+        // 比 Main 侧收到一片 `-32601` 才发现要好得多。
+        assert_eq!(
+            DECLARED_NOT_IMPLEMENTED,
+            &[lsp::START, lsp::STOP, lsp::SERVERS, lsp::REQUEST, lsp::SYNC,],
+            "待接线表只应有 LSP 五个方法"
         );
         for name in [
             llm::CHAT_STREAM,
@@ -524,9 +594,12 @@ mod tests {
         all.sort_unstable();
         all.dedup();
         assert_eq!(all.len(), total, "两张表不得有重叠");
+        // 已接线仍是 74：LSP 五个只进待接线表，能力数一分不涨。
+        assert_eq!(IMPLEMENTED.len(), 74, "LSP 切片一不改变已接线方法数");
+        assert_eq!(DECLARED_NOT_IMPLEMENTED.len(), 5);
         assert_eq!(
-            total, 74,
-            "应恰好覆盖协议里定义的全部 74 个请求方法（P5 切片二补 `plugin.command`，M3 切片一补 `search.symbols`，M3 切片三补 `inline_edit.propose`）"
+            total, 79,
+            "应恰好覆盖协议里定义的全部 79 个请求方法（74 已接线 + LSP 五个待接线）"
         );
     }
 
@@ -558,6 +631,7 @@ mod tests {
             event::AGENT_FINISHED,
             event::TERMINAL_DATA,
             event::TERMINAL_EXIT,
+            event::LSP_DIAGNOSTICS,
         ] {
             assert!(!IMPLEMENTED.contains(&event), "事件不该进能力清单: {event}");
             assert!(

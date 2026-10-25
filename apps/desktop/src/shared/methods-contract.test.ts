@@ -104,6 +104,11 @@ describe('协议常量', () => {
       pluginCommand: Methods.plugin.command,
       pluginGrant: Methods.plugin.grant,
       pluginRevoke: Methods.plugin.revoke,
+      lspStart: Methods.lsp.start,
+      lspStop: Methods.lsp.stop,
+      lspServers: Methods.lsp.servers,
+      lspRequest: Methods.lsp.request,
+      lspSync: Methods.lsp.sync,
       wsChanged: Methods.event.workspaceChanged,
       wsIndexed: Methods.event.workspaceIndexed,
       providerChanged: Methods.event.providerChanged,
@@ -117,7 +122,8 @@ describe('协议常量', () => {
       agentApprovalRequired: Methods.event.agentApprovalRequired,
       agentFinished: Methods.event.agentFinished,
       terminalData: Methods.event.terminalData,
-      terminalExit: Methods.event.terminalExit
+      terminalExit: Methods.event.terminalExit,
+      lspDiagnostics: Methods.event.lspDiagnostics
     }).toEqual({
       hello: 'core.hello',
       ping: 'core.ping',
@@ -193,6 +199,11 @@ describe('协议常量', () => {
       pluginCommand: 'plugin.command',
       pluginGrant: 'plugin.grant',
       pluginRevoke: 'plugin.revoke',
+      lspStart: 'lsp.start',
+      lspStop: 'lsp.stop',
+      lspServers: 'lsp.servers',
+      lspRequest: 'lsp.request',
+      lspSync: 'lsp.sync',
       wsChanged: 'workspace.changed',
       wsIndexed: 'workspace.indexed',
       providerChanged: 'provider.changed',
@@ -206,7 +217,8 @@ describe('协议常量', () => {
       agentApprovalRequired: 'agent.approval_required',
       agentFinished: 'agent.finished',
       terminalData: 'terminal.data',
-      terminalExit: 'terminal.exit'
+      terminalExit: 'terminal.exit',
+      lspDiagnostics: 'lsp.diagnostics'
     })
   })
 
@@ -294,9 +306,18 @@ describe('协议常量', () => {
     ])
   })
 
-  it('未接线清单已清空（M2 收口），且与已实现清单互斥', () => {
-    // M2 把 llm.* 接进 dispatch 后，「协议已定义」与「内核已接线」的差值应为空。
-    expect([...DECLARED_NOT_IMPLEMENTED_METHODS]).toEqual([])
+  it('未接线清单只含 lsp.* 五项，且与已实现清单互斥', () => {
+    // 协议面（常量 / DTO / 错误码）先落地，dispatch 接线留到下一片：
+    // 这五项必须停在声明表里，进了 IMPLEMENTED 就等于对 core.hello 虚报能力。
+    expect([...DECLARED_NOT_IMPLEMENTED_METHODS]).toEqual([
+      'lsp.start',
+      'lsp.stop',
+      'lsp.servers',
+      'lsp.request',
+      'lsp.sync'
+    ])
+    // 能力数保持 74：本片不动已实现清单。
+    expect(IMPLEMENTED_METHODS).toHaveLength(74)
     for (const method of DECLARED_NOT_IMPLEMENTED_METHODS) {
       // 虚报能力会让外壳照单调进一片 -32601，互斥关系必须钉死。
       expect(IMPLEMENTED_METHODS as readonly string[]).not.toContain(method)

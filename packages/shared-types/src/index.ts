@@ -138,6 +138,33 @@ export type { CompressStrategy } from "./generated/CompressStrategy";
 export type { ContextRef } from "./generated/ContextRef";
 export type { ContextRefKind } from "./generated/ContextRefKind";
 
+// ---- lsp.* 方法（语言服务，切片一：协议面先行，内核未接线）----
+// 坐标一律 1-based 行列：LSP 原生协议用 0-based，但本协议面给外壳用——两者换算
+// 只在内核做一次（`crates/lsp`），外壳与 DTO 都拿 1-based，避免「第一行是 0 还是 1」
+// 这类错误在三个进程间反复传播。
+export type { LspPosition } from "./generated/LspPosition";
+export type { LspRange } from "./generated/LspRange";
+export type { LspServerStatus } from "./generated/LspServerStatus";
+export type { LspServerInfo } from "./generated/LspServerInfo";
+export type { LspStartParams } from "./generated/LspStartParams";
+export type { LspStartResult } from "./generated/LspStartResult";
+export type { LspStopParams } from "./generated/LspStopParams";
+export type { LspStopResult } from "./generated/LspStopResult";
+export type { LspServersParams } from "./generated/LspServersParams";
+export type { LspServersResult } from "./generated/LspServersResult";
+export type { LspRequestMethod } from "./generated/LspRequestMethod";
+export type { LspRequestParams } from "./generated/LspRequestParams";
+export type { LspRequestResult } from "./generated/LspRequestResult";
+export type { LspLocation } from "./generated/LspLocation";
+export type { LspHover } from "./generated/LspHover";
+export type { LspCompletionItem } from "./generated/LspCompletionItem";
+export type { LspCompletionList } from "./generated/LspCompletionList";
+export type { LspSyncParams } from "./generated/LspSyncParams";
+export type { LspSyncResult } from "./generated/LspSyncResult";
+export type { LspDiagnosticSeverity } from "./generated/LspDiagnosticSeverity";
+export type { LspDiagnostic } from "./generated/LspDiagnostic";
+export type { LspDiagnosticsEvent } from "./generated/LspDiagnosticsEvent";
+
 // ---- agent.* 方法（M4）----
 export type { AgentMode } from "./generated/AgentMode";
 export type { AgentRunStatus } from "./generated/AgentRunStatus";
@@ -391,6 +418,16 @@ export const Methods = {
   inlineEdit: {
     propose: "inline_edit.propose",
   },
+  // 语言服务（切片一：协议面先行）。`request` 的 `method` 用枚举字符串而不是裸字符串，
+  // 因为外壳要按它选渲染组件（定义跳转 / 悬浮 / 补全），拼错一个字母就得到空结果，
+  // 那种失败最难查。`stop` 只带 `server_id`——被关的是连接，不是整个语言。
+  lsp: {
+    start: "lsp.start",
+    stop: "lsp.stop",
+    servers: "lsp.servers",
+    request: "lsp.request",
+    sync: "lsp.sync",
+  },
   agent: {
     start: "agent.start",
     stop: "agent.stop",
@@ -470,6 +507,10 @@ export const Methods = {
     agentFinished: "agent.finished",
     terminalData: "terminal.data",
     terminalExit: "terminal.exit",
+    // 诊断是**推送**而非拉取：打开文件后语言服务器随时可能重算，外壳不能靠轮询
+    // （补全型服务器算一次诊断要几十毫秒，轮询会把编辑器拖死）。载荷见
+    // `LspDiagnosticsEvent`，带 `version` 供外壳丢弃过期批次。
+    lspDiagnostics: "lsp.diagnostics",
     // 插件可观测事件（P5 切片七）。名字取自 Rust `crates/plugin/src/events.rs`
     // 的常量（`PLUGIN_LOG` / `PLUGIN_PROGRESS` / `PLUGIN_STATE_CHANGED`）——
     // 这三个不是 `ai_ide_protocol::methods::event` 的成员，因为它们是宿主
@@ -581,5 +622,16 @@ export const IMPLEMENTED_METHODS = [
  *
  * 它**不能**与 `IMPLEMENTED_METHODS` 有交集：`core.hello` 会把已实现清单当能力
  * 回给外壳，一旦虚报，外壳照单调用只会拿到一片 `-32601`。
+ *
+ * 现在这里有 `lsp.*` 五项：协议面（DTO / 常量 / 错误码）已定，`crates/lsp` 的客户端
+ * 与注册表也已落地，但 `crates/core` 的 dispatch 还没接线，因此它们**是能路由之外的
+ * 声明**。放进这张表而不是 `IMPLEMENTED_METHODS`，是为了让 `core.hello` 如实回「还没
+ * 这一项」；接线那一片只需把五行从这张表移到上面那张，`capability` 计数随之 +5。
  */
-export const DECLARED_NOT_IMPLEMENTED_METHODS: readonly string[] = [];
+export const DECLARED_NOT_IMPLEMENTED_METHODS: readonly string[] = [
+  Methods.lsp.start,
+  Methods.lsp.stop,
+  Methods.lsp.servers,
+  Methods.lsp.request,
+  Methods.lsp.sync,
+];
