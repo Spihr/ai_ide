@@ -302,22 +302,22 @@ describe('协议常量', () => {
       'plugin.call',
       'plugin.command',
       'plugin.grant',
-      'plugin.revoke'
-    ])
-  })
-
-  it('未接线清单只含 lsp.* 五项，且与已实现清单互斥', () => {
-    // 协议面（常量 / DTO / 错误码）先落地，dispatch 接线留到下一片：
-    // 这五项必须停在声明表里，进了 IMPLEMENTED 就等于对 core.hello 虚报能力。
-    expect([...DECLARED_NOT_IMPLEMENTED_METHODS]).toEqual([
+      'plugin.revoke',
+      // LSP 切片二：语言服务五项接线完成（crates/core/src/lsp_api.rs）。
       'lsp.start',
       'lsp.stop',
       'lsp.servers',
       'lsp.request',
       'lsp.sync'
     ])
-    // 能力数保持 74：本片不动已实现清单。
-    expect(IMPLEMENTED_METHODS).toHaveLength(74)
+  })
+
+  it('未接线清单为空，且与已实现清单互斥', () => {
+    // `lsp.*` 曾在声明表里待过一片（协议先行、dispatch 后接），接线后整组挪进
+    // IMPLEMENTED：声明表恢复为空才是常态。若这里非空，说明有人加了协议方法却忘了接线。
+    expect([...DECLARED_NOT_IMPLEMENTED_METHODS]).toEqual([])
+    // 能力数 74 → 79：lsp 五项进清单。
+    expect(IMPLEMENTED_METHODS).toHaveLength(79)
     for (const method of DECLARED_NOT_IMPLEMENTED_METHODS) {
       // 虚报能力会让外壳照单调进一片 -32601，互斥关系必须钉死。
       expect(IMPLEMENTED_METHODS as readonly string[]).not.toContain(method)

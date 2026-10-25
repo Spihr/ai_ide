@@ -28,9 +28,20 @@
 //!
 //! ## 与 dispatch 的关系
 //!
-//! 本切片**不接线** `dispatch.rs`：五个 handler 已经可用，但 `lsp.*` 仍在
-//! `DECLARED_NOT_IMPLEMENTED` 里，调用会如实返回 `-32601`。接线（连同能力表搬家）
-//! 留给下一个切片，这样本片的 diff 只碰一个文件 + 一行 `pub mod`。
+//! 五个 handler 已在 `dispatch.rs` 接线，`lsp.*` 五项也已从
+//! `DECLARED_NOT_IMPLEMENTED` 搬进 `IMPLEMENTED`（74 → 79），`core.hello`
+//! 因此如实把它们报成能力。
+//!
+//! ## 诊断是推送，不是应答
+//!
+//! `textDocument/publishDiagnostics` 是服务器**主动推**的通知，没有对应的请求，
+//! 因此它不可能是某个 handler 的返回值：`lsp.start` 一成功就为这条连接挂一个
+//! 转发任务，把来自 [`ai_ide_lsp::LspClient::subscribe`] 的诊断翻成
+//! `event::LSP_DIAGNOSTICS`（`lsp.diagnostics`）推给外壳。
+//!
+//! 任务的生命周期绑在**广播通道**上而不是绑在句柄上：`lsp.stop` 关掉进程后读线程
+//! 结束、发送端随之析构，转发任务收到 `Closed` 自行退出。这样「谁负责收尾」只有
+//! 一处答案，不需要再维护一张「任务表」。
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
@@ -39,16 +50,19 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use ai_ide_lsp::{
-    CommandSpec, LanguageRegistry, LspClient, LspError, ServerOverrides, SourceLocation,
-    SourcePosition, SourceRange,
+    uri_to_path, CommandSpec, LanguageRegistry, LspClient, LspError, ServerOverrides,
+    SourceLocation, SourcePosition, SourceRange,
 };
 use ai_ide_protocol::dto::{
-    LspCompletionItem, LspCompletionList, LspHover, LspLocation, LspPosition, LspRange,
-    LspRequestMethod, LspRequestParams, LspRequestResult, LspServerInfo, LspServerStatus,
-    LspServersParams, LspServersResult, LspStartParams, LspStartResult, LspStopParams,
-    LspStopResult, LspSyncParams, LspSyncResult,
+    LspCompletionItem, LspCompletionList, LspDiagnostic, LspDiagnosticSeverity,
+    LspDiagnosticsEvent, LspHover, LspLocation, LspPosition, LspRange, LspRequestMethod,
+    LspRequestParams, LspRequestResult, LspServerInfo, LspServerStatus, LspServersParams,
+    LspServersResult, LspStartParams, LspStartResult, LspStopParams, LspStopResult, LspSyncParams,
+    LspSyncResult,
 };
-use ai_ide_protocol::{ErrorCode, ErrorObject, Request};
+use ai_ide_protocol::{methods, ErrorCode, ErrorObject, Request};
+use serde_json::Value;
+use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 use crate::dispatch::parse_params;
@@ -330,7 +344,8 @@ impl LspManager {
 
     /// 按 id 找连接，找不到就是 `10003`。
     pub fn require(&self, server_id: &str) -> Result<Arc<LspServerHandle>, ErrorObject> {
-        self.lookup(server_id).ok_or_else(|| unknown_server(server_id))
+        self.lookup(server_id)
+            .ok_or_else(|| unknown_server(server_id))
     }
 
     /// 摘掉一条连接（返回被摘掉的那条）。
@@ -503,9 +518,145 @@ fn protocol_position(position: SourcePosition) -> LspPosition {
 fn lsp_location(location: &SourceLocation) -> LspLocation {
     LspLocation {
         uri: location.uri.clone(),
-        path: location.path.as_ref().map(|path| path.display().to_string()),
+        path: location
+            .path
+            .as_ref()
+            .map(|path| path.display().to_string()),
         range: lsp_range(location.range),
     }
+}
+
+// ---------------------------------------------------------------------------
+// 诊断转发
+// ---------------------------------------------------------------------------
+
+/// 上游的诊断方法名。
+///
+/// 只在这里出现一次：`crates/lsp` 不导出这个常量（它把通知当纯数据广播），
+/// 而协议面的 `event::LSP_DIAGNOSTICS` 是**下行**改名的那个，两者不是同一个名字。
+const PUBLISH_DIAGNOSTICS: &str = "textDocument/publishDiagnostics";
+
+/// LSP 的 0-based 坐标 → 协议面的 1-based。
+///
+/// 与 [`lsp_position`] 的 `saturating_sub` 相反：这里是**上游**给的坐标，
+/// 加一不可能溢出（`u32::MAX` 行的文档不存在），但仍用 `saturating_add` 兜住
+/// 服务器发疯的情况，不 panic。
+fn wire_position(value: &Value) -> Option<LspPosition> {
+    let line = u32::try_from(value.get("line")?.as_i64()?).ok()?;
+    let character = u32::try_from(value.get("character")?.as_i64()?).ok()?;
+    Some(LspPosition {
+        line: line.saturating_add(1),
+        character: character.saturating_add(1),
+    })
+}
+
+/// LSP `DiagnosticSeverity`（1..4 数字）→ 协议枚举。
+///
+/// 缺省 / `0` / 越界一律 `Unknown`，不猜成 `error`：把提示画成红点比不画更糟。
+fn wire_severity(value: Option<&Value>) -> LspDiagnosticSeverity {
+    match value.and_then(Value::as_u64) {
+        Some(1) => LspDiagnosticSeverity::Error,
+        Some(2) => LspDiagnosticSeverity::Warning,
+        Some(3) => LspDiagnosticSeverity::Information,
+        Some(4) => LspDiagnosticSeverity::Hint,
+        _ => LspDiagnosticSeverity::Unknown,
+    }
+}
+
+/// 一条 LSP 诊断 → 协议 DTO。
+///
+/// 缺 `range` 的坏条目返回 `None`：坐标是渲染的唯一依据，编一个 `0:0` 会让红点
+/// 落在文件开头，用户点过去发现什么都没有。
+fn wire_diagnostic(value: &Value) -> Option<LspDiagnostic> {
+    let range = value.get("range")?;
+    Some(LspDiagnostic {
+        range: LspRange {
+            start: wire_position(range.get("start")?)?,
+            end: wire_position(range.get("end")?)?,
+        },
+        severity: wire_severity(value.get("severity")),
+        // `code` 在 LSP 里既可能是字符串（`"TS2304"`）也可能是数字（`2322`），
+        // 统一成字符串：面板要原样展示，数字类型对 UI 没有额外价值。
+        code: value.get("code").and_then(|code| match code {
+            Value::String(code) => Some(code.clone()),
+            Value::Number(code) => Some(code.to_string()),
+            _ => None,
+        }),
+        source: value
+            .get("source")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        message: value
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    })
+}
+
+/// 一条 `publishDiagnostics` 通知 → `lsp.diagnostics` 事件载荷。
+///
+/// 缺 `uri` 时返回 `None`（无处安放诊断）；其余字段都能降级，不因此丢整批。
+fn diagnostics_event(server_id: &str, params: &Value) -> Option<LspDiagnosticsEvent> {
+    let uri = params.get("uri").and_then(Value::as_str)?;
+    Some(LspDiagnosticsEvent {
+        server_id: server_id.to_string(),
+        // uri → 本地路径：外壳按路径给编辑器挂标记。解不出来（非 `file:` 协议）
+        // 就原样回 uri——总比丢事件好，至少面板能显示「有个未知来源的文件」。
+        path: uri_to_path(uri)
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| uri.to_string()),
+        version: params
+            .get("version")
+            .and_then(Value::as_i64)
+            .and_then(|version| i32::try_from(version).ok()),
+        diagnostics: params
+            .get("diagnostics")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().filter_map(wire_diagnostic).collect())
+            .unwrap_or_default(),
+    })
+}
+
+/// 为一条连接挂上诊断转发任务（`lsp.start` 成功后调用）。
+///
+/// 没有 `peer`（进程内单测直接调 handler）时什么都不做：推送需要一个 stdout 出口，
+/// 没有出口就没有推送对象。
+fn spawn_diagnostics_forwarder(state: &AppState, server_id: &str, client: &Arc<LspClient>) {
+    let Some(peer) = state.peer() else {
+        return;
+    };
+    let mut notifications = client.subscribe();
+    let server_id = server_id.to_string();
+    tokio::spawn(async move {
+        loop {
+            match notifications.recv().await {
+                Ok(notification) => {
+                    if notification.method != PUBLISH_DIAGNOSTICS {
+                        continue;
+                    }
+                    let Some(params) = notification.params.as_ref() else {
+                        continue;
+                    };
+                    let Some(event) = diagnostics_event(&server_id, params) else {
+                        continue;
+                    };
+                    peer.notify(methods::event::LSP_DIAGNOSTICS, &event).await;
+                }
+                // 慢消费者被挤掉几条：诊断是「整篇替换」语义，丢中间批次不影响
+                // 最终态（下一次推送会覆盖），所以续读而不是终止。
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(
+                        server_id = %server_id,
+                        skipped,
+                        "诊断通知积压，已跳过过期批次"
+                    );
+                }
+                // 通道关闭＝连接没了（`lsp.stop` 或服务器崩了）：本任务随之结束。
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -562,7 +713,11 @@ pub async fn start(peer: &Peer, state: &AppState, req: &Request) {
                 restarts,
             ));
             let info = handle.info();
+            let client = handle.client().clone();
             manager.insert(handle);
+            // 先挂转发任务再回包：`initialize` 之后服务器可能立刻推一批诊断，
+            // 晚挂就会漏掉首屏那一批（面板要等下一次编辑才有红点）。
+            spawn_diagnostics_forwarder(state, &server_id, &client);
             info!(
                 server_id = %server_id,
                 language = %plan.language_id,
@@ -664,9 +819,10 @@ pub async fn request(peer: &Peer, _state: &AppState, req: &Request) {
     };
 
     let outcome: Result<LspRequestResult, LspError> = match params.method {
-        LspRequestMethod::Definition => client.definition(&path, &text, position).await.map(
-            |locations| echo(locations.iter().map(lsp_location).collect(), None, None),
-        ),
+        LspRequestMethod::Definition => client
+            .definition(&path, &text, position)
+            .await
+            .map(|locations| echo(locations.iter().map(lsp_location).collect(), None, None)),
         LspRequestMethod::References => {
             // 缺省由服务器决定（TypeScript 默认含声明、Pyright 默认不含），
             // 所以只有调用方显式给了才写进 `context`。
@@ -686,10 +842,8 @@ pub async fn request(peer: &Peer, _state: &AppState, req: &Request) {
                 None,
             )
         }),
-        LspRequestMethod::Completion => client
-            .completion(&path, &text, position)
-            .await
-            .map(|list| {
+        LspRequestMethod::Completion => {
+            client.completion(&path, &text, position).await.map(|list| {
                 echo(
                     Vec::new(),
                     None,
@@ -709,7 +863,8 @@ pub async fn request(peer: &Peer, _state: &AppState, req: &Request) {
                             .collect(),
                     }),
                 )
-            }),
+            })
+        }
     };
 
     match outcome {
@@ -784,7 +939,11 @@ mod tests {
         let manager = LspManager::new();
         let error = manager.require("no-such-server").expect_err("必须报错");
         assert_eq!(error.code, ErrorCode::LSP_SERVER_UNKNOWN);
-        assert!(error.message.contains("no-such-server"), "{}", error.message);
+        assert!(
+            error.message.contains("no-such-server"),
+            "{}",
+            error.message
+        );
         // 摘一个不存在的句柄要回 None（`lsp.stop` 靠它区分 10003 与幂等关闭）。
         assert!(manager.remove("no-such-server").is_none());
     }

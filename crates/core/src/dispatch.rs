@@ -11,6 +11,7 @@ use crate::checkpoint_api;
 use crate::git_api;
 use crate::inline_edit_api;
 use crate::llm_api;
+use crate::lsp_api;
 use crate::mcp_api;
 use crate::peer::Peer;
 use crate::permission_api;
@@ -174,6 +175,15 @@ async fn handle_request(peer: &Peer, state: &AppState, req: Request) {
         methods::plugin::COMMAND => plugin_api::command(peer, state, &req).await,
         methods::plugin::GRANT => plugin_api::grant(peer, state, &req).await,
         methods::plugin::REVOKE => plugin_api::revoke(peer, state, &req).await,
+
+        // 语言服务（LSP 切片二）：五个方法都是真实实现，连接池按
+        // `workspace_id → server_id` 复用；诊断不走这里，是 `lsp.start`
+        // 之后由转发任务推 `lsp.diagnostics` 通知。
+        methods::lsp::START => lsp_api::start(peer, state, &req).await,
+        methods::lsp::STOP => lsp_api::stop(peer, state, &req).await,
+        methods::lsp::SERVERS => lsp_api::servers(peer, state, &req).await,
+        methods::lsp::REQUEST => lsp_api::request(peer, state, &req).await,
+        methods::lsp::SYNC => lsp_api::sync(peer, state, &req).await,
 
         other => {
             warn!(method = %other, "未实现的方法");

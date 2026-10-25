@@ -14,6 +14,7 @@
 //! | `mock/echo` | 原样回 `params` |
 //! | `mock/state` | 回当前文档表与握手状态（验证 didOpen/didChange/didClose） |
 //! | `mock/diagnostics` | 先推一条 `textDocument/publishDiagnostics` 通知，再回 `null` |
+//! | `textDocument/didOpen` | 记文档；文本里带 [`DIAGNOSTICS_MARKER`] 时**顺带推一条诊断** |
 //! | `mock/sleep` | 睡 `params.ms` 毫秒后再回 `null`（测超时） |
 //! | `mock/crash` | **不回包直接退出**（码 3，测服务器中途退出） |
 //! | `mock/malformed` | 写一个非法帧头（`Content-Length: oops`，测非法帧） |
@@ -33,6 +34,15 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 
 use serde_json::{json, Value};
+
+/// 「打开即推诊断」的触发标记。
+///
+/// 为什么要这个开关：诊断是服务器**主动推**的通知，而上层（`crates/core`）的
+/// `lsp.request` 只暴露四类查询，没有任何「让服务器推一条诊断」的入口。要用
+/// 端到端测试钉住「诊断 → 事件转发」这条链路，就得让服务器在收到某个它本来就会
+/// 收到的消息时自己推一条。挂在 `didOpen` 上、并且只在文本里出现这个标记时才推，
+/// 才不会影响别的用例——那些用例的文档里不会出现这行注释。
+pub const DIAGNOSTICS_MARKER: &str = "// mock:publish-diagnostics";
 
 /// 打开的文档快照。
 #[derive(Debug, Clone)]
@@ -109,14 +119,41 @@ fn handle(
             "textDocument/didOpen" => {
                 server.did_open_count += 1;
                 let doc = &params["textDocument"];
+                let uri = doc["uri"].as_str().unwrap_or_default().to_string();
+                let text = doc["text"].as_str().unwrap_or_default().to_string();
+                let version = doc["version"].as_i64().unwrap_or_default();
+                let publishes = text.contains(DIAGNOSTICS_MARKER);
                 server.documents.insert(
-                    doc["uri"].as_str().unwrap_or_default().to_string(),
+                    uri.clone(),
                     Document {
                         language_id: doc["languageId"].as_str().unwrap_or_default().to_string(),
-                        version: doc["version"].as_i64().unwrap_or_default(),
-                        text: doc["text"].as_str().unwrap_or_default().to_string(),
+                        version,
+                        text,
                     },
                 );
+                // 打开即推一条诊断：让上层能在「没有原始 LSP 通道」的前提下验证
+                // `publishDiagnostics` → `lsp.diagnostics` 的转发。推完不必等回执
+                // （通知单向），紧跟着的 `lsp.sync` 响应照常回。
+                if publishes {
+                    send_notification(
+                        writer,
+                        "textDocument/publishDiagnostics",
+                        json!({
+                            "uri": uri,
+                            "version": version,
+                            "diagnostics": [{
+                                "range": {
+                                    "start": {"line": 0, "character": 0},
+                                    "end": {"line": 0, "character": 3}
+                                },
+                                "severity": 2,
+                                "code": "MOCK1001",
+                                "source": "lsp-mock-server",
+                                "message": "打开文档时推送的诊断"
+                            }]
+                        }),
+                    )?;
+                }
             }
             "textDocument/didChange" => {
                 server.did_change_count += 1;

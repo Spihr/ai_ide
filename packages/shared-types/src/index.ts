@@ -535,7 +535,9 @@ export const Methods = {
  * P5 切片二把其中第 11 项 `plugin.command`（命令网关）补成真实现，
  * 再加 M3 切片一的 `search.symbols`（符号检索内核面：七种语言的声明抽取，
  * 外壳入口留待下一片），以及 M3 切片三的 `inline_edit.propose`（选区改写内核面：
- * 一次补全 + 结构化 diff，内核不写盘），共 74 项，与 Rust `methods::IMPLEMENTED` 逐项对齐。
+ * 一次补全 + 结构化 diff，内核不写盘），再加语言服务的 `lsp.*` 五项（启动 /
+ * 关闭 / 清单 / 查询 / 同步，内核 `lsp_api.rs` 已接线），共 79 项，
+ * 与 Rust `methods::IMPLEMENTED` 逐项对齐。
  */
 export const IMPLEMENTED_METHODS = [
   Methods.core.hello,
@@ -612,6 +614,11 @@ export const IMPLEMENTED_METHODS = [
   Methods.plugin.command,
   Methods.plugin.grant,
   Methods.plugin.revoke,
+  Methods.lsp.start,
+  Methods.lsp.stop,
+  Methods.lsp.servers,
+  Methods.lsp.request,
+  Methods.lsp.sync,
 ] as const;
 
 /**
@@ -623,15 +630,8 @@ export const IMPLEMENTED_METHODS = [
  * 它**不能**与 `IMPLEMENTED_METHODS` 有交集：`core.hello` 会把已实现清单当能力
  * 回给外壳，一旦虚报，外壳照单调用只会拿到一片 `-32601`。
  *
- * 现在这里有 `lsp.*` 五项：协议面（DTO / 常量 / 错误码）已定，`crates/lsp` 的客户端
- * 与注册表也已落地，但 `crates/core` 的 dispatch 还没接线，因此它们**是能路由之外的
- * 声明**。放进这张表而不是 `IMPLEMENTED_METHODS`，是为了让 `core.hello` 如实回「还没
- * 这一项」；接线那一片只需把五行从这张表移到上面那张，`capability` 计数随之 +5。
+ * `lsp.*` 五项曾在这里待过一片：协议面（DTO / 常量 / 错误码）先定，`crates/lsp`
+ * 客户端与注册表随后落地，最后 `crates/core` 的 dispatch 接线。接线完成后整组挪进
+ * `IMPLEMENTED_METHODS`（74 → 79），本表随之清空——这才是它该有的常态。
  */
-export const DECLARED_NOT_IMPLEMENTED_METHODS: readonly string[] = [
-  Methods.lsp.start,
-  Methods.lsp.stop,
-  Methods.lsp.servers,
-  Methods.lsp.request,
-  Methods.lsp.sync,
-];
+export const DECLARED_NOT_IMPLEMENTED_METHODS: readonly string[] = [];
