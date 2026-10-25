@@ -26,6 +26,7 @@ import {
   type PluginCommandSource
 } from './command-registry'
 import { pluginApi, pluginErrorCode, pluginErrorMessage } from './plugin-api'
+import { openInlineEdit } from './inline-edit-store'
 import { openSymbolPicker } from './symbol-picker-store'
 import {
   getEditorState,
@@ -60,7 +61,9 @@ export const builtinActions: BuiltinCommandActions = {
   showView: (view) => setActivity(view),
   toggleTerminal: () => toggleTerminalPanel(),
   // 面板自己先 `closePalette()` 再执行，所以这里只要把符号浮层叫起来即可。
-  gotoSymbol: () => openSymbolPicker()
+  gotoSymbol: () => openSymbolPicker(),
+  // 内联编辑同理；「没有选区」的提示由 `openInlineEdit` 自己发，面板不重复判。
+  inlineEdit: () => openInlineEdit()
 }
 
 /**

@@ -34,7 +34,10 @@ function fakeActions(): BuiltinCommandActions {
     saveActiveTab: vi.fn(),
     showView: vi.fn(),
     toggleTerminal: vi.fn(),
-    gotoSymbol: vi.fn()
+    gotoSymbol: vi.fn(),
+    // 切片三：内联编辑入口。它的「有没有选区」判断在 `inline-edit-store` 里，
+    // 注册表只负责把点击转给这个动作。
+    inlineEdit: vi.fn()
   }
 }
 

@@ -75,6 +75,16 @@ export interface EditorSelection {
   startLine: number
   /** 结束行（1-based，含）。 */
   endLine: number
+  /**
+   * 起始列（**0-based**，含）——与内核 `TextSelection.start_column` 同一口径。
+   *
+   * 列是可选的两件事之一：对话面板的「引用」只要行范围，而 Inline Edit（Ctrl+K）
+   * 必须精确到列，否则「把这一行改成早退」会把整行连同缩进一起重写。老的上报方
+   * （或测试）不传列时，`null` 语义由使用方决定：引用照旧、改写按整行处理。
+   */
+  startColumn?: number
+  /** 结束列（0-based，不含）。缺失时表示「到该行行尾」。 */
+  endColumn?: number
 }
 
 /** 内容搜索点击后要在编辑器里定位的位置。 */
@@ -204,6 +214,16 @@ function relPath(absPath: string): string {
   const base = normalize(root).replace(/\/+$/, '')
   if (target === base) return ''
   return target.startsWith(`${base}/`) ? target.slice(base.length + 1) : absPath
+}
+
+/**
+ * 绝对路径 → 相对工作区根的路径（`/` 分隔）。不在工作区内时原样返回。
+ *
+ * 对外暴露的理由：`inline_edit.propose` 的 `path` 与 `workspace.*` 同口径（相对根、
+ * 正斜杠），而 Inline Edit 的浮层活在独立 store 里，拿不到这里的私有函数。
+ */
+export function workspaceRelativePath(absPath: string): string {
+  return relPath(absPath)
 }
 
 function parentRel(rel: string): string {
@@ -436,6 +456,18 @@ export function updateContent(path: string, content: string): void {
   patchTab(path, { content })
 }
 
+/**
+ * 由外壳自己写盘之后的回填（Inline Edit 接受建议走这里）。
+ *
+ * 与 `saveTab` 的区别只有「谁发起写」：写请求已经由 `inline-edit-store` 发完了，
+ * 这里只把内存里的标签对齐到磁盘上的新状态——`content` 与 `savedContent` 一起换，
+ * 于是标签算干净（没有未保存改动），`hash` 换成写回后的新值，否则下一次保存会拿旧
+ * hash 去撞 CAS 直接失败。
+ */
+export function applyWrittenContent(path: string, content: string, hash: string): void {
+  patchTab(path, { content, savedContent: content, hash, error: null })
+}
+
 /** 保存标签；返回是否真的写盘。 */
 export async function saveTab(path?: string): Promise<boolean> {
   const target = path ?? state.activePath
@@ -464,7 +496,15 @@ export async function saveTab(path?: string): Promise<boolean> {
 function sameSelection(a: EditorSelection | null, b: EditorSelection | null): boolean {
   if (a === b) return true
   if (!a || !b) return false
-  return a.path === b.path && a.startLine === b.startLine && a.endLine === b.endLine
+  // 列也要比：单选一行内拖动时行号没变，只有列在变；漏掉列会让选区快照永远停在
+  // 第一次上报的位置，Ctrl+K 拿到的是几秒前的那一段。
+  return (
+    a.path === b.path &&
+    a.startLine === b.startLine &&
+    a.endLine === b.endLine &&
+    a.startColumn === b.startColumn &&
+    a.endColumn === b.endColumn
+  )
 }
 
 /**
@@ -486,6 +526,19 @@ export function setEditorSelection(selection: EditorSelection | null): void {
     path: selection.path,
     startLine: Math.min(startLine, endLine),
     endLine: Math.max(startLine, endLine)
+  }
+  // 列是可选的：只有两端都是 ≥0 的整数才采纳，否则保持「整行」语义——宁可把范围
+  // 放宽到行，也不要拿一个半截的列去让内核按越界拒绝（9001）。
+  const startColumn = selection.startColumn
+  const endColumn = selection.endColumn
+  if (
+    Number.isInteger(startColumn) &&
+    Number.isInteger(endColumn) &&
+    (startColumn as number) >= 0 &&
+    (endColumn as number) >= 0
+  ) {
+    next.startColumn = startColumn
+    next.endColumn = endColumn
   }
   if (sameSelection(state.selection, next)) return
   set({ selection: next })

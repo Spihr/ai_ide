@@ -12,6 +12,7 @@ import { CommandPalette } from './components/CommandPalette'
 import { EditorTabs } from './components/EditorTabs'
 import { FileTree } from './components/FileTree'
 import { GitPanel } from './components/GitPanel'
+import { InlineEditOverlay } from './components/InlineEditOverlay'
 import { McpPanel } from './components/McpPanel'
 import { PermissionPanel } from './components/PermissionPanel'
 import { PluginPanel } from './components/PluginPanel'
@@ -23,6 +24,7 @@ import { TerminalPanel } from './components/TerminalPanel'
 import { initCheckpoints } from './checkpoint-store'
 import { togglePalette } from './command-palette-store'
 import { initGit } from './git-store'
+import { openInlineEdit } from './inline-edit-store'
 import { initSessions } from './session-store'
 import { initPluginActivityEvents } from './plugin-activity-store'
 import { resolveShortcut } from './shortcuts'
@@ -121,6 +123,11 @@ export function App() {
         case 'symbols':
           // Ctrl+T：转到符号（`search.symbols` 的浮层入口，与命令面板里的同名命令同源）。
           toggleSymbolPicker()
+          break
+        case 'inline-edit':
+          // Ctrl+K：内联编辑。不判「有没有选区」——那件事由 `openInlineEdit` 做，
+          // 无选区时它只发提示，不会吞掉按键去干别的。
+          openInlineEdit()
           break
       }
     }
@@ -246,6 +253,9 @@ export function App() {
 
       {/* 切片二：Ctrl+T 的「转到符号」浮层，与命令面板同一个层级、同样的遮罩。 */}
       <SymbolPicker />
+
+      {/* 切片三：Ctrl+K 的内联编辑浮层（指令输入 → diff 预览 → 接受/拒绝）。 */}
+      <InlineEditOverlay />
 
       {state.notice && (
         <div className={`notice notice--${state.notice.kind}`} onClick={dismissNotice} role="alert">

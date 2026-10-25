@@ -75,7 +75,7 @@
 
 - 协议面：`terminal.*` / `git.*` / `mcp.*` / `search.symbols` / `workspace.indexed` / `core.log` 主动推送（`DECLARED_NOT_IMPLEMENTED` 目前为空表，这些方法尚未进协议常量表；M4 的 `agent.*` 与 M5 的 `checkpoint.*` / `permission.*` 已接线并进入 `IMPLEMENTED`）
 - 模块：`mcp` / `terminal` / `parser`
-- 界面：M2 的 Provider 配置 / 对话面板、M3 的 `@` 补全与引用 chip、M4 的 Agent 运行面板与审批卡片、M5 的会话 / 检查点 / 权限面板均已接入渲染端；Inline Edit（Ctrl+K）、Tab 补全、LSP、列表与审计分页加载、消息级分叉入口未开工
+- 界面：M2 的 Provider 配置 / 对话面板、M3 的 `@` 补全与引用 chip、M4 的 Agent 运行面板与审批卡片、M5 的会话 / 检查点 / 权限面板、M3 的 Inline Edit（Ctrl+K 浮层 + diff 预览，命令面板「内联编辑」同入口）均已接入渲染端；Tab 补全、LSP、列表与审计分页加载、消息级分叉入口未开工
 
 ### 质量门禁实测（2026-10-22，M5 收尾 + P1 文档与 CI 收口）
 

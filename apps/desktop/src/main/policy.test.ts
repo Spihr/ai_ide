@@ -272,6 +272,9 @@ describe('checkRendererCall', () => {
       'git.diff',
       'git.stage',
       'git.status',
+      // 切片三：内联编辑只放行 `propose`——写盘仍是 `workspace.write_file`，
+      // 内核不越权改文件，外壳也就没必要给它开一个新口子。
+      'inline_edit.propose',
       'llm.cancel',
       'llm.chat_stream',
       'llm.count_tokens',

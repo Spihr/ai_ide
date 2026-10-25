@@ -1882,3 +1882,87 @@ button {
 .plugin-activity .panel__hint {
   padding: 8px;
 }
+
+/*
+ * 切片三：Ctrl+K 的内联编辑浮层。
+ *
+ * 复用 `.palette*` 的骨架（位置、阴影、输入框、页脚），只补三块：目标行的地址栏、
+ * 指令输入区（两行 textarea + 提交按钮）、以及 diff 预览的固定高度画布。
+ * diff 高度用 `min(46vh, 420px)`：太矮看不出上下文，太高会把浮层顶出视口。
+ */
+.inline-edit {
+  width: min(820px, 94vw);
+}
+
+.inline-edit__header {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 10px 12px 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.inline-edit__glyph {
+  flex: none;
+  color: var(--accent);
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 13px;
+}
+
+.inline-edit__target {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.inline-edit__input-row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 10px 12px;
+}
+
+.inline-edit__input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel-2);
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.inline-edit__input:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.inline-edit__diff {
+  height: min(46vh, 420px);
+  margin: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.inline-edit__diff-note {
+  padding: 6px 12px 0;
+  color: var(--muted);
+  font-size: 11px;
+  opacity: 0.85;
+}
+
+.inline-edit__actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}

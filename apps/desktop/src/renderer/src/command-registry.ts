@@ -66,6 +66,14 @@ export interface BuiltinCommandActions {
   toggleTerminal: () => void | Promise<void>
   /** 唤出「转到符号」快速选择器（`Ctrl+T`，符号检索的浮层入口）。 */
   gotoSymbol: () => void | Promise<void>
+  /**
+   * 唤出内联编辑浮层（`Ctrl+K`，选区改写的入口）。
+   *
+   * 与 `gotoSymbol` 分开而不是复用一个 `showOverlay(name)`：两者的前置条件不同
+   * （内联编辑要求「有文件 + 有选区」），共用一个动作就得让面板知道这些条件，
+   * 而那份判断应该留在 `inline-edit-store` 里。
+   */
+  inlineEdit: () => void | Promise<void>
 }
 
 export interface BuiltinCommandSpec {
@@ -118,6 +126,14 @@ export const BUILTIN_COMMAND_SPECS: readonly BuiltinCommandSpec[] = [
     // 拼音首字母与「符号」放在一起：用户记不住图标名时，最可能输入的就是 Ctrl+T。
     keywords: ['symbol', 'goto symbol', '符号', 'zhdf', 'ctrlt', '跳转'],
     run: (actions) => actions.gotoSymbol()
+  },
+  {
+    id: 'edit.inline',
+    title: '内联编辑…',
+    description: '选中代码后说一句要改成什么，看 diff 再决定写不写（Ctrl+K）',
+    // 「AI 改代码」这条同义词也收进来：用户找它时未必知道叫「内联编辑」。
+    keywords: ['inline edit', 'inline', 'ai 改代码', 'nl', '内联编辑', '改写', 'ctrlk'],
+    run: (actions) => actions.inlineEdit()
   },
   {
     id: 'view.ai',

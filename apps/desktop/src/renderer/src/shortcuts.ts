@@ -18,6 +18,7 @@ export type ShortcutAction =
   | 'explorer'
   | 'terminal'
   | 'symbols'
+  | 'inline-edit'
 
 /** 只取按键里用得到的几个字段，方便测试直接构造，不必造 `KeyboardEvent`。 */
 export interface ShortcutEvent {
@@ -44,6 +45,14 @@ export function resolveShortcut(event: ShortcutEvent): ShortcutAction | null {
    * 「工作区符号」之类，这里先不吞键。
    */
   if (key === 't') return shift ? null : 'symbols'
+  /**
+   * `Ctrl+K`：内联编辑（选中代码 → 说一句要改成什么）。与 VS Code 同键。
+   *
+   * 这里**不判断有没有选区**：拦截键位是窗口级的，判断「选中了没有」要么去读 store
+   * （纯函数就不纯了）、要么在 App 里再写一遍。统一交给 `openInlineEdit`——它在
+   * 无选区时只弹提示，不会吞掉用户的按键去干别的。
+   */
+  if (key === 'k') return shift ? null : 'inline-edit'
   // `Ctrl+`` 开关终端；macOS 的 `Cmd+`` 是系统级窗口切换，不抢。
   if (key === '`') return event.metaKey === true ? null : 'terminal'
   return null

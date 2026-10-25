@@ -51,6 +51,15 @@ const RENDERER_ALLOWED = new Set<string>([
   Methods.llm.listModels,
   Methods.llm.countTokens,
 
+  // M3 切片三：Inline Edit（`Ctrl+K`）。放行的是**生成建议**这一步，而且这一步
+  // 本身不写盘——内核只回 `original` / `replacement` / `diff`。所以这条比
+  // `workspace.write_file` 还弱：用户点「接受」之后才由外壳走那条已经在白名单里的
+  // 写文件方法（带预期 hash，撞 CAS 就失败）。
+  //
+  // 触发路径同样只有「用户显式动作」：选中代码后按 Ctrl+K、打一条指令、回车。
+  // 选区越界由内核回 9001、模型没回代码回 9003，都不存在自动重试的入口。
+  Methods.inlineEdit.propose,
+
   // M4：Agent 运行。三条方法都是「用户显式动作」的产物，没有自动发起的路径：
   // `agent.start` 由按下「启动」触发，`agent.stop` 由按下「停止」触发，
   // `agent.decide` 只能由用户对某一次 `agent.approval_required` 按下裁决触发。
