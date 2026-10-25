@@ -10,6 +10,7 @@
 
 import { useEffect, useRef } from 'react'
 
+import { registerLspProviders } from '../lsp-providers'
 import { languageForPath, monaco } from '../monaco-setup'
 import { clearReveal, setEditorSelection, updateContent, useEditor } from '../store'
 
@@ -78,6 +79,12 @@ export function CodeEditor() {
     editorRef.current = editor
     currentRef.current = null
 
+    // 四个语言服务 provider（定义 / 引用 / 悬停 / 补全）挂在编辑器初始化这一处：
+    // Monaco 的 provider 注册是全局的、与具体 editor 实例无关，所以只注册一次。
+    // 幂等由 `registerLspProviders` 自己保证；卸载时撤销，避免 HMR 之后重复注册
+    // 导致每次查询跑两遍、定义列表出现重复项。
+    const disposeLspProviders = registerLspProviders(monaco)
+
     const subscription = editor.onDidChangeModelContent(() => {
       if (applyingRef.current) return
       const path = currentRef.current
@@ -94,6 +101,7 @@ export function CodeEditor() {
     const views = viewsRef.current
 
     return () => {
+      disposeLspProviders()
       subscription.dispose()
       selectionSubscription.dispose()
       editor.dispose()

@@ -404,6 +404,95 @@ export async function syncFile(path: string, content: string, serverId?: string)
 }
 
 /**
+ * 重启当前语言的服务器（命令面板「重启语言服务器」的唯一入口）。
+ *
+ * 语义是「停掉再按同一份文件起一条」：`stop` 之后内核里那条连接连同进程都消失，
+ * `startServer` 会重新走一遍 `lsp.start`（命令缺失时照旧降级成 `unavailable`，
+ * 不抛给调用方）。
+ *
+ * `content` 可选：命令面板拿得到活动标签的缓冲，传进来就能把未保存的改动一并推给
+ * 新进程；不传则让内核读磁盘（`lsp.sync` 的 `content` 缺省即读盘）。**不给空串**——
+ * 空串会被当成「文件被清空了」推过去，是最坏的一种误伤。
+ */
+export async function restart(input?: { content?: string; root?: string }): Promise<boolean> {
+  const path = state.path
+  const languageId = state.languageId
+  if (path === null || languageId === null) return false
+
+  await stop({ languageId })
+  const started = await startServer({
+    path,
+    languageId,
+    ...(input?.root === undefined ? {} : { root: input.root })
+  })
+  if (!started) return false
+
+  if (input?.content === undefined) {
+    // 没拿到缓冲就退回「内核读盘」：`syncFile` 必传 content，这里单独发一次不带
+    // content 的同步，免得把空字符串推成文件内容。
+    return await syncFromDisk(path)
+  }
+  return await syncFile(path, input.content)
+}
+
+/** 不带正文的同步（内核读盘）。只给 `restart` 用。 */
+async function syncFromDisk(path: string): Promise<boolean> {
+  const id = state.serverId
+  if (id === null) return false
+  try {
+    await lspApi.sync(id, path)
+    return true
+  } catch (error) {
+    setState({ notice: describeLspError(error) })
+    return false
+  }
+}
+
+/**
+ * 一行状态摘要（命令面板「查看语言服务器状态」用）。
+ *
+ * 做成**纯函数**：状态栏之外的入口要的是「所有事实压成一句」，而 notice 条只有
+ * 一行高，逐连接列表得等有面板再说。没打开文件 / 没起过服务时也给一句确定的回答，
+ * 而不是让命令点了没反应。
+ */
+export function statusSummary(current: LspState = state): string {
+  const connections = Object.values(current.connections)
+  if (current.path === null) {
+    return connections.length === 0
+      ? 'LSP：还没有打开文件，语言服务未启动。'
+      : `LSP：当前没有打开文件；本会话有 ${connections.length} 条连接（${connections
+          .map((connection) => connection.languageId)
+          .join('、')}）。`
+  }
+
+  const language = languageLabel(current.languageId)
+  const connection =
+    current.languageId === null ? null : (current.connections[current.languageId] ?? null)
+  const problems = currentFileDiagnostics(current)?.problems ?? 0
+  const head = `${language.length > 0 ? language : '当前文件'}：${statusLabel(current)}`
+
+  if (connection === null) {
+    return `LSP ${head}${current.notice === null ? '' : `（${current.notice}）`}；当前文件 ${problems} 个问题。`
+  }
+
+  const pid = connection.pid === undefined ? '' : `，PID ${connection.pid}`
+  return `LSP ${head}，命令 ${connection.command}${pid}，重启 ${connection.restarts} 次；本会话 ${connections.length} 条连接；当前文件 ${problems} 个问题。`
+}
+
+/**
+ * 当前可用的连接句柄（providers 的判断依据）。
+ *
+ * 「可用」= 有连接且状态是 `ready` / `starting`；降级、崩溃、主动停掉的都回 `null`，
+ * provider 据此直接返回空结果而不是发一次注定失败的 `lsp.request`。
+ */
+export function activeServerId(): string | null {
+  const languageId = state.languageId
+  if (languageId === null) return null
+  const connection = state.connections[languageId] ?? null
+  return isUsable(connection) ? connection.serverId : null
+}
+
+/**
  * 关掉当前语言的连接并清标记。
  *
  * 清标记是 `stop` 的必要动作：内核不再推诊断了，旧的红点会永久留着，看起来像
