@@ -593,6 +593,88 @@ pub struct SearchSymbolsResult {
 }
 
 // ---------------------------------------------------------------------------
+// inline_edit.* —— 选区改写（M3 切片三）
+// ---------------------------------------------------------------------------
+
+/// 编辑器选区。**行号 1 起算、闭区间；列号 0 起算、右开区间**（与 LSP 的
+/// `Range` 同口径，也与 `workspace.read_file` 回传的行序对得上）。
+///
+/// 两套基数是刻意的：人读行号从 1 开始，Monaco / VS Code 的列坐标从 0 开始。
+/// 把它们统一成同一套基数，只会让其中一侧每次都差一行或差一列。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TextSelection {
+    /// 起始行（含，1 起算）。
+    #[ts(type = "number")]
+    pub start_line: u32,
+    /// 起始列（含，0 起算）。
+    #[ts(type = "number")]
+    pub start_column: u32,
+    /// 结束行（含，1 起算）。
+    #[ts(type = "number")]
+    pub end_line: u32,
+    /// 结束列（不含，0 起算）。
+    #[ts(type = "number")]
+    pub end_column: u32,
+}
+
+/// `inline_edit.propose` 请求参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct InlineEditProposeParams {
+    pub workspace_id: String,
+    /// 相对工作区根的路径，`/` 分隔。
+    pub path: String,
+    /// 自然语言指令，例如「改成早退返回」「补上错误处理」。
+    pub instruction: String,
+    pub selection: TextSelection,
+    /// 选区上下各带几行上下文，缺省 40。上限 400——再多也塞不进上下文预算，
+    /// 且模型对超长前缀的定位能力会明显下降。
+    #[serde(default)]
+    pub context_lines: Option<u32>,
+    /// 走哪个模型；缺省时用工作区/全局默认模型。与 `llm.chat_stream` 同一个结构。
+    #[serde(default)]
+    pub model_ref: Option<ModelRef>,
+}
+
+/// `inline_edit.propose` 响应结果。**内核不写盘**，只描述「应该改成什么」。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct InlineEditProposeResult {
+    /// 原样回显目标路径（相对工作区根），外壳据此确认补丁打在哪份文件上。
+    pub path: String,
+    /// 实际被替换的选区。与请求原样一致——越界不会被「体贴地」收拢到合法范围，
+    /// 而是直接回 9001：静默改选区会让用户的补丁打在没画到的地方。
+    pub range: TextSelection,
+    /// 被替换的原文（按 `range` 切出来的精确片段，不含上下文）。
+    pub original: String,
+    /// 模型给出的替换文本（已去掉代码围栏；无围栏时取整段响应）。
+    pub replacement: String,
+    /// 统一格式补丁（`--- a/<path>` / `+++ b/<path>`），可直接交给 diff 视图渲染。
+    pub diff: String,
+    /// 上游用量；provider 没回传时缺省（不是补零——0 与「未上报」含义不同，
+    /// 计费面板把两者混起来就会少算）。
+    #[serde(default)]
+    pub usage: Option<InlineEditUsage>,
+}
+
+/// Inline Edit 的用量。字段与 `llm.usage` 事件同口径，但独立成协议结构：
+/// `ai-ide-protocol` 不依赖 `ai-ide-llm`（契约层不能反过来依赖实现层），
+/// 因此这里只能是镜像，而不是复用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct InlineEditUsage {
+    #[ts(type = "number")]
+    pub prompt_tokens: u64,
+    #[ts(type = "number")]
+    pub completion_tokens: u64,
+    /// 命中提示缓存的 token 数；上游未报为 `None`。
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub cached_tokens: Option<u64>,
+}
+
+// ---------------------------------------------------------------------------
 // provider.* / model.* —— Provider 与模型目录（M2）
 // ---------------------------------------------------------------------------
 

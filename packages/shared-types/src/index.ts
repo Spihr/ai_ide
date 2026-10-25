@@ -125,6 +125,12 @@ export type { LlmUsageEvent } from "./generated/LlmUsageEvent";
 export type { ToolChoice } from "./generated/ToolChoice";
 export type { ToolSpec } from "./generated/ToolSpec";
 
+// ---- inline_edit.* 方法（M3 切片三：选区改写）----
+export type { InlineEditProposeParams } from "./generated/InlineEditProposeParams";
+export type { InlineEditProposeResult } from "./generated/InlineEditProposeResult";
+export type { InlineEditUsage } from "./generated/InlineEditUsage";
+export type { TextSelection } from "./generated/TextSelection";
+
 // ---- 上下文引用（M3）----
 export type { ChatContext } from "./generated/ChatContext";
 export type { CompressOptions } from "./generated/CompressOptions";
@@ -380,6 +386,11 @@ export const Methods = {
     listModels: "llm.list_models",
     countTokens: "llm.count_tokens",
   },
+  // M3 切片三：选区改写。语义上贴着 llm.*，但它是「编辑器动作」而非「一轮对话」，
+  // 因此单起一个命名空间——外壳以后要按这个前缀决定「不进会话、不写盘」。
+  inlineEdit: {
+    propose: "inline_edit.propose",
+  },
   agent: {
     start: "agent.start",
     stop: "agent.stop",
@@ -482,7 +493,8 @@ export const Methods = {
  * 以及插件系统 P0 的 `plugin.*` 十项（协议骨架：能路由，但统一回 6101）——
  * P5 切片二把其中第 11 项 `plugin.command`（命令网关）补成真实现，
  * 再加 M3 切片一的 `search.symbols`（符号检索内核面：七种语言的声明抽取，
- * 外壳入口留待下一片），共 73 项，与 Rust `methods::IMPLEMENTED` 逐项对齐。
+ * 外壳入口留待下一片），以及 M3 切片三的 `inline_edit.propose`（选区改写内核面：
+ * 一次补全 + 结构化 diff，内核不写盘），共 74 项，与 Rust `methods::IMPLEMENTED` 逐项对齐。
  */
 export const IMPLEMENTED_METHODS = [
   Methods.core.hello,
@@ -513,6 +525,7 @@ export const IMPLEMENTED_METHODS = [
   Methods.llm.cancel,
   Methods.llm.listModels,
   Methods.llm.countTokens,
+  Methods.inlineEdit.propose,
   Methods.agent.start,
   Methods.agent.stop,
   Methods.agent.decide,

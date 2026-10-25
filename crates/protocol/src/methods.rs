@@ -68,6 +68,19 @@ pub mod llm {
     pub const COUNT_TOKENS: &str = "llm.count_tokens";
 }
 
+/// Inline Edit（M3 切片三：选区改写）。
+///
+/// 与 `llm.chat_stream` 的分工：那条是「对话」，流式、多轮、由 UI 拼消息；
+/// 这条是「编辑器里的一个动作」——给一段选区与一句指令，要回一段可直接落盘的替换文本。
+/// 因此它一次调用即返回完整结果，不走 `llm.*` 事件族，也不产生会话消息。
+pub mod inline_edit {
+    /// 依据指令改写文件中的一段选区，返回替换文本与 unified diff。
+    ///
+    /// 内核**不写盘**：结果只描述「应该改成什么」，落盘由外壳走 `workspace.write_file`
+    /// （带 `expected_hash` 乐观锁）。这样用户按 Esc 放弃时不需要任何撤销逻辑。
+    pub const PROPOSE: &str = "inline_edit.propose";
+}
+
 /// Agent 运行时（M4：协议面先定稿，`crates/core` 的接线随后落地）。
 pub mod agent {
     pub const START: &str = "agent.start";
@@ -303,6 +316,8 @@ pub const IMPLEMENTED: &[&str] = &[
     llm::CANCEL,
     llm::LIST_MODELS,
     llm::COUNT_TOKENS,
+    // M3 切片三：Inline Edit 内核面（一次调用返回替换文本 + unified diff，不写盘）。
+    inline_edit::PROPOSE,
     // M4 第三切片：agent 运行时（协议面与 core 接线均已落地）。
     agent::START,
     agent::STOP,
@@ -381,7 +396,7 @@ mod tests {
 
     #[test]
     fn implemented_list_covers_core_m1_m2_agent_domains() {
-        assert_eq!(IMPLEMENTED.len(), 73);
+        assert_eq!(IMPLEMENTED.len(), 74);
         assert!(IMPLEMENTED.contains(&"core.ping"));
         assert!(IMPLEMENTED.contains(&"$/cancelRequest"));
         assert!(IMPLEMENTED.contains(&"workspace.read_file"));
@@ -395,6 +410,9 @@ mod tests {
         assert!(IMPLEMENTED.contains(&llm::CANCEL));
         assert!(IMPLEMENTED.contains(&llm::LIST_MODELS));
         assert!(IMPLEMENTED.contains(&llm::COUNT_TOKENS));
+        // M3 切片三：Inline Edit 内核面进清单，dispatch 有真分支（非 6101 式占位）。
+        assert!(IMPLEMENTED.contains(&inline_edit::PROPOSE));
+        assert_eq!(inline_edit::PROPOSE, "inline_edit.propose");
         // M4 第三切片：`agent.*` 三个方法进清单（协议面与 core 接线均已落地）。
         assert!(IMPLEMENTED.contains(&agent::START));
         assert!(IMPLEMENTED.contains(&agent::STOP));
@@ -507,8 +525,8 @@ mod tests {
         all.dedup();
         assert_eq!(all.len(), total, "两张表不得有重叠");
         assert_eq!(
-            total, 73,
-            "应恰好覆盖协议里定义的全部 73 个请求方法（P5 切片二补 `plugin.command`，M3 切片一补 `search.symbols`）"
+            total, 74,
+            "应恰好覆盖协议里定义的全部 74 个请求方法（P5 切片二补 `plugin.command`，M3 切片一补 `search.symbols`，M3 切片三补 `inline_edit.propose`）"
         );
     }
 

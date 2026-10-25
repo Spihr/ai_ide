@@ -240,6 +240,7 @@ describe('协议常量', () => {
       'llm.cancel',
       'llm.list_models',
       'llm.count_tokens',
+      'inline_edit.propose',
       'agent.start',
       'agent.stop',
       'agent.decide',

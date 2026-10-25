@@ -1383,3 +1383,268 @@ fn token_精确计数_认识模型族走分词器_其余回落估算() {
         "两个口径相加，结构开销沿用每消息 +4：{mixed}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// M3 切片三：inline_edit.propose
+//
+// 它和对话面共用同一个假上游，但**不该**共用同一套对外语义：不推 `llm.*` 事件、
+// 不占 `stream_id`、不写盘。用例除了看替换结果，就盯这三条边界——它们才是
+// 「编辑器里的一个动作」与「一轮对话」的分水岭。
+// ---------------------------------------------------------------------------
+
+/// `inline_edit.propose` 的常用参数：在 `src/main.ts` 第 1 行选中 `main` 这四个字符。
+///
+/// 列号按 0 起算右开（`export const ` 恰好 13 个字符），与 Monaco 的选区口径一致。
+fn propose_params(workspace_id: &str, provider_id: &str) -> Value {
+    json!({
+        "workspace_id": workspace_id,
+        "path": "src/main.ts",
+        "instruction": "把 main 改名为 entry",
+        "selection": {
+            "start_line": 1,
+            "start_column": 13,
+            "end_line": 1,
+            "end_column": 17,
+        },
+        "context_lines": 2,
+        "model_ref": { "provider_id": provider_id, "model_id": MODEL },
+    })
+}
+
+#[test]
+fn inline_edit_端到端_返回替换与diff且不写盘不推事件() {
+    let upstream = MockUpstream::start(
+        vec![Script::Stream {
+            frames: vec![
+                // 选区只有 `main` 四个字符，所以模型只需回选区内的替换文本；
+                // 它照系统提示词用围栏包住，且围栏与正文被切在两个增量里。
+                delta("```ts\n"),
+                delta("entry"),
+                delta("\n```"),
+                sse(json!({
+                    "id": "chatcmpl-ie",
+                    "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+                })),
+                sse(json!({
+                    "id": "chatcmpl-ie",
+                    "choices": [],
+                    "usage": { "prompt_tokens": 31, "completion_tokens": 7, "total_tokens": 38 },
+                })),
+            ],
+        }],
+        json!({ "data": [] }),
+    );
+    let data = TempDataDir::new("inline-edit-ok");
+    let workspace = TempWorkspace::new("inline-edit-ok");
+    let mut core = Core::spawn(&data.root);
+    let provider_id = setup_provider(&mut core, &upstream);
+    let workspace_id = open_workspace(&mut core, &workspace);
+
+    let result = core.ok(
+        "inline_edit.propose",
+        propose_params(&workspace_id, &provider_id),
+    );
+
+    assert_eq!(result["path"], json!("src/main.ts"), "路径要原样回显");
+    assert_eq!(
+        result["range"],
+        json!({
+            "start_line": 1, "start_column": 13, "end_line": 1, "end_column": 17
+        }),
+        "被替换的选区必须与请求一致，越界不会被悄悄收拢"
+    );
+    assert_eq!(
+        result["original"],
+        json!("main"),
+        "原文要按选区精确切出来，不含上下文"
+    );
+    assert_eq!(
+        result["replacement"],
+        json!("entry"),
+        "替换文本只管选区内那段，围栏与行内其余字符都不该被模型改写"
+    );
+
+    let diff = result["diff"].as_str().expect("diff 是字符串");
+    assert!(diff.contains("--- a/src/main.ts"), "{diff}");
+    assert!(diff.contains("+++ b/src/main.ts"), "{diff}");
+    assert!(diff.contains("-export const main = 1;"), "{diff}");
+    assert!(
+        diff.contains("+export const entry = 1;"),
+        "替换要嵌回原行的列位置，而不是整行覆盖：{diff}"
+    );
+    assert_eq!(
+        diff.matches("@@ -").count(),
+        1,
+        "只有一行变了，不该出现第二个 hunk：{diff}"
+    );
+
+    assert_eq!(result["usage"]["prompt_tokens"], json!(31));
+    assert_eq!(result["usage"]["completion_tokens"], json!(7));
+    assert_eq!(
+        result["usage"]["cached_tokens"],
+        json!(null),
+        "上游没报缓存命中就是 null，不是 0"
+    );
+
+    // 边界 1：内核不写盘。落盘要由外壳带 expected_hash 走 workspace.write_file。
+    let on_disk =
+        std::fs::read_to_string(workspace.root.join("src").join("main.ts")).expect("读回原文件");
+    assert_eq!(
+        on_disk, "export const main = 1;\nexport const other = 2;\n",
+        "propose 只描述「应该改成什么」，不该动磁盘"
+    );
+
+    // 边界 2：不进会话面。没有 llm.delta / llm.finished，也不占 stream_id。
+    assert!(
+        core.events().iter().all(|event| !event["method"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("llm.")),
+        "Inline Edit 不该推对话事件：{:?}",
+        core.events()
+    );
+
+    // 出网前就该带上选区标记与行号，否则模型只能靠猜自己改哪几行。
+    let seen = upstream.last_chat();
+    let body: Value = serde_json::from_str(&seen.body).expect("请求体是 JSON");
+    assert_eq!(body["model"], json!(MODEL));
+    assert_eq!(
+        body["temperature"],
+        json!(0.2),
+        "改写要照指令改，不该带上创作的随机性"
+    );
+    let messages = injected_messages(&upstream);
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert_eq!(messages[0]["role"], json!("system"));
+    let prompt = messages[1]["content"].as_str().expect("用户消息是字符串");
+    assert!(prompt.contains("<<<SELECTION>>>"), "{prompt}");
+    assert!(prompt.contains("<<<END SELECTION>>>"), "{prompt}");
+    assert!(prompt.contains("1 | export const main = 1;"), "{prompt}");
+    assert!(
+        prompt.contains("2 | export const other = 2;"),
+        "context_lines=2 要把下一行也带上：{prompt}"
+    );
+    assert!(prompt.contains("把 main 改名为 entry"), "{prompt}");
+    assert!(prompt.contains("语言：TypeScript"), "{prompt}");
+}
+
+#[test]
+fn inline_edit_选区越界报9001且不打上游() {
+    let upstream = MockUpstream::start(vec![], json!({ "data": [] }));
+    let data = TempDataDir::new("inline-edit-range");
+    let workspace = TempWorkspace::new("inline-edit-range");
+    let mut core = Core::spawn(&data.root);
+    let provider_id = setup_provider(&mut core, &upstream);
+    let workspace_id = open_workspace(&mut core, &workspace);
+
+    let mut params = propose_params(&workspace_id, &provider_id);
+    // main.ts 只有 3 行（末尾换行会 split 出一个空行），选到第 9 行属于画错了。
+    params["selection"] = json!({
+        "start_line": 9,
+        "start_column": 0,
+        "end_line": 9,
+        "end_column": 1,
+    });
+
+    let response = core.call("inline_edit.propose", params);
+    let error = response.get("error").expect("越界必须报错");
+    assert_eq!(error["code"], json!(9001), "选区越界走 9001：{error}");
+    assert_ne!(
+        error["code"],
+        json!(1002),
+        "「选区画错了」与「报文不合协议」必须分开"
+    );
+    assert_eq!(
+        error["data"]["lines"],
+        json!(3),
+        "带上文件总行数，外壳才能把选区收拢到合法范围：{error}"
+    );
+    assert_eq!(
+        error["data"]["selection"]["start_line"],
+        json!(9),
+        "回显原始选区，避免用户以为是自己手抖改的值"
+    );
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("越界"),
+        "{error}"
+    );
+    assert!(
+        upstream.requests().is_empty(),
+        "选区都不合法就不该打上游——白花一次 token"
+    );
+}
+
+#[test]
+fn inline_edit_上游4xx折成provider错误码而非9003() {
+    let upstream = MockUpstream::start(
+        vec![Script::Failure {
+            status: 429,
+            headers: vec![("retry-after".to_string(), "3".to_string())],
+            body: json!({ "error": { "message": "rate limit exceeded" } }).to_string(),
+        }],
+        json!({ "data": [] }),
+    );
+    let data = TempDataDir::new("inline-edit-4xx");
+    let workspace = TempWorkspace::new("inline-edit-4xx");
+    let mut core = Core::spawn(&data.root);
+    let provider_id = setup_provider(&mut core, &upstream);
+    let workspace_id = open_workspace(&mut core, &workspace);
+
+    let code = core.error_code(
+        "inline_edit.propose",
+        propose_params(&workspace_id, &provider_id),
+    );
+    assert_eq!(
+        code,
+        ErrorCode::PROVIDER_RATE_LIMITED.as_i32() as i64,
+        "上游限流沿用 2xxx 段：9003 是「模型没给代码」，不是「上游没答应」"
+    );
+    assert_eq!(
+        upstream.requests().len(),
+        1,
+        "确实打到了上游，失败不是因为请求没发出去"
+    );
+}
+
+#[test]
+fn inline_edit_模型只回解释时报9003而不是空替换() {
+    let upstream = MockUpstream::start(
+        vec![Script::Stream {
+            frames: vec![
+                delta("这段代码看起来没问题，不需要修改。"),
+                sse(json!({
+                    "id": "chatcmpl-ie-empty",
+                    "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+                })),
+            ],
+        }],
+        json!({ "data": [] }),
+    );
+    let data = TempDataDir::new("inline-edit-empty");
+    let workspace = TempWorkspace::new("inline-edit-empty");
+    let mut core = Core::spawn(&data.root);
+    let provider_id = setup_provider(&mut core, &upstream);
+    let workspace_id = open_workspace(&mut core, &workspace);
+
+    let response = core.call(
+        "inline_edit.propose",
+        propose_params(&workspace_id, &provider_id),
+    );
+    let error = response.get("error").expect("提不出代码必须报错");
+    assert_eq!(error["code"], json!(9003), "{error}");
+    assert_eq!(
+        error["data"]["response_chars"],
+        json!("这段代码看起来没问题，不需要修改。".chars().count()),
+        "把上游原话字数带出去，便于判断是空响应还是只有解释：{error}"
+    );
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("提取不出代码"),
+        "{error}"
+    );
+}

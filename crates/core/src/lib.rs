@@ -57,6 +57,8 @@ pub mod checkpoint_api;
 pub mod context;
 pub mod dispatch;
 pub mod git_api;
+/// Inline Edit 处理器（M3 切片三）：`inline_edit.propose` —— 读选区、补全一次、算 diff。
+pub mod inline_edit_api;
 pub mod llm_api;
 pub mod llm_runtime;
 /// 结构化日志（M5 任务 4）：JSONL 按天滚动 + 出口脱敏。

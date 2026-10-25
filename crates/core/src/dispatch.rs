@@ -9,6 +9,7 @@ use crate::agent_api;
 use crate::audit_api;
 use crate::checkpoint_api;
 use crate::git_api;
+use crate::inline_edit_api;
 use crate::llm_api;
 use crate::mcp_api;
 use crate::peer::Peer;
@@ -104,6 +105,10 @@ async fn handle_request(peer: &Peer, state: &AppState, req: Request) {
         methods::llm::CANCEL => llm_api::cancel(peer, state, &req).await,
         methods::llm::LIST_MODELS => llm_api::list_models(peer, state, &req).await,
         methods::llm::COUNT_TOKENS => llm_api::count_tokens(peer, state, &req).await,
+
+        // Inline Edit（M3 切片三）：一次调用返回替换文本 + unified diff，不写盘、
+        // 不占 `stream_id`、不进会话消息——它是「编辑器里的一个动作」而非「一轮对话」。
+        methods::inline_edit::PROPOSE => inline_edit_api::propose(peer, state, &req).await,
 
         // Agent 运行时（M4）
         methods::agent::START => agent_api::start(peer, state, &req).await,

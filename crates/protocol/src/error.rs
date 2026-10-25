@@ -149,6 +149,26 @@ impl ErrorCode {
     /// 参数不可用：命名空间拆不开、`arguments` 不是对象、Server 名非法。
     pub const MCP_INVALID_PARAMS: Self = Self(8007);
 
+    // --- Inline Edit（9xxx）------------------------------------------------
+    //
+    // 这一族专指「一次选区改写没做成」，且**失败原因分得开**：用户按 Ctrl+K 之后
+    // 看到的是弹窗里的一句话，把「选区不属于这个文件」和「模型没配」混成同一个码，
+    // 只能让用户自己猜该改什么。上游本身的问题（非 200 / 限流 / 未配置 provider）
+    // 不在这里另开码，沿用 2xxx 段——那是模型接入层的既有口径。
+
+    /// 选区越界：行号或列号超出文件范围、`start` 在 `end` 之后、文件内容为空。
+    ///
+    /// `data` 带 `lines`（文件总行数）与 `selection`，供外壳把选区收拢到合法范围。
+    pub const INLINE_EDIT_SELECTION_INVALID: Self = Self(9001);
+    /// 无可用模型：`model_ref` 缺失、`model_id` 为空，或 provider 名下没有该模型。
+    pub const INLINE_EDIT_MODEL_UNAVAILABLE: Self = Self(9002);
+    /// 上游返回的文本里提取不出任何代码（空响应、只有解释没有代码块）。
+    ///
+    /// 这条**绝不**降级成「返回空替换」：空替换落盘等于悄悄删掉用户的代码。
+    pub const INLINE_EDIT_EMPTY_REPLACEMENT: Self = Self(9003);
+    /// 目标文件超过读取上限被截断，行号与内容都不再可信，无法安全地算补丁。
+    pub const INLINE_EDIT_FILE_TOO_LARGE: Self = Self(9004);
+
     pub const fn as_i32(self) -> i32 {
         self.0
     }
@@ -338,6 +358,35 @@ mod tests {
         assert_ne!(
             ErrorCode::PLUGIN_NOT_FOUND.as_i32(),
             ErrorCode::TERMINAL_NOT_FOUND.as_i32()
+        );
+    }
+
+    /// Inline Edit 错误码占 9001-9004：这四个码是外壳弹窗的判断依据，
+    /// 一旦有人为了「省一个码」把它们合并，用户就再也分不清是选区画错了还是模型没配。
+    #[test]
+    fn inline_edit_error_codes_use_their_own_9xxx_band() {
+        let codes = [
+            ErrorCode::INLINE_EDIT_SELECTION_INVALID,
+            ErrorCode::INLINE_EDIT_MODEL_UNAVAILABLE,
+            ErrorCode::INLINE_EDIT_EMPTY_REPLACEMENT,
+            ErrorCode::INLINE_EDIT_FILE_TOO_LARGE,
+        ];
+        for (index, code) in codes.iter().enumerate() {
+            let raw = code.as_i32();
+            assert!((9001..=9099).contains(&raw), "{raw} 不在 9xxx 段");
+            assert!(!code.is_standard(), "{raw} 不该被当成标准码");
+            assert!(
+                !codes[..index].contains(code),
+                "{raw} 重复定义，同段内码值必须唯一"
+            );
+        }
+        assert_eq!(ErrorCode::INLINE_EDIT_SELECTION_INVALID.as_i32(), 9001);
+        assert_eq!(ErrorCode::INLINE_EDIT_FILE_TOO_LARGE.as_i32(), 9004);
+        // 9001 与「参数非法 1002」必须分开：一个是「选区画错了」（可修正后重试），
+        // 一个是「报文不合协议」（属于调用方 bug），外壳的反应不一样。
+        assert_ne!(
+            ErrorCode::INLINE_EDIT_SELECTION_INVALID.as_i32(),
+            ErrorCode::INVALID_PARAMS.as_i32()
         );
     }
 }
