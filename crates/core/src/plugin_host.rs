@@ -1,13 +1,16 @@
-//! 宿主能力（插件系统 P3.5 读侧 + P4 切片二写侧）：`host/fs.read` /
-//! `host/fs.list` / `host/fs.stat` / `host/search.content` / `host/workspace.info`
-//! 与 `host/fs.write` 的真实实现。
+//! 宿主能力（插件系统 P3.5 读侧 + P4 切片二写侧 + P5 出站与模型）：
+//! `host/fs.read` / `host/fs.list` / `host/fs.stat` / `host/search.content` /
+//! `host/workspace.info` / `host/fs.write` / `host/progress` /
+//! `host/net.fetch` / `host/llm.chat` 的真实实现。
 //!
 //! 这一层是 [`ai_ide_plugin::host_api::HostApi`] 的内核侧实现：`crates/plugin`
 //! 只负责把插件进程发出的 `host/*` 帧转过来，**资格判定、路径判定、审批判定、
 //! 用量判定全在这里**。遥测走 [`HostApi::notify`] 这条旁路：`host/log` 无条件
 //! 收（写日志没有额外信息面），`host/progress` 要 `progress` 能力，转成
 //! `plugin.progress` 推给外壳窗口与订阅了它的插件（P5 切片四）。网络
-//! （`net.fetch`）、模型（`llm.chat`）明确留给后续切片，一律回 `-32601`。
+//! （`net.fetch`）与模型（`llm.chat`）已在 P5 切片五、六落成真实出站：
+//! 前者走 `plugin_net.rs` 的协议 / 域名单 / 地址三重闸门，后者走
+//! `plugin_llm.rs` 的 Provider 通道，两者都要能力 + 清单声明配对校验。
 //!
 //! 闸门严格按 docs/14 §8.1 的顺序，且**顺序不可交换**：
 //!
