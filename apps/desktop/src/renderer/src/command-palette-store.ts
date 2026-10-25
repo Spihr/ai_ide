@@ -28,6 +28,7 @@ import {
 import { pluginApi, pluginErrorCode, pluginErrorMessage } from './plugin-api'
 import { openInlineEdit } from './inline-edit-store'
 import { openSymbolPicker } from './symbol-picker-store'
+import { restart as restartLanguageServer, statusSummary as lspStatusSummary } from './lsp-store'
 import {
   getEditorState,
   pickAndOpenWorkspace,
@@ -63,7 +64,9 @@ export const builtinActions: BuiltinCommandActions = {
   // 面板自己先 `closePalette()` 再执行，所以这里只要把符号浮层叫起来即可。
   gotoSymbol: () => openSymbolPicker(),
   // 内联编辑同理；「没有选区」的提示由 `openInlineEdit` 自己发，面板不重复判。
-  inlineEdit: () => openInlineEdit()
+  inlineEdit: () => openInlineEdit(),
+  restartLsp: () => restartLspQuietly(),
+  showLspStatus: () => showLspStatusNotice()
 }
 
 /**
@@ -79,6 +82,37 @@ async function saveActiveTabQuietly(): Promise<void> {
     return
   }
   await saveTab(activePath)
+}
+
+/**
+ * 重启当前文件的语言服务器。
+ *
+ * 两件事必须在这里做，`lsp-store` 做不了：
+ * 1. **没有打开文件时给一句提示**——`restart()` 会静默回 `false`，用户会以为按键
+ *    没生效；这和上面保存标签是同一类「静默失败」。
+ * 2. **把未保存的缓冲推给新进程**：重启的动机通常是「我刚改完代码 / 刚改完配置」，
+ *    让新服务器对着磁盘上的旧文本工作会把用户刚写的代码判成一堆错误。
+ */
+async function restartLspQuietly(): Promise<void> {
+  const { activePath, tabs } = getEditorState()
+  const tab = activePath === null ? null : (tabs.find((item) => item.path === activePath) ?? null)
+  if (tab === null) {
+    setNotice({ kind: 'warn', text: '没有打开的文件：先打开一个文件再重启语言服务器。' })
+    return
+  }
+
+  const restarted = await restartLanguageServer({ content: tab.content })
+  setNotice({
+    kind: restarted ? 'info' : 'warn',
+    text: restarted
+      ? `已重启语言服务器。${lspStatusSummary()}`
+      : `语言服务器没起来（没装 / 启动失败）。${lspStatusSummary()}`
+  })
+}
+
+/** 「查看语言服务器状态」：一行摘要直接进提示条，不新开面板。 */
+function showLspStatusNotice(): void {
+  setNotice({ kind: 'info', text: lspStatusSummary() })
 }
 
 function initialState(): CommandPaletteState {

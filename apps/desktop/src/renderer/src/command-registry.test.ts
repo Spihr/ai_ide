@@ -37,7 +37,10 @@ function fakeActions(): BuiltinCommandActions {
     gotoSymbol: vi.fn(),
     // 切片三：内联编辑入口。它的「有没有选区」判断在 `inline-edit-store` 里，
     // 注册表只负责把点击转给这个动作。
-    inlineEdit: vi.fn()
+    inlineEdit: vi.fn(),
+    // 切片四：语言服务入口（状态查询 / 重启）。具体取数与重启在 `lsp-store`。
+    restartLsp: vi.fn(),
+    showLspStatus: vi.fn()
   }
 }
 
@@ -115,6 +118,26 @@ describe('内置命令注册表', () => {
 
     const byEnglish = filterCommands(rows, 'symbol').map((row) => row.id)
     expect(byEnglish).toContain('builtin:symbol.goto')
+  })
+
+  it('语言服务入口（状态 / 重启）在面板里可搜可执行', async () => {
+    const actions = fakeActions()
+    const rows = builtinCommands(actions)
+
+    // 三条召回路径：「lsp」是用户最可能敲的词，中文与「重启」是另一条常见路径。
+    expect(filterCommands(rows, 'lsp').map((row) => row.id)).toEqual(
+      expect.arrayContaining(['builtin:lsp.status', 'builtin:lsp.restart'])
+    )
+    expect(filterCommands(rows, '语言服务器').map((row) => row.id)).toEqual(
+      expect.arrayContaining(['builtin:lsp.status', 'builtin:lsp.restart'])
+    )
+    expect(filterCommands(rows, '重启').map((row) => row.id)).toContain('builtin:lsp.restart')
+
+    await rows.find((row) => row.id === 'builtin:lsp.status')?.run?.()
+    expect(actions.showLspStatus).toHaveBeenCalledTimes(1)
+
+    await rows.find((row) => row.id === 'builtin:lsp.restart')?.run?.()
+    expect(actions.restartLsp).toHaveBeenCalledTimes(1)
   })
 })
 

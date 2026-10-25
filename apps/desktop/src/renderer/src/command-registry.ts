@@ -74,6 +74,20 @@ export interface BuiltinCommandActions {
    * 而那份判断应该留在 `inline-edit-store` 里。
    */
   inlineEdit: () => void | Promise<void>
+  /**
+   * 重启当前文件的语言服务器（`lsp.restart`）。
+   *
+   * 停掉再按同一份文件起一条：改了 `tsconfig` / 装完新插件后要靠它让服务器重新
+   * 握手。参数（缓冲正文）由 store 侧取，面板只说「重启」。
+   */
+  restartLsp: () => void | Promise<void>
+  /**
+   * 把语言服务状态压成一句提示（`lsp.status`）。
+   *
+   * 「为什么没有补全」这类问题，90% 是服务器没起（没装 / 崩了 / 降级），得先有一
+   * 个地方能一眼看到当前连接的命令、PID、重启次数。
+   */
+  showLspStatus: () => void | Promise<void>
 }
 
 export interface BuiltinCommandSpec {
@@ -169,6 +183,21 @@ export const BUILTIN_COMMAND_SPECS: readonly BuiltinCommandSpec[] = [
     description: '底部终端面板（Ctrl+`）',
     keywords: ['terminal', 'shell', 'zd', '终端', '命令行'],
     run: (actions) => actions.toggleTerminal()
+  },
+  {
+    id: 'lsp.status',
+    title: '查看语言服务器状态',
+    description: '当前文件的 LSP 连接、命令、PID 与问题数',
+    // 「补全没反应」「跳转不灵」是用户找这条命令时的原话，一并收进别名。
+    keywords: ['lsp', 'language server', 'yyfwq', '语言服务器', '语言服务', '补全', '诊断'],
+    run: (actions) => actions.showLspStatus()
+  },
+  {
+    id: 'lsp.restart',
+    title: '重启语言服务器',
+    description: '停掉当前语言的服务器再按当前文件重新启动（读了 tsconfig / 装完插件后用）',
+    keywords: ['lsp restart', 'restart lsp', 'cqq', '重启', '语言服务器', 'reload'],
+    run: (actions) => actions.restartLsp()
   }
 ]
 
