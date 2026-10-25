@@ -11,6 +11,8 @@ import {
   Methods,
   type SearchContentResult,
   type SearchFilesResult,
+  type SearchSymbolsResult,
+  type Symbol,
   type TreeEntry,
   type WorkspaceOpenResult,
   type WorkspaceReadFileResult,
@@ -29,6 +31,8 @@ import {
   openWorkspace,
   runContentSearch,
   runFileSearch,
+  runSymbolSearch,
+  openSymbol,
   saveTab,
   tabIsDirty,
   updateContent
@@ -52,6 +56,7 @@ interface Harness {
   confirm: ReturnType<typeof vi.fn>
   setReadResult: (patch: Partial<WorkspaceReadFileResult>) => void
   setTreeEntries: (entries: TreeEntry[]) => void
+  setSymbols: (symbols: Symbol[]) => void
   failNextRequest: (message: string) => void
 }
 
@@ -67,6 +72,9 @@ function installHarness(): Harness {
     hash: 'h1'
   }
   let treeEntries: TreeEntry[] = [entry('src', `${ROOT}\\src`, 'dir'), entry('a.ts', FILE_A, 'file')]
+  let symbols: Symbol[] = [
+    { name: 'boot', kind: 'function', path: 'a.ts', range: { start_line: 7, end_line: 9 } }
+  ]
   let failure: string | null = null
 
   const openResult: WorkspaceOpenResult = {
@@ -113,6 +121,9 @@ function installHarness(): Harness {
             matches: [{ path: 'a.ts', line: 1, column: 1, preview: 'hello' }],
             truncated: false
           } satisfies SearchContentResult
+        case Methods.search.symbols:
+          // 空 query 是「列全部」：内核按空串返回全部符号，这里给同一份即可。
+          return { symbols } satisfies SearchSymbolsResult
         default:
           return { ok: true }
       }
@@ -154,6 +165,9 @@ function installHarness(): Harness {
     },
     setTreeEntries: (entries) => {
       treeEntries = entries
+    },
+    setSymbols: (next) => {
+      symbols = next
     },
     failNextRequest: (message) => {
       failure = message
@@ -280,6 +294,64 @@ describe('检索', () => {
     expect(state.activePath).toBe(FILE_A)
     expect(state.tabs[0]?.path).toBe(FILE_A)
     expect(state.reveal).toMatchObject({ path: FILE_A, line: 3, column: 7 })
+  })
+})
+
+describe('符号检索', () => {
+  it('非空 query 发 search.symbols 并写入结果', async () => {
+    await runSymbolSearch('boo')
+    const state = getEditorState()
+
+    expect(state.symbolQuery).toBe('boo')
+    expect(state.symbolMatches).toHaveLength(1)
+    expect(state.symbolMatches[0]?.name).toBe('boot')
+    expect(state.symbolSearching).toBe(false)
+
+    const call = callsOf(Methods.search.symbols)[0]
+    expect(call?.params).toMatchObject({ workspace_id: 'ws-1', query: 'boo' })
+  })
+
+  it('空 query 默认不发请求（搜索面板口径），allowEmpty 才列全部（浮层口径）', async () => {
+    await runSymbolSearch('   ')
+    expect(callsOf(Methods.search.symbols)).toHaveLength(0)
+    expect(getEditorState().symbolMatches).toHaveLength(0)
+
+    await runSymbolSearch('', { allowEmpty: true })
+    expect(callsOf(Methods.search.symbols)).toHaveLength(1)
+    expect(getEditorState().symbolMatches).toHaveLength(1)
+  })
+
+  it('无结果时是空数组而不是报错', async () => {
+    h.setSymbols([])
+    await runSymbolSearch('nothing-matches')
+
+    const state = getEditorState()
+    expect(state.symbolMatches).toEqual([])
+    expect(state.symbolError).toBeNull()
+  })
+
+  it('检索失败写入 symbolError 并退出 loading', async () => {
+    h.failNextRequest('符号索引未就绪')
+    await runSymbolSearch('boot')
+
+    const state = getEditorState()
+    expect(state.symbolError).toContain('符号索引未就绪')
+    expect(state.symbolSearching).toBe(false)
+    expect(state.symbolMatches).toEqual([])
+  })
+
+  it('跳转符号：打开文件并把光标定位到 range.start_line（列固定 1）', async () => {
+    await openSymbol({
+      name: 'trace',
+      kind: 'method',
+      path: 'a.ts',
+      range: { start_line: 42, end_line: 48 }
+    })
+
+    const state = getEditorState()
+    expect(state.activePath).toBe(FILE_A)
+    expect(state.tabs[0]?.path).toBe(FILE_A)
+    expect(state.reveal).toMatchObject({ path: FILE_A, line: 42, column: 1 })
   })
 })
 

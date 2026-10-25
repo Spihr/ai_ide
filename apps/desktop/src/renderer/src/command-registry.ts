@@ -64,6 +64,8 @@ export interface BuiltinCommandActions {
   /** 切到某个活动栏视图（资源管理器 / 搜索 / 插件 …）。 */
   showView: (view: 'explorer' | 'search' | 'ai' | 'git' | 'checkpoints' | 'permissions' | 'mcp' | 'plugin') => void
   toggleTerminal: () => void | Promise<void>
+  /** 唤出「转到符号」快速选择器（`Ctrl+T`，符号检索的浮层入口）。 */
+  gotoSymbol: () => void | Promise<void>
 }
 
 export interface BuiltinCommandSpec {
@@ -108,6 +110,14 @@ export const BUILTIN_COMMAND_SPECS: readonly BuiltinCommandSpec[] = [
     description: '左侧活动栏 · 全工作区搜索',
     keywords: ['search', 'ss', '查找', 'grep'],
     run: (actions) => actions.showView('search')
+  },
+  {
+    id: 'symbol.goto',
+    title: '转到符号…',
+    description: '搜索工作区里的函数 / 类 / 常量并跳转（Ctrl+T）',
+    // 拼音首字母与「符号」放在一起：用户记不住图标名时，最可能输入的就是 Ctrl+T。
+    keywords: ['symbol', 'goto symbol', '符号', 'zhdf', 'ctrlt', '跳转'],
+    run: (actions) => actions.gotoSymbol()
   },
   {
     id: 'view.ai',

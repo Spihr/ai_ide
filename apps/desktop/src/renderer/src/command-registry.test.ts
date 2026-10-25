@@ -33,7 +33,8 @@ function fakeActions(): BuiltinCommandActions {
     openWorkspace: vi.fn(),
     saveActiveTab: vi.fn(),
     showView: vi.fn(),
-    toggleTerminal: vi.fn()
+    toggleTerminal: vi.fn(),
+    gotoSymbol: vi.fn()
   }
 }
 
@@ -89,6 +90,28 @@ describe('内置命令注册表', () => {
 
     await rows.find((row) => row.id === 'builtin:workspace.open')?.run?.()
     expect(actions.openWorkspace).toHaveBeenCalledTimes(1)
+  })
+
+  it('「转到符号」是内建命令，走 gotoSymbol 动作', async () => {
+    const actions = fakeActions()
+    const row = builtinCommands(actions).find((entry) => entry.id === 'builtin:symbol.goto')
+
+    expect(row, '命令面板必须能搜到「转到符号」').toBeDefined()
+    // 描述里带快捷键：用户在面板里看到这一行就知道下次可以直接按。
+    expect(row?.description).toContain('Ctrl+T')
+
+    await row?.run?.()
+    expect(actions.gotoSymbol).toHaveBeenCalledTimes(1)
+  })
+
+  it('「转到符号」能被中文与 symbol 两种词召回', () => {
+    const rows = builtinCommands(fakeActions())
+
+    const byChinese = filterCommands(rows, '符号').map((row) => row.id)
+    expect(byChinese).toContain('builtin:symbol.goto')
+
+    const byEnglish = filterCommands(rows, 'symbol').map((row) => row.id)
+    expect(byEnglish).toContain('builtin:symbol.goto')
   })
 })
 

@@ -13,6 +13,8 @@ import type {
   OkResult,
   SearchContentResult,
   SearchFilesResult,
+  SearchSymbolsResult,
+  SymbolKind,
   WorkspaceDeleteResult,
   WorkspaceOpenResult,
   WorkspaceReadFileResult,
@@ -22,6 +24,12 @@ import type {
 
 function req<T>(method: string, params?: unknown): Promise<T> {
   return window.aiide.request(method, params) as Promise<T>
+}
+
+/** `search.symbols` 的可选参数。 */
+export interface SymbolSearchOptions {
+  /** 只保留这些 kind；缺省由内核返回全部 kind。 */
+  kinds?: SymbolKind[]
 }
 
 /** `search.content` 的可选参数。 */
@@ -94,6 +102,22 @@ export const workspaceApi = {
       query,
       glob: glob ?? null,
       limit: null
+    })
+  },
+
+  /**
+   * 符号检索（`search.symbols`）。`query` 为**子串**匹配，空串表示列出全部符号
+   * （内核上限 200 条，按相关度排序）——快速选择器一打开就要有东西可选，靠的就是它。
+   */
+  searchSymbols(
+    workspaceId: string,
+    query: string,
+    options: SymbolSearchOptions = {}
+  ): Promise<SearchSymbolsResult> {
+    return req<SearchSymbolsResult>(Methods.search.symbols, {
+      workspace_id: workspaceId,
+      query,
+      kinds: options.kinds ?? null
     })
   },
 

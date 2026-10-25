@@ -26,6 +26,7 @@ import {
   type PluginCommandSource
 } from './command-registry'
 import { pluginApi, pluginErrorCode, pluginErrorMessage } from './plugin-api'
+import { openSymbolPicker } from './symbol-picker-store'
 import {
   getEditorState,
   pickAndOpenWorkspace,
@@ -57,7 +58,9 @@ export const builtinActions: BuiltinCommandActions = {
   openWorkspace: () => pickAndOpenWorkspace(),
   saveActiveTab: () => saveActiveTabQuietly(),
   showView: (view) => setActivity(view),
-  toggleTerminal: () => toggleTerminalPanel()
+  toggleTerminal: () => toggleTerminalPanel(),
+  // 面板自己先 `closePalette()` 再执行，所以这里只要把符号浮层叫起来即可。
+  gotoSymbol: () => openSymbolPicker()
 }
 
 /**

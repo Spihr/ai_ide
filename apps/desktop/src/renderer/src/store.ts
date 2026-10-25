@@ -17,6 +17,7 @@ import type {
   ContentMatch,
   Eol,
   FileMatch,
+  Symbol,
   TreeEntry,
   WorkspaceChangedEvent,
   WorkspaceIndexedEvent,
@@ -110,6 +111,17 @@ export interface EditorState {
   contentTruncated: boolean
   searching: boolean
   searchError: string | null
+  /**
+   * 符号检索（`search.symbols`）的输入与结果。
+   *
+   * 与文件名 / 内容两组并列、而不是塞进 `searching` / `searchError`：符号浮层和搜索
+   * 面板的「符号」模式共用这一份结果，共用一个 loading 标志会让两处互相把对方的
+   * 「检索中…」掐掉。
+   */
+  symbolQuery: string
+  symbolMatches: Symbol[]
+  symbolSearching: boolean
+  symbolError: string | null
   notice: Notice | null
   /** 待执行的编辑器跳转。 */
   reveal: RevealTarget | null
@@ -133,6 +145,10 @@ const initialState: EditorState = {
   contentTruncated: false,
   searching: false,
   searchError: null,
+  symbolQuery: '',
+  symbolMatches: [],
+  symbolSearching: false,
+  symbolError: null,
   notice: null,
   reveal: null
 }
@@ -555,6 +571,66 @@ export async function runContentSearch(
 /** 搜索结果点击：打开文件并请求编辑器定位到行列。 */
 let revealNonce = 0
 
+/**
+ * 符号检索的请求序号。
+ *
+ * 符号检索是「逐字符触发 + 内核扫全库」，先发的请求完全可能后到。只让**最后一次**
+ * 请求写回结果，否则输入 `run` 之后你会看到 `ru` 的命中把 `run` 的命中盖掉。
+ */
+let symbolRequestSeq = 0
+
+/**
+ * 符号检索。
+ *
+ * `allowEmpty`：快速选择器（`Ctrl+T`）一打开就要有东西可选，空串必须真的发请求
+ * （内核按空 query 列出全部符号）；搜索面板的「符号」模式则沿袭文件名 / 内容的习惯，
+ * 空输入直接清空结果，不发无意义的全库扫描。
+ */
+export async function runSymbolSearch(
+  query: string,
+  options: { allowEmpty?: boolean } = {}
+): Promise<void> {
+  set({ symbolQuery: query })
+  const workspace = state.workspace
+  if (!workspace) {
+    // 没有工作区就没有符号可搜：顺手清掉上一个工作区留下来的结果，
+    // 否则浮层会在「未打开工作区」的空状态下继续显示别的项目的符号。
+    set({ symbolMatches: [], symbolSearching: false, symbolError: null })
+    return
+  }
+  const trimmed = query.trim()
+  if (trimmed === '' && options.allowEmpty !== true) {
+    set({ symbolMatches: [], symbolError: null })
+    return
+  }
+  const seq = (symbolRequestSeq += 1)
+  set({ symbolSearching: true, symbolError: null })
+  try {
+    const result = await workspaceApi.searchSymbols(workspace.workspace_id, trimmed)
+    if (seq !== symbolRequestSeq) return
+    set({ symbolMatches: result.symbols, symbolSearching: false })
+  } catch (error) {
+    if (seq !== symbolRequestSeq) return
+    set({ symbolSearching: false, symbolError: cleanMessage(error) })
+  }
+}
+
+/**
+ * 符号跳转：打开 `symbol.path` 并把光标放到 `range.start_line`。
+ *
+ * 协议里 `range` 只有行、没有列（见 docs/03 的 `SymbolRange`），所以列固定给 1——
+ * 编辑器那边收到列 1 就是把光标放到行首，正是「转到符号」该有的落点。
+ */
+export async function openSymbol(symbol: Symbol): Promise<void> {
+  await openMatch(symbol.path, symbol.range.start_line, 1)
+}
+
+/**
+ * 打开（或切到）某个文件，并把光标定位到 `line` / `column`（1-based）。
+ *
+ * `symbol.path` 与文件树的相对路径同形，所以「转到符号」直接复用这条通道，
+ * 不必再造一条只给符号用的打开逻辑。
+ */
 export async function openMatch(
   relPathFromRoot: string,
   line: number,
