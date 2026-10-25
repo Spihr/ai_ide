@@ -1,0 +1,14 @@
+# Rust 工具链钉版（新增）
+#
+# 探测结论（2026-10-25，E:\ai_ide）：
+#   - rustup toolchain list -> stable-x86_64-pc-windows-msvc (active, default)
+#   - rustc -vV              -> rustc 1.99.1 (58cf8f9c3 2026-10-13)
+#   - Cargo.toml [workspace.package] -> edition = "2021", rust-version = "1.79"
+#
+# 因此这里对齐"实际在用"的 stable 通道 + MSVC host，不写死具体小版本号：
+# 写死 1.99.1 会让其他机器 rustup 去下载一个未必可得的版本，反而破坏可构建性；
+# 语义上吃紧的下界由 Cargo.toml 的 rust-version = "1.79" 保证。
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

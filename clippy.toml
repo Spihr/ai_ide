@@ -1,0 +1,11 @@
+# clippy 配置（新增）
+#
+# 只放"事实性"参数，不放任何会把现有代码判红的严格项：
+#   - msrv 与 Cargo.toml [workspace.package] rust-version 保持一致（1.79），
+#     让 clippy 不要推荐 1.79 之后才稳定的 API。
+#   - 未启用 disallowed-types / 自定义 threshold 等，避免与既有 clippy 门禁冲突。
+msrv = "1.79"
+
+# 仓库里存在依赖外部进程输出的场景（PowerShell / git / LSP），
+# 保留 clippy 对 panic/unwrap 的默认策略，不做全局放开。
+# 如需为测试模块放行 unwrap，请在测试 crate 内部用 #[allow(...)] 局部声明。
