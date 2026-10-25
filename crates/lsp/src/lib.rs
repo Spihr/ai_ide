@@ -54,9 +54,11 @@ mod client;
 mod config;
 mod document;
 mod error;
+mod features;
 mod framing;
 mod initialize;
 mod jsonrpc;
+mod registry;
 mod stdio_transport;
 mod transport;
 
@@ -69,6 +71,11 @@ pub use document::{
     VersionedTextDocumentIdentifier, METHOD_DID_CHANGE, METHOD_DID_CLOSE, METHOD_DID_OPEN,
 };
 pub use error::{ErrorClass, LspError};
+pub use features::{
+    parse_completion, parse_hover, parse_locations, CompletionItem, CompletionList, HoverInfo,
+    Position, SourceLocation, SourcePosition, SourceRange, SyncedDocument, METHOD_COMPLETION,
+    METHOD_DEFINITION, METHOD_HOVER, METHOD_REFERENCES,
+};
 pub use framing::{
     encode_frame, parse_content_length, FrameReader, TransportLimits, DEFAULT_MAX_CONTENT_BYTES,
     DEFAULT_MAX_HEADER_BYTES,
@@ -84,6 +91,10 @@ pub use jsonrpc::{
     error_response, Incoming, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
     RequestId, INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, JSONRPC_VERSION, METHOD_NOT_FOUND,
     PARSE_ERROR,
+};
+pub use registry::{
+    command_available, CommandSpec, LanguageRegistry, LanguageServerSpec, ResolvedServer,
+    ServerOverrides,
 };
 pub use stdio_transport::StdioTransport;
 pub use transport::{

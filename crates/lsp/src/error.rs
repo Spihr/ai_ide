@@ -84,6 +84,28 @@ pub enum LspError {
     /// 文档同步状态不对（对未打开的文档发 `didChange` / `didClose`，或重复打开）。
     #[error("文档同步错误：{0}")]
     Document(String),
+
+    /// 语言服务器命令未安装（注册表解析出默认命令，但 PATH 里找不到）。
+    ///
+    /// 单独成一个变体而不是复用 [`LspError::Spawn`]：这条错误要能直接给用户看
+    /// ——「该装什么」，所以必须带上命令名与安装提示，而不是等到 spawn 失败再
+    /// 拿到一句笼统的 `No such file or directory`。
+    #[error("语言服务器未安装：`{command}`（{language}）。{hint}")]
+    NotInstalled {
+        /// 缺失的可执行文件名。
+        command: String,
+        /// 语言标识（用于提示用户装哪一套）。
+        language: String,
+        /// 安装提示（来自注册表）。
+        hint: String,
+    },
+
+    /// 文件扩展名没有对应的语言服务器（注册表里没有），也不是调用方显式指定语言。
+    #[error("没有为 `{path}` 找到语言服务器：扩展名未登记，也没有显式指定 language_id")]
+    UnsupportedLanguage {
+        /// 触发失败的文件路径或语言标识。
+        path: String,
+    },
 }
 
 /// 错误大类。上层按类决定重试与提示策略。
@@ -109,13 +131,14 @@ impl LspError {
     /// 错误大类。
     pub fn class(&self) -> ErrorClass {
         match self {
-            Self::Spawn { .. } => ErrorClass::Spawn,
+            Self::Spawn { .. } | Self::NotInstalled { .. } => ErrorClass::Spawn,
             Self::Transport { .. } => ErrorClass::Transport,
             Self::Timeout { .. } => ErrorClass::Timeout,
             Self::Disconnected { .. } => ErrorClass::Disconnected,
             Self::Protocol(_) => ErrorClass::Protocol,
             Self::Rpc { .. } => ErrorClass::Rpc,
             Self::NotInitialized(_) | Self::Closed(_) | Self::Document(_) => ErrorClass::State,
+            Self::UnsupportedLanguage { .. } => ErrorClass::State,
         }
     }
 
@@ -232,6 +255,20 @@ mod tests {
             (LspError::NotInitialized("a".into()), ErrorClass::State),
             (LspError::Closed("a".into()), ErrorClass::State),
             (LspError::Document("未打开".into()), ErrorClass::State),
+            (
+                LspError::NotInstalled {
+                    command: "typescript-language-server".into(),
+                    language: "typescript".into(),
+                    hint: "npm i -g typescript-language-server".into(),
+                },
+                ErrorClass::Spawn,
+            ),
+            (
+                LspError::UnsupportedLanguage {
+                    path: "a.unknownext".into(),
+                },
+                ErrorClass::State,
+            ),
         ];
         for (err, expected) in cases {
             assert_eq!(err.class(), expected, "{err}");
@@ -247,5 +284,22 @@ mod tests {
         .to_string();
         assert!(text.contains("textDocument/definition"), "{text}");
         assert!(text.contains("1500"), "{text}");
+    }
+
+    #[test]
+    fn not_installed_message_tells_the_user_what_to_install() {
+        let error = LspError::NotInstalled {
+            command: "pyright-langserver".into(),
+            language: "python".into(),
+            hint: "npm i -g pyright".into(),
+        };
+        let text = error.to_string();
+        assert!(text.contains("未安装"), "{text}");
+        assert!(text.contains("pyright-langserver"), "{text}");
+        assert!(text.contains("python"), "{text}");
+        assert!(text.contains("npm i -g pyright"), "{text}");
+        // 「没装」属于可修复的配置问题：不重试、也不是致命断连。
+        assert!(!error.is_retryable(), "{text}");
+        assert!(!error.is_fatal(), "{text}");
     }
 }

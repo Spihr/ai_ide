@@ -17,6 +17,14 @@
 //! | `mock/sleep` | 睡 `params.ms` 毫秒后再回 `null`（测超时） |
 //! | `mock/crash` | **不回包直接退出**（码 3，测服务器中途退出） |
 //! | `mock/malformed` | 写一个非法帧头（`Content-Length: oops`，测非法帧） |
+//! | `textDocument/definition` | 回 `Location` + `LocationLink` + 一条缺 `range` 的坏条目 |
+//! | `textDocument/references` | 按 `context.includeDeclaration` 回 2 条 / 1 条 |
+//! | `textDocument/hover` | 文档非空时回 MarkedString 数组 + `range`，文档为空回 `null` |
+//! | `textDocument/completion` | 回 `{isIncomplete: true, items: [...]}` |
+//!
+//! 查询类方法（definition / references / hover / completion）**要求文档先
+//! `didOpen`**，否则回 `-32000` 错误——客户端如果漏了自动同步，这里会立刻炸，
+//! 而不是回一个空结果让人误以为「这个符号没有定义」。
 //!
 //! 只用 std：客户端要异步，假服务器反而越简单越好——**它不该有 bug**，
 //! 否则测试失败时分不清是客户端错还是桩错。
@@ -42,6 +50,8 @@ struct Server {
     did_open_count: usize,
     did_change_count: usize,
     did_close_count: usize,
+    /// 每个请求方法被调用了几次（验证「同一份文本只 didChange 一次」这类不变量）。
+    request_counts: BTreeMap<String, usize>,
     server_requests: Vec<String>,
 }
 
@@ -137,6 +147,30 @@ fn handle(
     }
 
     let id = id.expect("上面已排除 null/缺失");
+    *server.request_counts.entry(method.clone()).or_insert(0) += 1;
+
+    // 查询类方法的前置条件：文档必须已经 didOpen。真实服务器对未打开文档
+    // 往往沉默或回空，客户端漏掉自动 didOpen 时会表现成「查不到」，很难查；
+    // 这里直接报错，把问题暴露在最早的断点上。
+    if matches!(
+        method.as_str(),
+        "textDocument/definition"
+            | "textDocument/references"
+            | "textDocument/hover"
+            | "textDocument/completion"
+    ) {
+        let uri = params["textDocument"]["uri"].as_str().unwrap_or_default();
+        if !server.documents.contains_key(uri) {
+            send_error(
+                writer,
+                &id,
+                -32000,
+                format!("文档未打开：{uri}（客户端应先发 textDocument/didOpen）"),
+            )?;
+            return Ok(());
+        }
+    }
+
     match method.as_str() {
         "initialize" => {
             server.server_requests.push("initialize".to_string());
@@ -179,7 +213,102 @@ fn handle(
                     "documents": documents,
                     "didOpen": server.did_open_count,
                     "didChange": server.did_change_count,
-                    "didClose": server.did_close_count
+                    "didClose": server.did_close_count,
+                    "requests": server.request_counts
+                }),
+            )?;
+        }
+        "textDocument/definition" => {
+            let uri = params["textDocument"]["uri"].as_str().unwrap_or_default();
+            let line = params["position"]["line"].as_u64().unwrap_or(0);
+            let character = params["position"]["character"].as_u64().unwrap_or(0);
+            // 三种形态一次覆盖：普通 Location、LocationLink（只有 target* 字段）、
+            // 以及一条缺 range 的坏条目（客户端必须跳过，而不是交出一个坐标为空的位置）。
+            send_result(
+                writer,
+                &id,
+                json!([
+                    {
+                        "uri": uri,
+                        "range": {
+                            "start": {"line": line + 2, "character": character},
+                            "end": {"line": line + 2, "character": character + 5}
+                        }
+                    },
+                    {
+                        "targetUri": "file:///E:/ai_ide/src/%E4%B8%AD%E6%96%87.ts",
+                        "targetRange": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": 9, "character": 0}
+                        },
+                        "targetSelectionRange": {
+                            "start": {"line": 4, "character": 6},
+                            "end": {"line": 4, "character": 11}
+                        }
+                    },
+                    {"uri": uri}
+                ]),
+            )?;
+        }
+        "textDocument/references" => {
+            let uri = params["textDocument"]["uri"].as_str().unwrap_or_default();
+            // 用 includeDeclaration 决定条数：客户端没把 context 传下去的话，
+            // 条数就会和预期对不上。
+            let include_declaration = params["context"]["includeDeclaration"]
+                .as_bool()
+                .unwrap_or(true);
+            let count = if include_declaration { 2 } else { 1 };
+            let locations: Vec<Value> = (0..count)
+                .map(|index| {
+                    json!({
+                        "uri": uri,
+                        "range": {
+                            "start": {"line": index, "character": 0},
+                            "end": {"line": index, "character": 4}
+                        }
+                    })
+                })
+                .collect();
+            send_result(writer, &id, Value::Array(locations))?;
+        }
+        "textDocument/hover" => {
+            let uri = params["textDocument"]["uri"].as_str().unwrap_or_default();
+            let empty = server
+                .documents
+                .get(uri)
+                .map(|document| document.text.is_empty())
+                .unwrap_or(true);
+            if empty {
+                // 空文档没有可悬停的东西：规范允许回 null，客户端不该当成错误。
+                send_result(writer, &id, Value::Null)?;
+            } else {
+                let line = params["position"]["line"].as_u64().unwrap_or(0);
+                send_result(
+                    writer,
+                    &id,
+                    json!({
+                        "contents": [
+                            {"language": "typescript", "value": "const value: number"},
+                            "来自 mock 的说明"
+                        ],
+                        "range": {
+                            "start": {"line": line, "character": 0},
+                            "end": {"line": line, "character": 5}
+                        }
+                    }),
+                )?;
+            }
+        }
+        "textDocument/completion" => {
+            send_result(
+                writer,
+                &id,
+                json!({
+                    "isIncomplete": true,
+                    "items": [
+                        {"label": "alpha", "kind": 3, "detail": "() => void", "insertText": "alpha()"},
+                        {"label": "beta", "kind": 6}
+                    ]
                 }),
             )?;
         }

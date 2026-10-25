@@ -91,6 +91,12 @@ pub struct DidCloseTextDocumentParams {
 struct OpenDocument {
     language_id: String,
     version: i32,
+    /// 最近一次同步给服务器的全文。
+    ///
+    /// full 同步下客户端手里有整篇文本，存下来才能判断「这次调用到底有没有改内容」：
+    /// 同一段文本重复 `didOpen`/`didChange` 会白白推进版本号，服务器（尤其
+    /// `rust-analyzer`）会当成真变更重算一遍。
+    text: String,
 }
 
 /// 打开文档的版本表。
@@ -120,6 +126,7 @@ impl DocumentSync {
     ) -> DidOpenTextDocumentParams {
         let uri = uri.into();
         let language_id = language_id.into();
+        let text = text.into();
         let mut documents = self.lock();
         let version = documents
             .get(&uri)
@@ -130,6 +137,7 @@ impl DocumentSync {
             OpenDocument {
                 language_id: language_id.clone(),
                 version,
+                text: text.clone(),
             },
         );
         DidOpenTextDocumentParams {
@@ -137,7 +145,7 @@ impl DocumentSync {
                 uri,
                 language_id,
                 version,
-                text: text.into(),
+                text,
             },
         }
     }
@@ -148,6 +156,7 @@ impl DocumentSync {
         uri: &str,
         text: impl Into<String>,
     ) -> Result<DidChangeTextDocumentParams, LspError> {
+        let text = text.into();
         let mut documents = self.lock();
         let Some(document) = documents.get_mut(uri) else {
             return Err(LspError::Document(format!(
@@ -155,13 +164,19 @@ impl DocumentSync {
             )));
         };
         document.version += 1;
+        document.text = text.clone();
         Ok(DidChangeTextDocumentParams {
             text_document: VersionedTextDocumentIdentifier {
                 uri: uri.to_string(),
                 version: document.version,
             },
-            content_changes: vec![TextDocumentContentChangeEvent { text: text.into() }],
+            content_changes: vec![TextDocumentContentChangeEvent { text }],
         })
+    }
+
+    /// 已同步给服务器的全文；未打开时为 `None`。
+    pub fn text(&self, uri: &str) -> Option<String> {
+        self.lock().get(uri).map(|document| document.text.clone())
     }
 
     /// 登记一次关闭；文档未打开时返回 [`LspError::Document`]。
@@ -416,9 +431,37 @@ mod tests {
     }
 
     #[test]
+    fn chinese_paths_round_trip_without_spaces() {
+        // 纯中文路径（无空格）最容易踩「逐字符而不是逐字节编码」的坑：
+        // 按字节编码时 `%E4%B8%AD` 才正确，按字符编码会把 uri 编坏。
+        let path = std::path::PathBuf::from(r"E:\项目\代码\主文件.ts");
+        let uri = path_to_uri(&path);
+        assert_eq!(
+            uri,
+            "file:///E:/%E9%A1%B9%E7%9B%AE/%E4%BB%A3%E7%A0%81/%E4%B8%BB%E6%96%87%E4%BB%B6.ts"
+        );
+        assert_eq!(
+            uri_to_path(&uri),
+            Some(std::path::PathBuf::from("E:/项目/代码/主文件.ts"))
+        );
+    }
+
+    #[test]
     fn non_file_uris_have_no_path() {
         assert_eq!(uri_to_path("untitled:Untitled-1"), None);
         assert_eq!(uri_to_path("git://x"), None);
+    }
+
+    #[test]
+    fn full_sync_tracks_the_latest_text_so_repeats_can_be_skipped() {
+        let sync = DocumentSync::new();
+        sync.open("file:///a.ts", "typescript", "const a = 1;");
+        assert_eq!(sync.text("file:///a.ts").as_deref(), Some("const a = 1;"));
+
+        sync.change_full("file:///a.ts", "const a = 2;")
+            .expect("ok");
+        assert_eq!(sync.text("file:///a.ts").as_deref(), Some("const a = 2;"));
+        assert_eq!(sync.text("file:///ghost.ts"), None);
     }
 
     #[test]
