@@ -13,12 +13,12 @@
 use crate::dispatch::parse_params;
 use crate::peer::Peer;
 use crate::state::AppState;
-use ai_ide_indexer::{grep, FileIndex, IndexError};
+use ai_ide_indexer::{grep, symbols, FileIndex, IndexError};
 use ai_ide_protocol::dto::{
-    OkResult, SearchContentParams, SearchFilesParams, WorkspaceChangedEvent, WorkspaceCloseParams,
-    WorkspaceCreateParams, WorkspaceDeleteParams, WorkspaceOpenParams, WorkspaceOpenResult,
-    WorkspaceReadFileParams, WorkspaceRenameParams, WorkspaceRevealParams, WorkspaceTreeParams,
-    WorkspaceTreeResult, WorkspaceWriteFileParams,
+    OkResult, SearchContentParams, SearchFilesParams, SearchSymbolsParams, WorkspaceChangedEvent,
+    WorkspaceCloseParams, WorkspaceCreateParams, WorkspaceDeleteParams, WorkspaceOpenParams,
+    WorkspaceOpenResult, WorkspaceReadFileParams, WorkspaceRenameParams, WorkspaceRevealParams,
+    WorkspaceTreeParams, WorkspaceTreeResult, WorkspaceWriteFileParams,
 };
 use ai_ide_protocol::{methods, ErrorObject, PathChange, Request};
 use ai_ide_workspace::{fs_ops, Workspace, WorkspaceError};
@@ -447,6 +447,42 @@ fn reveal_in_explorer(abs: &Path) -> Result<(), WorkspaceError> {
 // search.files / search.content
 // ---------------------------------------------------------------------------
 
+/// 取（或兜底建）工作区的文件索引。
+///
+/// 符号检索复用同一份索引，不自己再遍历目录：否则「忽略规则」「隐藏文件」会有
+/// 两份实现，迟早出现「树里看不见、符号却能搜到」。
+async fn ensure_index(
+    peer: &Peer,
+    state: &AppState,
+    req_id: &str,
+    workspace_id: &str,
+) -> Option<Arc<FileIndex>> {
+    if let Some(index) = state.index(workspace_id) {
+        return Some(index);
+    }
+
+    // 正常路径下 open 已经建好索引；这里兜底，避免「先搜索后打开」的调用直接失败。
+    let workspace = match state.workspace(Some(workspace_id)) {
+        Ok(workspace) => workspace,
+        Err(err) => {
+            peer.respond_error(req_id, &ws_error(&err)).await;
+            return None;
+        }
+    };
+    let root = workspace.root.clone();
+    match blocking(move || FileIndex::build(&root)).await {
+        Ok(index) => {
+            let index = Arc::new(index);
+            state.put_index(&workspace.id, Arc::clone(&index));
+            Some(index)
+        }
+        Err(err) => {
+            peer.respond_error(req_id, &err).await;
+            None
+        }
+    }
+}
+
 pub async fn search_files(peer: &Peer, state: &AppState, req: &Request) {
     let params: SearchFilesParams = match parse_params(req.params.as_ref()) {
         Ok(params) => params,
@@ -496,6 +532,33 @@ pub async fn search_content(peer: &Peer, state: &AppState, req: &Request) {
     match task::spawn_blocking(move || grep::search(&root, &query)).await {
         Ok(Ok(result)) => peer.respond(&req.id, &result).await,
         Ok(Err(err)) => peer.respond_error(&req.id, &err.to_error()).await,
+        Err(err) => peer.respond_error(&req.id, &join_error(err)).await,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// search.symbols
+// ---------------------------------------------------------------------------
+
+/// 符号检索：在索引到的源码文件里按名字找声明。
+///
+/// 与 [`search_content`] 的分工：内容检索回「哪一行的文本里有这个词」，符号检索回
+/// 「这个声明定义在哪、覆盖到哪几行」——前者用于看上下文，后者用于跳转定义。
+pub async fn search_symbols(peer: &Peer, state: &AppState, req: &Request) {
+    let params: SearchSymbolsParams = match parse_params(req.params.as_ref()) {
+        Ok(params) => params,
+        Err(err) => return peer.respond_error(&req.id, &err).await,
+    };
+
+    let Some(index) = ensure_index(peer, state, &req.id, &params.workspace_id).await else {
+        return;
+    };
+
+    // 逐文件读盘 + 正则匹配是纯 CPU / IO 活，放阻塞池，别占 async worker。
+    let root = index.root().to_path_buf();
+    let query = params.clone();
+    match task::spawn_blocking(move || symbols::search(&root, &index, &query)).await {
+        Ok(result) => peer.respond(&req.id, &result).await,
         Err(err) => peer.respond_error(&req.id, &join_error(err)).await,
     }
 }

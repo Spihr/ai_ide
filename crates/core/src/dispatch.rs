@@ -88,6 +88,7 @@ async fn handle_request(peer: &Peer, state: &AppState, req: Request) {
         // 检索（M1）
         methods::search::FILES => ws::search_files(peer, state, &req).await,
         methods::search::CONTENT => ws::search_content(peer, state, &req).await,
+        methods::search::SYMBOLS => ws::search_symbols(peer, state, &req).await,
 
         // Provider 与模型目录（M2）
         methods::provider::UPSERT => provider_api::provider_upsert(peer, state, &req).await,

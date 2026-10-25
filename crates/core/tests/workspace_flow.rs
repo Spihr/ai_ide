@@ -349,3 +349,59 @@ fn 新建_重命名_删除走真实磁盘() {
 
     let _ = workspace_id;
 }
+
+/// M3 切片一：`search.symbols` 必须真的走 dispatch（而不是落 `-32601` 兜底），
+/// 且 `kinds` 过滤与「无匹配」两条支路要有可观测的差别。
+///
+/// 断言写在端到端层而不是 handler 里，是因为这条链路的风险在「方法名常量 →
+/// dispatch 分支 → 索引复用 → 序列化形状」上；单测命中不了常量拼错、分支漏接。
+#[test]
+fn 符号检索_走分发_支持种类过滤与空结果() {
+    let ws_dir = TempWorkspace::new("symbols");
+    let mut core = Core::spawn();
+    let workspace_id = open(&mut core, &ws_dir.root);
+
+    // 1) 基础命中：`main` 是 `src/main.rs` 里的函数，range 落在第 1–3 行。
+    let hit = core.ok(
+        "search.symbols",
+        json!({ "workspace_id": workspace_id, "query": "main" }),
+    );
+    let symbols = hit["symbols"].as_array().expect("symbols 是数组");
+    let main = symbols
+        .iter()
+        .find(|symbol| symbol["name"] == json!("main"))
+        .expect("应命中 fn main");
+    assert_eq!(main["kind"], json!("function"));
+    assert_eq!(
+        main["path"],
+        json!("src/main.rs"),
+        "path 是相对工作区根的路径"
+    );
+    assert_eq!(main["range"]["start_line"], json!(1));
+    assert_eq!(main["range"]["end_line"], json!(3), "块级闭合算到第 3 行");
+
+    // 2) `kinds` 过滤：同一个 query 换成只要 struct，就该是空表——而不是报错。
+    let filtered = core.ok(
+        "search.symbols",
+        json!({ "workspace_id": workspace_id, "query": "main", "kinds": ["struct"] }),
+    );
+    assert_eq!(
+        filtered["symbols"].as_array().map(Vec::len),
+        Some(0),
+        "kinds 过滤后不应残留 function：{filtered}"
+    );
+
+    // 3) 无匹配：空表 + 成功响应（浏览型查询不该因为没找到就报错）。
+    let missing = core.ok(
+        "search.symbols",
+        json!({ "workspace_id": workspace_id, "query": "definitely_absent_symbol" }),
+    );
+    assert_eq!(missing["symbols"].as_array().map(Vec::len), Some(0));
+
+    // 4) 未知工作区：走业务错误 1001，而不是静默空表。
+    let unknown = core.error_code(
+        "search.symbols",
+        json!({ "workspace_id": "00000000-0000-4000-8000-000000000000", "query": "main" }),
+    );
+    assert_eq!(unknown, 1001, "未知工作区应返回 1001");
+}

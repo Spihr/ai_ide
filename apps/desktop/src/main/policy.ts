@@ -32,6 +32,7 @@ const RENDERER_ALLOWED = new Set<string>([
   // M1：检索。
   Methods.search.files,
   Methods.search.content,
+  Methods.search.symbols,
 
   // M2：模型接入。放行的理由与 M1 一致——这些都要用户显式动作才会发起：
   // 配置/删除 Provider 与模型、点「测试连接」、发一条对话、按「停止」。

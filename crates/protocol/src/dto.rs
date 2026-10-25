@@ -519,6 +519,79 @@ pub struct SearchContentResult {
     pub truncated: bool,
 }
 
+/// 符号种类。
+///
+/// 七种语言共用一套 kind，而不是各自一套：前端呈现的是一张「符号列表」，
+/// 分组的维度应该是「这是函数还是类型」，而不是「这是 Rust 的 trait 还是 TS 的 interface」。
+/// 因此 `trait` / `interface` / `struct` / `class` 各自独立，`function` / `method`
+/// 按「是否定义在类型体内」区分（Rust 的 `impl`、TS/Java 的 `class`、Python 的 `class`、
+/// Go 的接收者函数都算方法）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum SymbolKind {
+    /// 函数（模块级 / 顶层）。
+    Function,
+    /// 方法（定义在类型体内）。
+    Method,
+    /// 结构体（Rust `struct`、Go `type X struct`）。
+    Struct,
+    /// 类（TS / JS / Python / Java `class`）。
+    Class,
+    /// 枚举（Rust / TS / Java `enum`）。
+    Enum,
+    /// 接口（TS `interface`、Java `interface`、Go `type X interface`）。
+    Interface,
+    /// trait（Rust）。
+    Trait,
+    /// 常量（`const` / `static` / 模块级全大写赋值 / `static final`）。
+    Const,
+}
+
+/// 符号在文件内的行范围（1 起算，闭区间）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SymbolRange {
+    /// 声明起始行（含）。
+    #[ts(type = "number")]
+    pub start_line: u32,
+    /// 声明结束行（含）。单行声明与 `start_line` 相等。
+    #[ts(type = "number")]
+    pub end_line: u32,
+}
+
+/// 一个符号。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct Symbol {
+    /// 名字（不含 `fn` / `class` 等关键字）。
+    pub name: String,
+    pub kind: SymbolKind,
+    /// 相对工作区根的路径，`/` 分隔。
+    pub path: String,
+    pub range: SymbolRange,
+}
+
+/// `search.symbols` 请求参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SearchSymbolsParams {
+    pub workspace_id: String,
+    /// 查询串；空串表示「所有符号」。大小写不敏感，先按子串命中，再退化到子序列模糊匹配。
+    pub query: String,
+    /// 只返回这些种类；缺省（或空数组）表示不过滤。
+    #[serde(default)]
+    pub kinds: Option<Vec<SymbolKind>>,
+}
+
+/// `search.symbols` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SearchSymbolsResult {
+    /// 命中上限由内核固定（200 条），按相关度排序。
+    pub symbols: Vec<Symbol>,
+}
+
 // ---------------------------------------------------------------------------
 // provider.* / model.* —— Provider 与模型目录（M2）
 // ---------------------------------------------------------------------------

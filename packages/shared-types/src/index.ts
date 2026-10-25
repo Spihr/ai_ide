@@ -69,6 +69,12 @@ export type { SearchFilesResult } from "./generated/SearchFilesResult";
 export type { SearchContentParams } from "./generated/SearchContentParams";
 export type { ContentMatch } from "./generated/ContentMatch";
 export type { SearchContentResult } from "./generated/SearchContentResult";
+// M3 切片一：符号检索（`search.symbols`）的请求 / 响应与符号视图类型。
+export type { SearchSymbolsParams } from "./generated/SearchSymbolsParams";
+export type { SearchSymbolsResult } from "./generated/SearchSymbolsResult";
+export type { SymbolKind } from "./generated/SymbolKind";
+export type { SymbolRange } from "./generated/SymbolRange";
+export type { Symbol } from "./generated/Symbol";
 
 // ---- provider.* 方法（M2）----
 export type { ProviderChangedEvent } from "./generated/ProviderChangedEvent";
@@ -355,6 +361,7 @@ export const Methods = {
   search: {
     files: "search.files",
     content: "search.content",
+    symbols: "search.symbols",
   },
   provider: {
     upsert: "provider.upsert",
@@ -474,7 +481,8 @@ export const Methods = {
  * M7 的 `mcp.*` 五项（Server 清单 / 连接 / 断开 / 工具 / 调用），
  * 以及插件系统 P0 的 `plugin.*` 十项（协议骨架：能路由，但统一回 6101）——
  * P5 切片二把其中第 11 项 `plugin.command`（命令网关）补成真实现，
- * 共 72 项，与 Rust `methods::IMPLEMENTED` 逐项对齐。
+ * 再加 M3 切片一的 `search.symbols`（符号检索内核面：七种语言的声明抽取，
+ * 外壳入口留待下一片），共 73 项，与 Rust `methods::IMPLEMENTED` 逐项对齐。
  */
 export const IMPLEMENTED_METHODS = [
   Methods.core.hello,
@@ -493,6 +501,7 @@ export const IMPLEMENTED_METHODS = [
   Methods.workspace.reveal,
   Methods.search.files,
   Methods.search.content,
+  Methods.search.symbols,
   Methods.provider.upsert,
   Methods.provider.list,
   Methods.provider.delete,

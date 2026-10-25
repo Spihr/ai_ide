@@ -25,7 +25,8 @@ describe('checkRendererCall', () => {
       'workspace.write_file',
       'workspace.delete',
       'search.files',
-      'search.content'
+      'search.content',
+      'search.symbols'
     ]
 
     for (const method of methods) {
@@ -302,6 +303,7 @@ describe('checkRendererCall', () => {
       'provider.upsert',
       'search.content',
       'search.files',
+      'search.symbols',
       'session.append_message',
       'session.create',
       'session.delete',

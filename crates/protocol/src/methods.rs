@@ -30,10 +30,16 @@ pub mod workspace {
     pub const REVEAL: &str = "workspace.reveal";
 }
 
-/// 检索（M1：文件名模糊 + 内容检索；符号检索属 M3）。
+/// 检索（M1：文件名模糊 + 内容检索；M3 切片一补符号检索）。
 pub mod search {
     pub const FILES: &str = "search.files";
     pub const CONTENT: &str = "search.content";
+    /// 符号检索：按名字在源码里找函数 / 结构体 / 类 / 枚举 / 接口 / trait / 常量 / 方法。
+    ///
+    /// 与 [`CONTENT`] 的区别是**语义层级**：内容检索给的是「哪一行的文本里有这个词」，
+    /// 符号检索给的是「这个声明定义在哪、覆盖到哪一行」。前端据此做「跳到定义」，
+    /// 而不是把命中行当文本展示。
+    pub const SYMBOLS: &str = "search.symbols";
 }
 
 /// Provider 与模型管理（M2，已在 `crates/core` 接线）。
@@ -285,6 +291,7 @@ pub const IMPLEMENTED: &[&str] = &[
     workspace::REVEAL,
     search::FILES,
     search::CONTENT,
+    search::SYMBOLS,
     provider::UPSERT,
     provider::LIST,
     provider::DELETE,
@@ -374,11 +381,13 @@ mod tests {
 
     #[test]
     fn implemented_list_covers_core_m1_m2_agent_domains() {
-        assert_eq!(IMPLEMENTED.len(), 72);
+        assert_eq!(IMPLEMENTED.len(), 73);
         assert!(IMPLEMENTED.contains(&"core.ping"));
         assert!(IMPLEMENTED.contains(&"$/cancelRequest"));
         assert!(IMPLEMENTED.contains(&"workspace.read_file"));
         assert!(IMPLEMENTED.contains(&"search.content"));
+        // M3 切片一：符号检索进清单，与 `search.files` / `search.content` 同族。
+        assert!(IMPLEMENTED.contains(&search::SYMBOLS));
         assert!(IMPLEMENTED.contains(&provider::UPSERT));
         assert!(IMPLEMENTED.contains(&model::DELETE));
         // M2 收尾：`llm.*` 四个方法进清单，能力声明与 dispatch 分支一致。
@@ -498,8 +507,8 @@ mod tests {
         all.dedup();
         assert_eq!(all.len(), total, "两张表不得有重叠");
         assert_eq!(
-            total, 72,
-            "应恰好覆盖协议里定义的全部 72 个请求方法（P5 切片二补 `plugin.command`）"
+            total, 73,
+            "应恰好覆盖协议里定义的全部 73 个请求方法（P5 切片二补 `plugin.command`，M3 切片一补 `search.symbols`）"
         );
     }
 
@@ -574,6 +583,7 @@ mod tests {
         assert_eq!(workspace::READ_FILE, "workspace.read_file");
         assert_eq!(workspace::WRITE_FILE, "workspace.write_file");
         assert_eq!(search::FILES, "search.files");
+        assert_eq!(search::SYMBOLS, "search.symbols");
         assert_eq!(event::WORKSPACE_CHANGED, "workspace.changed");
     }
 }

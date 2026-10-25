@@ -11,10 +11,12 @@
 //! - 落盘索引要处理失效、版本、迁移，是 M3 该付的成本，不该提前付；
 //! - 内容检索先用「遍历 + 正则」直查，靠 `ignore` 的并行遍历控制开销。
 //!
-//! 符号索引（`search.symbols`）同样属 M3，不在这里。
+//! 符号索引（`search.symbols`）在 M3 切片一落地：只做「行首声明 + 作用域跟踪」的
+//! 轻量抽取（见 [`symbols`]），不引语法树——理由写在那个模块的文档里。
 
 pub mod fuzzy;
 pub mod grep;
+pub mod symbols;
 
 use ai_ide_protocol::{FileMatch, SearchFilesParams, SearchFilesResult, WorkspaceStats};
 use globset::Glob;
