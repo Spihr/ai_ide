@@ -76,7 +76,7 @@ impl HostApiError {
     pub const LLM_DENIED: i64 = Self::UNAUTHORIZED;
     /// 参数畸形（缺字段 / 类型不对）。
     pub const INVALID_PARAMS: i64 = -32602;
-    /// 方法不存在（v1 未实现的宿主能力也走它）。
+    /// 方法不存在（能力表里查不到这个名字：从未实现，或插件把方法名拼错了）。
     pub const METHOD_NOT_FOUND: i64 = -32601;
 
     pub fn new(code: i64, message: impl Into<String>) -> Self {
@@ -94,7 +94,7 @@ impl HostApiError {
         )
     }
 
-    /// 方法不存在 / v1 未实现。
+    /// 方法不存在（能力表里查不到这个名字）。
     pub fn method_not_found(method: &str) -> Self {
         Self::new(
             Self::METHOD_NOT_FOUND,

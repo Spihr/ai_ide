@@ -89,7 +89,8 @@ pub const DECISION_ERROR: &str = "error";
 /// 名字带进程号与自增序号，避免两个插件同时写同一目标时互相踩。
 const WRITE_TEMP_PREFIX: &str = ".aiide-write";
 
-/// 方法 → 所需能力。返回 `None` 的方法就是「v1 未实现」，回 `-32601`。
+/// 方法 → 所需能力。返回 `None` 的方法就是「能力表里没有这个名字」（从未实现，
+/// 或方法名拼错），回 `-32601`。
 ///
 /// 注意 `workspace.info` 也归 `fs.read`：它只是把已打开工作区的根告诉插件，
 /// 读能力本就隐含这件事，单开一个 `workspace` 能力会让清单白多一项。
@@ -1260,7 +1261,7 @@ impl HostApi for FsHostApi {
             // 不做审计：连方法都不存在，谈不上「插件用了什么能力」。
             return Err(HostApiError::new(
                 HostApiError::METHOD_NOT_FOUND,
-                format!("v1 未实现该宿主能力：{method}"),
+                format!("未知的宿主能力：{method}（未实现或方法名有误）"),
             ));
         };
         let call_id = format!("host-{}", self.calls.fetch_add(1, Ordering::Relaxed) + 1);
@@ -1468,7 +1469,7 @@ impl HostApi for FsHostApi {
             },
             (_, other) => Err(HostApiError::new(
                 HostApiError::METHOD_NOT_FOUND,
-                format!("v1 未实现该宿主能力：{other}"),
+                format!("未知的宿主能力：{other}（未实现或方法名有误）"),
             )),
         };
         // 6103 记 `deny` 而不是 `error`：网络逐跳校验在 `execute` 里做，跳转出白名单
@@ -2462,21 +2463,29 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// 未实现的方法回 -32601，且不去碰闸门（不消耗配额、不落审计）。
+    /// 能力表里没有的方法名回 -32601，且不去碰闸门（不消耗配额、不落审计）。
+    ///
+    /// P5 收口后 `host/*` 六项能力已全部接线，再拿真实方法名当「未实现」样本就是
+    /// 假断言：`host/progress` 早已落地，而且它走的是通知通道（`notify`）而不是
+    /// `call`，对它断言 -32601 只会掩盖真实行为。所以这里用一个**确实不存在**的
+    /// 方法名——这条用例验的是「未知方法名 → -32601」的兜底路径，与任何一项能力的
+    /// 落地状态无关。
     #[tokio::test]
     async fn unimplemented_method_answers_method_not_found() {
         let root = sandbox("unimpl");
         let (api, store) = api_with_store(&root, &["fs.read"], "unimpl").await;
 
-        // `host/net.fetch` 与 `host/llm.chat` 都已接线（未授权时回 6103），所以
-        // 只剩这一项：一张「还没接线」的表必须随着接线一条条变短，否则它会从
-        // 「进度看板」退化成「谎话看板」。
-        let method = "host/progress";
+        // 拼错 / 从未定义的方法名走的就是这条路：能力表查不到，直接 -32601。
+        let method = "host/nonexistent";
         let err = api
             .call("demo", method, &json!({ "path": "a.txt" }))
-            .expect_err("v1 未实现");
+            .expect_err("未知方法名应报 -32601");
         assert_eq!(err.code, HostApiError::METHOD_NOT_FOUND, "{method}");
-        assert!(err.message.contains("v1 未实现"), "{}", err.message);
+        assert!(
+            err.message.contains("未知的宿主能力") && err.message.contains(method),
+            "{}",
+            err.message
+        );
         assert_eq!(api.quota_used("demo"), 0);
         // 方法不存在 = 连「插件用了什么能力」都谈不上，审计表必须干净。
         let rows = store
