@@ -179,8 +179,11 @@ export function SearchPanel() {
               </button>
             </li>
           ))}
+          {/* 后台索引还没建完时，内核回的是降级空表：这时候说「没有匹配的文件」是撒谎。 */}
           {state.fileQuery.trim() !== '' && state.fileMatches.length === 0 && (
-            <li className="panel__hint">没有匹配的文件</li>
+            <li className="panel__hint">
+              {state.searchIndexing ? '索引构建中，结果暂不完整' : '没有匹配的文件'}
+            </li>
           )}
         </ul>
       )}
@@ -242,7 +245,9 @@ export function SearchPanel() {
             </div>
           ))}
           {symbolQuery.trim() !== '' && state.symbolMatches.length === 0 && (
-            <p className="panel__hint">没有匹配的符号</p>
+            <p className="panel__hint">
+              {state.searchIndexing ? '索引构建中，结果暂不完整' : '没有匹配的符号'}
+            </p>
           )}
           {symbolQuery.trim() === '' && state.symbolMatches.length > 0 && (
             <p className="panel__hint">共 {state.symbolMatches.length} 个符号，输入名字缩小范围</p>

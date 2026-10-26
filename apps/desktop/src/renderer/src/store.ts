@@ -135,6 +135,32 @@ export interface EditorState {
   notice: Notice | null
   /** 待执行的编辑器跳转。 */
   reveal: RevealTarget | null
+  /**
+   * 后台索引是否还在建。
+   *
+   * 内核的 `workspace.open` 不再等整库遍历（见 docs/03），首次打开回 `indexing: true`，
+   * 遍历完成后推 `workspace.indexed`；状态栏与符号浮层靠这个字段提示「索引中」，
+   * 而不是把「还没扫完」显示成「0 个文件」。
+   */
+  indexing: boolean
+  /** 最近一次索引完成的真实载荷；本次会话还没完成过索引时为 `null`。 */
+  indexSummary: IndexSummary | null
+  /**
+   * 检索侧看到的索引状态：`search.files` / `search.symbols` 命中降级结果
+   * （`indexing: true`，空表）时为真，索引就绪后的下一次检索自动转假。
+   */
+  searchIndexing: boolean
+}
+
+/** `workspace.indexed` 载荷里界面用得上的部分（耗时与增量标记不在 `stats` 里）。 */
+export interface IndexSummary {
+  files: number
+  dirs: number
+  ignored: number
+  /** 后台构建耗时（毫秒），由内核侧计时。 */
+  durationMs: number
+  /** 是否为增量构建；当前内核每次都是全量重建，恒为 `false`。 */
+  incremental: boolean
 }
 
 const initialState: EditorState = {
@@ -160,7 +186,10 @@ const initialState: EditorState = {
   symbolSearching: false,
   symbolError: null,
   notice: null,
-  reveal: null
+  reveal: null,
+  indexing: false,
+  indexSummary: null,
+  searchIndexing: false
 }
 
 let state: EditorState = initialState
@@ -300,11 +329,14 @@ export async function openWorkspace(path: string): Promise<void> {
   try {
     const workspace = await workspaceApi.open(path, true)
     // 换工作区 = 换世界：标签、树、搜索结果全部重置。
+    // `indexing` 必须从 open 的返回值里接过来：内核这时通常还没遍历完，
+    // 直接沿用 `initialState` 的 `false` 会让状态栏谎报「已索引 0 个文件」。
     state = {
       ...initialState,
       workspace,
       activity: state.activity,
-      opening: false
+      opening: false,
+      indexing: workspace.indexing
     }
     emit()
     await loadDir('')
@@ -591,7 +623,8 @@ export async function runFileSearch(query: string): Promise<void> {
   set({ searching: true, searchError: null })
   try {
     const result = await workspaceApi.searchFiles(workspace.workspace_id, query)
-    set({ fileMatches: result.matches, searching: false })
+    // `indexing: true` 是内核的降级信号：这次遍历还没跑完，空表不代表「没有匹配」。
+    set({ fileMatches: result.matches, searching: false, searchIndexing: result.indexing })
   } catch (error) {
     set({ searching: false, searchError: cleanMessage(error) })
   }
@@ -661,7 +694,11 @@ export async function runSymbolSearch(
   try {
     const result = await workspaceApi.searchSymbols(workspace.workspace_id, trimmed)
     if (seq !== symbolRequestSeq) return
-    set({ symbolMatches: result.symbols, symbolSearching: false })
+    set({
+      symbolMatches: result.symbols,
+      symbolSearching: false,
+      searchIndexing: result.indexing
+    })
   } catch (error) {
     if (seq !== symbolRequestSeq) return
     set({ symbolSearching: false, symbolError: cleanMessage(error) })
@@ -758,7 +795,20 @@ export function handleWorkspaceChanged(event: WorkspaceChangedEvent): void {
 export function handleWorkspaceIndexed(event: WorkspaceIndexedEvent): void {
   const workspace = state.workspace
   if (!workspace || event.workspace_id !== workspace.workspace_id) return
-  set({ workspace: { ...workspace, stats: event.stats, indexing: false } })
+  // 事件是「索引真的建完了」的唯一信号：统计换成真实值，两个就绪标记一起归位。
+  // 载荷里的 `duration_ms` / `incremental` 不在 `stats` 上，单独存一份给状态栏。
+  set({
+    workspace: { ...workspace, stats: event.stats, indexing: false },
+    indexing: false,
+    searchIndexing: false,
+    indexSummary: {
+      files: event.stats.files,
+      dirs: event.stats.dirs,
+      ignored: event.stats.ignored,
+      durationMs: event.duration_ms,
+      incremental: event.incremental
+    }
+  })
 }
 
 export function initWorkspaceEvents(): () => void {

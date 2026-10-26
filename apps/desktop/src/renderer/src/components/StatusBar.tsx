@@ -19,6 +19,12 @@ function truncateLog(text: string): string {
   return single.length > LOG_PREVIEW_CHARS ? `${single.slice(0, LOG_PREVIEW_CHARS)}…` : single
 }
 
+/** 毫秒 → 状态栏可读文案：一秒以内给毫秒，超过给秒（保留一位小数）。 */
+function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return '-'
+  return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`
+}
+
 const CORE_LABEL: Record<CoreStatus['state'], string> = {
   idle: '未启动',
   starting: '启动中',
@@ -39,6 +45,21 @@ export function StatusBar({ core }: StatusBarProps) {
 
   const active = state.tabs.find((tab) => tab.path === state.activePath) ?? null
   const dirty = active ? active.content !== active.savedContent : false
+
+  // 后台索引提示：内核的 workspace.open 不再等整库遍历，索引没就绪时 stats 是空快照，
+  // 直接显示「0 文件 / 0 目录」会被当成「这个工作区是空的」。
+  const indexSummary = state.indexSummary
+  const indexLabel = !state.workspace
+    ? null
+    : state.indexing
+      ? '索引中…'
+      : indexSummary
+        ? `索引完成 ${formatDuration(indexSummary.durationMs)}`
+        : '索引未就绪'
+  const indexTitle =
+    indexSummary && !state.indexing
+      ? `${indexSummary.incremental ? '增量' : '全量'}索引：${indexSummary.files} 文件 / ${indexSummary.dirs} 目录 / 忽略 ${indexSummary.ignored} 项，耗时 ${formatDuration(indexSummary.durationMs)}`
+      : '内核在后台遍历工作区，完成后会自动刷新统计'
 
   // 语言服务只在「有话说」时占位：`idle`（还没开过文件）不显示，免得空工作区
   // 里挂一条「语言服务器不可用」吓人。`unavailable` / `error` 走 tooltip 说明，
@@ -115,6 +136,14 @@ export function StatusBar({ core }: StatusBarProps) {
           <span className="status__item">{dirty ? '未保存' : '已保存'}{active.saving ? ' · 写入中' : ''}</span>
           <span className="status__item">{active.encoding} · {active.eol.toUpperCase()}</span>
         </>
+      )}
+      {indexLabel && (
+        <span
+          className={`status__item status__item--${state.indexing ? 'starting' : 'ready'}`}
+          title={indexTitle}
+        >
+          {indexLabel}
+        </span>
       )}
       <span className="status__item">
         {state.workspace

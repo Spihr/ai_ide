@@ -104,7 +104,8 @@ function installHarness(): void {
         case Methods.workspace.readFile:
           return read
         case Methods.search.symbols:
-          return { symbols } satisfies SearchSymbolsResult
+          // 就绪标记必填（协议里的 `indexing`）：这里模拟「索引已建好」。
+          return { symbols, indexing: false } satisfies SearchSymbolsResult
         default:
           return { ok: true }
       }

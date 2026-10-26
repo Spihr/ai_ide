@@ -57,6 +57,8 @@ interface Harness {
   setReadResult: (patch: Partial<WorkspaceReadFileResult>) => void
   setTreeEntries: (entries: TreeEntry[]) => void
   setSymbols: (symbols: Symbol[]) => void
+  setOpenIndexing: (indexing: boolean) => void
+  setSearchIndexing: (indexing: boolean) => void
   failNextRequest: (message: string) => void
 }
 
@@ -84,6 +86,8 @@ function installHarness(): Harness {
     stats: { files: 2, dirs: 1, ignored: 0 },
     indexing: false
   }
+  // 后台索引的降级形状由内核决定：测试里用开关模拟「还没建完」。
+  let searchIndexing = false
 
   const api: AiIdeApi = {
     getCoreStatus: async () => {
@@ -115,7 +119,12 @@ function installHarness(): Harness {
         case Methods.workspace.writeFile:
           return { ok: true, hash: 'h2' } satisfies WorkspaceWriteFileResult
         case Methods.search.files:
-          return { matches: [{ path: 'a.ts', score: 1 }] } satisfies SearchFilesResult
+          return {
+            // 内核在索引未就绪时回「空表 + indexing: true」，这里照同一形状模拟：
+            // 空表不是「没有匹配」，而是「还没扫完」。
+            matches: searchIndexing ? [] : [{ path: 'a.ts', score: 1 }],
+            indexing: searchIndexing
+          } satisfies SearchFilesResult
         case Methods.search.content:
           return {
             matches: [{ path: 'a.ts', line: 1, column: 1, preview: 'hello' }],
@@ -123,7 +132,10 @@ function installHarness(): Harness {
           } satisfies SearchContentResult
         case Methods.search.symbols:
           // 空 query 是「列全部」：内核按空串返回全部符号，这里给同一份即可。
-          return { symbols } satisfies SearchSymbolsResult
+          return {
+            symbols: searchIndexing ? [] : symbols,
+            indexing: searchIndexing
+          } satisfies SearchSymbolsResult
         default:
           return { ok: true }
       }
@@ -170,6 +182,12 @@ function installHarness(): Harness {
     setSymbols: (next) => {
       symbols = next
     },
+    setOpenIndexing: (indexing) => {
+      openResult.indexing = indexing
+    },
+    setSearchIndexing: (indexing) => {
+      searchIndexing = indexing
+    },
     failNextRequest: (message) => {
       failure = message
     }
@@ -203,12 +221,80 @@ describe('工作区', () => {
     expect(state.workspaceError).toContain('内核对不上')
   })
 
-  it('索引完成事件把最终统计写回工作区', () => {
+  it('索引完成事件把最终统计、耗时与两个就绪标记一起写回', () => {
     handleWorkspaceIndexed({
       workspace_id: 'ws-1',
-      stats: { files: 9, dirs: 3, ignored: 1 }
+      stats: { files: 9, dirs: 3, ignored: 1 },
+      duration_ms: 42,
+      incremental: false
     })
-    expect(getEditorState().workspace?.stats.files).toBe(9)
+    const state = getEditorState()
+    expect(state.workspace?.stats.files).toBe(9)
+    expect(state.workspace?.indexing).toBe(false)
+    expect(state.indexing).toBe(false)
+    expect(state.searchIndexing).toBe(false)
+    expect(state.indexSummary).toEqual({
+      files: 9,
+      dirs: 3,
+      ignored: 1,
+      durationMs: 42,
+      incremental: false
+    })
+  })
+
+  it('别的 workspace 的索引事件不串台', () => {
+    handleWorkspaceIndexed({
+      workspace_id: 'ws-other',
+      stats: { files: 99, dirs: 9, ignored: 5 },
+      duration_ms: 7,
+      incremental: false
+    })
+    const state = getEditorState()
+    expect(state.workspace?.stats.files).toBe(2)
+    expect(state.indexSummary).toBeNull()
+  })
+
+  it('打开时内核回 indexing:true，状态与检索结果都标「索引中」', async () => {
+    h.setOpenIndexing(true)
+    await openWorkspace(ROOT)
+    expect(getEditorState().indexing).toBe(true)
+    expect(getEditorState().workspace?.indexing).toBe(true)
+
+    // 索引未就绪：文件名与符号检索都回空表 + 就绪标记，界面据此说「索引中」
+    // 而不是「没找到」。
+    h.setSearchIndexing(true)
+    await runFileSearch('mnrs')
+    expect(getEditorState().searchIndexing).toBe(true)
+    expect(getEditorState().fileMatches).toEqual([])
+
+    await runSymbolSearch('boot')
+    expect(getEditorState().searchIndexing).toBe(true)
+    expect(getEditorState().symbolMatches).toEqual([])
+  })
+
+  it('索引事件到达后检索标记归位，下一次检索回到正常结果', async () => {
+    h.setOpenIndexing(true)
+    h.setSearchIndexing(true)
+    await openWorkspace(ROOT)
+    await runFileSearch('mnrs')
+    expect(getEditorState().searchIndexing).toBe(true)
+
+    handleWorkspaceIndexed({
+      workspace_id: 'ws-1',
+      stats: { files: 2, dirs: 1, ignored: 0 },
+      duration_ms: 11,
+      incremental: false
+    })
+    const settled = getEditorState()
+    expect(settled.searchIndexing).toBe(false)
+    expect(settled.indexing).toBe(false)
+    expect(settled.indexSummary?.durationMs).toBe(11)
+
+    h.setSearchIndexing(false)
+    await runFileSearch('mnrs')
+    const after = getEditorState()
+    expect(after.searchIndexing).toBe(false)
+    expect(after.fileMatches.map((item) => item.path)).toEqual(['a.ts'])
   })
 })
 

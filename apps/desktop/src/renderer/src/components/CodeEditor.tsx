@@ -10,9 +10,56 @@
 
 import { useEffect, useRef } from 'react'
 
-import { registerLspProviders } from '../lsp-providers'
+import { lspProviders, registerLspProviders, type ZeroBasedRange } from '../lsp-providers'
 import { languageForPath, monaco } from '../monaco-setup'
-import { clearReveal, setEditorSelection, updateContent, useEditor } from '../store'
+import {
+  clearReveal,
+  getEditorState,
+  setEditorSelection,
+  updateContent,
+  useEditor
+} from '../store'
+import { runTabCompletion } from '../tab-completion'
+import { workspaceApi } from '../workspace-api'
+
+/**
+ * 绝对路径 → 相对工作区根的路径（`/` 分隔）。
+ *
+ * 符号索引里的 `Symbol.path` 是相对路径，而编辑器只知道绝对路径；把当前文件也算成
+ * 相对路径，`toTabCandidates` 才能判断「这个符号是不是就在本文件里」。
+ * 不在工作区内（理论上不该发生）返回 `null`，此时不做本文件优先，不影响补全。
+ */
+function relativeToRoot(root: string, path: string): string | null {
+  const normalize = (value: string): string => value.replace(/\\/g, '/').replace(/\/+$/, '')
+  const rootNorm = normalize(root)
+  const fileNorm = path.replace(/\\/g, '/')
+  if (rootNorm.length === 0) return null
+  if (fileNorm === rootNorm) return ''
+  const prefix = `${rootNorm}/`
+  if (!fileNorm.startsWith(prefix)) return null
+  return fileNorm.slice(prefix.length)
+}
+
+/**
+ * 建议列表是否已经展开（用户按了 `Ctrl+空格`）。
+ *
+ * Monaco 不接受公开查询接口，只能看它的 widget 是否带 `visible` 类——这里只读、
+ * 不改任何状态。展开时 Tab 属于「接受选中项」，必须让给 Monaco，否则会和
+ * `Ctrl+空格` 的补全流程打架。查不到一律算「未展开」。
+ */
+function suggestWidgetVisible(): boolean {
+  return document.querySelector('.suggest-widget.visible') !== null
+}
+
+/**
+ * 把 Tab 原样交回 Monaco。
+ *
+ * 接线的 action 抢占了 `Tab`，不显式触发内置 `tab` 命令的话，缩进、反向缩进、
+ * 片段占位符跳转都会失效——那是最不能接受的一种「帮倒忙」。
+ */
+function defaultTab(editor: monaco.editor.ICodeEditor): void {
+  editor.trigger('aiide.tabCompletion', 'tab', null)
+}
 
 /**
  * 把 Monaco 的选区读成 store 里那对真实行号。
@@ -85,6 +132,96 @@ export function CodeEditor() {
     // 导致每次查询跑两遍、定义列表出现重复项。
     const disposeLspProviders = registerLspProviders(monaco)
 
+    /**
+     * Tab 键的唯一入口。
+     *
+     * 只做四件事：读光标的词、确认当前文件属于某个工作区、把两路候选来源接到
+     * `runTabCompletion`、把结果落到编辑器。所有「该不该补、补哪段」的判断都在
+     * `tab-completion.ts` 里（纯逻辑、可单测），这里不含业务规则。
+     */
+    const handleTab = async (instance: monaco.editor.ICodeEditor): Promise<void> => {
+      const model = instance.getModel()
+      const position = instance.getPosition()
+      if (!model || !position) {
+        defaultTab(instance)
+        return
+      }
+      // 建议列表已经展开：这一次 Tab 的意思是「接受选中项」，让给 Monaco。
+      if (suggestWidgetVisible()) {
+        defaultTab(instance)
+        return
+      }
+      const word = model.getWordUntilPosition(position)
+      const path = currentRef.current
+      const workspace = getEditorState().workspace
+      if (path === null || workspace === null) {
+        defaultTab(instance)
+        return
+      }
+      // LSP 的替换区间同样要 0-based（与 `lsp-providers` 的中间形态一致）。
+      const replaceRange: ZeroBasedRange = {
+        start: { line: position.lineNumber - 1, character: word.startColumn - 1 },
+        end: { line: position.lineNumber - 1, character: word.endColumn - 1 }
+      }
+      await runTabCompletion({
+        prefix: word.word,
+        position,
+        currentPath: relativeToRoot(workspace.root, path),
+        // 来源一：语言服务（未连接时 `lspProviders` 自己回空数组）。
+        // 内核收的路径是正斜杠形式（与 Monaco 的 `pathFromUriPath` 一致），这里先归一。
+        completions: () =>
+          lspProviders.completion(
+            {
+              path: path.replace(/\\/g, '/'),
+              position: { line: position.lineNumber, character: position.column }
+            },
+            replaceRange
+          ),
+        // 来源二：内核符号索引（空串以外的子串查询；未就绪时回空表）。
+        symbols: async () =>
+          (await workspaceApi.searchSymbols(workspace.workspace_id, word.word)).symbols,
+        insert: (text, range) => {
+          const now = instance.getPosition()
+          const nowWord = now === null ? null : instance.getModel()?.getWordUntilPosition(now)
+          // 查询是异步的：回来时用户可能挪了光标或又敲了几个字。这时替换区间已经过期，
+          // 宁可什么都不做，也不能把别处的字符换掉。
+          if (
+            now === null ||
+            now.lineNumber !== position.lineNumber ||
+            now.column !== position.column ||
+            !nowWord ||
+            nowWord.word !== word.word
+          ) {
+            return
+          }
+          instance.executeEdits('aiide.tabCompletion', [
+            {
+              range: new monaco.Range(
+                range.start.line + 1,
+                range.start.character + 1,
+                range.end.line + 1,
+                range.end.character + 1
+              ),
+              text,
+              forceMoveMarkers: true
+            }
+          ])
+          instance.focus()
+        },
+        pass: () => defaultTab(instance)
+      })
+    }
+
+    // Tab 补全：注册在编辑器实例上，`pass` 时显式转交内置 `tab` 命令（缩进照旧）。
+    const tabAction = editor.addAction({
+      id: 'aiide.tabCompletion',
+      label: 'Tab 补全（索引符号 + 语言服务）',
+      keybindings: [monaco.KeyCode.Tab],
+      run: (instance) => {
+        void handleTab(instance)
+      }
+    })
+
     const subscription = editor.onDidChangeModelContent(() => {
       if (applyingRef.current) return
       const path = currentRef.current
@@ -101,6 +238,7 @@ export function CodeEditor() {
     const views = viewsRef.current
 
     return () => {
+      tabAction.dispose()
       disposeLspProviders()
       subscription.dispose()
       selectionSubscription.dispose()
