@@ -308,6 +308,13 @@ export type { GitStageHunkParams } from "./generated/GitStageHunkParams";
 export type { GitStageHunkResult } from "./generated/GitStageHunkResult";
 export type { GitUnstageHunkParams } from "./generated/GitUnstageHunkParams";
 export type { GitUnstageHunkResult } from "./generated/GitUnstageHunkResult";
+// 合并冲突：`GitConflictBlock` 是块级布局（ours / base / theirs 三段 + 行号区间），
+// 读侧返回 `GitConflictReadResult`、解决侧返回 `GitConflictResolveResult`（带剩余冲突列表）。
+export type { GitConflictBlock } from "./generated/GitConflictBlock";
+export type { GitConflictReadParams } from "./generated/GitConflictReadParams";
+export type { GitConflictReadResult } from "./generated/GitConflictReadResult";
+export type { GitConflictResolveParams } from "./generated/GitConflictResolveParams";
+export type { GitConflictResolveResult } from "./generated/GitConflictResolveResult";
 export type { McpServerInfo } from "./generated/McpServerInfo";
 export type { McpServersParams } from "./generated/McpServersParams";
 export type { McpServersResult } from "./generated/McpServersResult";
