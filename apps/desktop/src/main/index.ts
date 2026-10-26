@@ -13,6 +13,7 @@ import { app, BrowserWindow, dialog, ipcMain, safeStorage } from 'electron'
 import { dirname, join } from 'node:path'
 
 import { Methods, type HelloResult } from '@ai-ide/shared-types'
+import { createCoreLogSink, type CoreLogSink } from './core-log-file'
 import { CoreRpcError, CoreSupervisor } from './core-supervisor'
 import { CredentialVault } from './credentials'
 import { checkRendererCall } from './policy'
@@ -86,10 +87,62 @@ function setStatus(next: CoreStatus): void {
   }
 }
 
-function pushLog(text: string): void {
+/**
+ * 内核日志的磁盘副本（P5 切片八 B6）。
+ *
+ * 懒建而不是模块顶层建：`app.getPath('userData')` 在 `whenReady` 之前不可靠，
+ * 而 `AI_IDE_USER_DATA_DIR` 覆盖就在这个文件顶部，早建会拿到错的目录。
+ * 目录与内核共用一套约定（`<userData>/logs`，内核侧 `AI_IDE_DATA_DIR` 也是
+ * userData），用户排查时只需看一个目录。
+ */
+let coreLogSink: CoreLogSink | null = null
+/** 同一个事件在落盘失败时只抱怨一次，避免日志写不进去反而刷屏。 */
+let coreLogSinkWarned = false
+
+function ensureCoreLogSink(): CoreLogSink | null {
+  if (coreLogSink) return coreLogSink
+  try {
+    coreLogSink = createCoreLogSink({ dir: join(app.getPath('userData'), 'logs') })
+  } catch (error) {
+    if (!coreLogSinkWarned) {
+      coreLogSinkWarned = true
+      console.warn('[core-log] 无法初始化日志文件：', error)
+    }
+    return null
+  }
+  return coreLogSink
+}
+
+/**
+ * 内核日志：**既落盘也推送**。
+ *
+ * 落盘与推送必须各走各的：窗口没开（启动早期 / 用户关了窗口）时推送无对象，
+ * 但磁盘上那一行正是排查启动失败最需要的；渲染进程崩了同理。反过来，
+ * 推送也不能等 `fsync`——stderr 是逐块来的，等一次写盘就会拖慢读循环。
+ */
+function pushLog(text: string, stream: 'stderr' | 'event' = 'stderr'): void {
+  if (text.length === 0) return
+  ensureCoreLogSink()?.append(stream === 'event' ? `[event] ${text}` : text)
   if (!mainWindow || mainWindow.isDestroyed()) return
-  const chunk: CoreLogChunk = { stream: 'stderr', text }
+  const chunk: CoreLogChunk = { stream, text }
   mainWindow.webContents.send(IpcChannels.coreLog, chunk)
+}
+
+/**
+ * `core.log` 载荷 → 一行可读文本。
+ *
+ * 形如 `[warn] ai_ide_core::dispatch: 请求超时`。字段缺失不报错：这条通道是
+ * 诊断用的旁路，为了一行日志的形状去拒收，等于把「内核说了什么」丢掉。
+ */
+function formatCoreLogNotification(params: unknown): string {
+  if (typeof params === 'string') return params
+  if (!params || typeof params !== 'object') return JSON.stringify(params ?? null)
+  const record = params as { level?: unknown; target?: unknown; message?: unknown }
+  const level = typeof record.level === 'string' && record.level.length > 0 ? record.level : 'info'
+  const target = typeof record.target === 'string' && record.target.length > 0 ? record.target : 'core'
+  const message =
+    typeof record.message === 'string' ? record.message : JSON.stringify(record.message ?? '')
+  return `[${level}] ${target}: ${message}`
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +186,10 @@ function eventChannel(method: string): string | null {
       return IpcChannels.terminalExit
     case Methods.event.lspDiagnostics:
       return IpcChannels.lspDiagnostics
+    // 内核日志转发（docs/03 §事件表）：`{level,target,message}` → `core:log`。
+    // 走到这里不是「原样转投」而是「改写成 CoreLogChunk」，见 handler 里的特判。
+    case Methods.event.log:
+      return IpcChannels.coreLog
     case Methods.event.pluginLog:
     case Methods.event.pluginProgress:
     case Methods.event.pluginStateChanged:
@@ -227,6 +284,15 @@ async function startCore(): Promise<CoreStatus> {
     // 通道映射统一收在 `eventChannel` 里（见上方），这里只负责投递：
     // 有专用通道就直接发，没有的只留在内核日志里。
     const channel = eventChannel(method)
+
+    // `core.log` 与其它通道不同：它的载荷是 `{level,target,message}`（docs/03），
+    // 而渲染端 `core:log` 收的是 `CoreLogChunk`。所以先在这里改写成一行文本，
+    // 再走 `pushLog`——顺带就完成了「内核日志也写进 core-shell-*.log」这件事，
+    // 与 stderr 那条路共用同一个落盘入口，不会出现两份格式不同的日志文件。
+    if (channel === IpcChannels.coreLog) {
+      pushLog(formatCoreLogNotification(params), 'event')
+      return
+    }
 
     if (channel && mainWindow && !mainWindow.isDestroyed()) {
       const payload = channel === IpcChannels.aiEvent ? ({ method, params } satisfies AiEvent) : params

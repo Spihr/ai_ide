@@ -27,6 +27,7 @@ import { togglePalette } from './command-palette-store'
 import { initGit } from './git-store'
 import { openInlineEdit } from './inline-edit-store'
 import { initSessions } from './session-store'
+import { initCoreLogEvents } from './core-log-store'
 import { initPluginActivityEvents } from './plugin-activity-store'
 import { resolveShortcut } from './shortcuts'
 import { toggleSymbolPicker } from './symbol-picker-store'
@@ -83,6 +84,12 @@ export function App() {
      * 是发生在你没看着面板的时候。
      */
     const offPluginActivity = initPluginActivityEvents()
+    /*
+     * P5 切片八：内核日志（stderr + `core.log` 通知）同样常驻。这条订阅必须
+     * 最早挂上——内核启动失败的那几行恰好落在窗口刚建好的瞬间，晚一步订阅，
+     * 用户点开状态栏只会看到一句 `failed`，上下文全在磁盘里。
+     */
+    const offCoreLog = initCoreLogEvents()
     // M6：Git 状态是「工作区内容」的视图——`git.*` 没有自己的事件，靠 `workspace.changed`
     // 去抖后重拉。订阅常驻，这样活动栏角标在别的视图里也能实时对上。
     const offGit = initGit()
@@ -92,6 +99,7 @@ export function App() {
       offWorkspace()
       offTerminal()
       offPluginActivity()
+      offCoreLog()
       offGit()
       disposeAi()
     }
