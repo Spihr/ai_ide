@@ -398,11 +398,17 @@ async function runPingBenchmark(sup: CoreSupervisor, count: number): Promise<Pin
  * 方法（P1 目前唯一需要结构化数据的调用面）把载荷编进 message 尾部，渲染侧
  * 按 `shared/ipc.ts` 的分隔串还原。
  *
- * 只对 `plugin.` 前缀生效而不是全量启用：其他面板目前只消费文案，给它们塞一段
+ * 缺口第二批起 `git.*` 也要开口子：`7006` 的 `data.files`、`7009` 的 `data.branch`、
+ * `7010` 的 `data.files` + `data.stash_kept` 是外壳「列出这些冲突文件 / 填进设上游
+ * 确认框 / 说清条目还留着」的唯一依据，只丢一条 message 让 UI 自己从中文里抠路径
+ * 是不可接受的（路径里的空格、引号会把抠出来的清单弄错）。
+ *
+ * 只对这两个前缀生效而不是全量启用：其他面板目前只消费文案，给它们塞一段
  * JSON 尾巴只会让错误提示变丑。等哪个面板真的需要 data，再把前缀加进来即可。
  */
 function toRendererError(method: string, error: unknown): unknown {
-  if (!(error instanceof CoreRpcError) || !method.startsWith('plugin.')) {
+  const needsPayload = method.startsWith('plugin.') || method.startsWith('git.')
+  if (!(error instanceof CoreRpcError) || !needsPayload) {
     return error
   }
   return new Error(

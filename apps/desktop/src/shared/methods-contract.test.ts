@@ -286,6 +286,16 @@ describe('协议常量', () => {
       'git.stage',
       'git.commit',
       'git.branches',
+      // M6 切片四（缺口第二批）：分支切换 / 远端同步 / stash 五项。
+      'git.checkout',
+      'git.fetch',
+      'git.pull',
+      'git.push',
+      'git.stash',
+      'git.stash_list',
+      'git.stash_pop',
+      'git.stash_apply',
+      'git.stash_drop',
       'mcp.servers',
       'mcp.connect',
       'mcp.disconnect',
@@ -319,8 +329,9 @@ describe('协议常量', () => {
     // `lsp.*` 曾在声明表里待过一片（协议先行、dispatch 后接），接线后整组挪进
     // IMPLEMENTED：声明表恢复为空才是常态。若这里非空，说明有人加了协议方法却忘了接线。
     expect([...DECLARED_NOT_IMPLEMENTED_METHODS]).toEqual([])
-    // 能力数 74 → 79：lsp 五项进清单；79 → 80：P5 切片八补 plugin.load_many。
-    expect(IMPLEMENTED_METHODS).toHaveLength(80)
+    // 能力数 74 → 79：lsp 五项进清单；79 → 80：P5 切片八补 plugin.load_many；
+    // 80 → 89：缺口第二批补 Git 深化（checkout / fetch / pull / push / stash 五项）。
+    expect(IMPLEMENTED_METHODS).toHaveLength(89)
     for (const method of DECLARED_NOT_IMPLEMENTED_METHODS) {
       // 虚报能力会让外壳照单调进一片 -32601，互斥关系必须钉死。
       expect(IMPLEMENTED_METHODS as readonly string[]).not.toContain(method)

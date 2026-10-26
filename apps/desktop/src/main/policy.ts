@@ -127,14 +127,37 @@ const RENDERER_ALLOWED = new Set<string>([
   //
   // 这里要交代清楚它比终端弱在哪：`git.stage` / `git.commit` 会**写仓库对象库**，
   // 但两者都不能指定任意命令——参数是路径清单与提交信息，动作集合在协议里是封闭的
-  // （没有 `git.checkout` / `git.reset --hard` / `git.push`），所以渲染进程即使被
-  // 注入脚本，也拿不到「丢工作区改动」或「往远端推」的能力。工作区之外的路径由内核
-  // 侧做越界校验（错误码 7004），不依赖白名单兜底。
+  // （没有任意 shell、没有 `git.reset --hard`），所以渲染进程即使被注入脚本，也拿不到
+  // 「执行任意命令」的能力。工作区之外的路径由内核侧做越界校验（错误码 7004），
+  // 不依赖白名单兜底。
   Methods.git.status,
   Methods.git.diff,
   Methods.git.stage,
   Methods.git.commit,
   Methods.git.branches,
+
+  // M6 切片四：分支切换 / 远端同步 / stash（九条）。
+  //
+  // 这一组比上面五条**重**：`git.checkout` 会换工作区内容、`git.push` 会让本地提交
+  // 离开本机、`git.stash_drop` 会永久丢弃一条 stash。放行的理由不是「它无害」，而是
+  // 「它是用户在面板上显式按下的那一个按钮，且协议层已把危险档位拆开了」：
+  //   - 脏工作区切换由内核直接拒绝（7006 带 `files`），外壳必须把冲突文件摊给用户看，
+  //     不允许静默 `--force`——协议里也没有那个字段。
+  //   - `git.pull` 只有 `--ff-only`，不提供合并式 pull，不会凭空造 merge commit。
+  //   - `git.push` 只有 `force_with_lease`（无裸 `force` 字段），且外壳强制二次确认。
+  //   - `git.stash_pop` / `stash_apply` 冲突一律走 7010 且 `stash_kept` 恒真，
+  //     「取出失败」不会顺手删条目。
+  //   - `git.stash_drop` 是唯一不可逆的一条，外壳同样强制二次确认。
+  // 换工作区内容的路径仍受内核越界校验（7004）约束，白名单只决定「壳体能不能发起」。
+  Methods.git.checkout,
+  Methods.git.fetch,
+  Methods.git.pull,
+  Methods.git.push,
+  Methods.git.stash,
+  Methods.git.stashList,
+  Methods.git.stashPop,
+  Methods.git.stashApply,
+  Methods.git.stashDrop,
 
   // M7：MCP。五条同样是「用户显式动作」的后果——打开 MCP 视图才 `servers` / `tools`、
   // 点某个 Server 的「连接 / 断开」才 `connect` / `disconnect`、在面板里手写一条参数

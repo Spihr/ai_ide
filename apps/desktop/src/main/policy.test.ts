@@ -245,12 +245,21 @@ describe('checkRendererCall', () => {
   })
 
   /*
-   * Git 的「危险动作」目前一个都没进协议：推、切分支、`reset --hard`、强制检出。
-   * 这条用例是防回归的闸门——将来谁加了 `git.push` 之类的方法，会被这里挡下并提醒
-   * 「放行前先想清楚 UI 有没有二次确认」，而不是顺手加进白名单就完事。
+   * `git.push` 与 `git.checkout` 已在缺口第二批进协议并放行：它们前面有确认弹窗
+   * （强推）或明确的失败提示（7006 脏工作区），不再算「点了就回不去」的动作。
+   * 但 `reset --hard` / `merge` / `rebase` / `clean -fd` 这类会**静默丢改动**的
+   * 动作至今没有协议方法，这条用例仍是防回归的闸门：谁加了这些方法，会被这里挡下
+   * 并提醒「放行前先想清楚 UI 有没有二次确认」，而不是顺手加进白名单就完事。
    */
-  it('不放行协议里不存在的 Git 危险动作', () => {
-    const methods = ['git.push', 'git.checkout', 'git.reset', 'git.merge', 'git.rebase']
+  it('不放行协议里不存在的 Git 破坏性动作', () => {
+    const methods = [
+      'git.reset',
+      'git.reset_hard',
+      'git.merge',
+      'git.rebase',
+      'git.clean',
+      'git.checkout_force'
+    ]
 
     for (const method of methods) {
       expect(checkRendererCall(method).allowed, `${method} 不应被放行`).toBe(false)
@@ -300,9 +309,21 @@ describe('checkRendererCall', () => {
       'core.ping',
       'core.stats',
       'git.branches',
+      // 缺口第二批：分支切换 / 远端同步 / stash 五项。放行的理由是「失败可见」：
+      // 7006 脏工作区、7007 非快进、7008 认证、7009 无上游、7010 stash 冲突
+      // 都带结构化 data，外壳会逐条渲染，不会静默吞掉；`drop` 与强推另有确认弹窗。
+      'git.checkout',
       'git.commit',
       'git.diff',
+      'git.fetch',
+      'git.pull',
+      'git.push',
       'git.stage',
+      'git.stash',
+      'git.stash_apply',
+      'git.stash_drop',
+      'git.stash_list',
+      'git.stash_pop',
       'git.status',
       // 切片三：内联编辑只放行 `propose`——写盘仍是 `workspace.write_file`，
       // 内核不越权改文件，外壳也就没必要给它开一个新口子。

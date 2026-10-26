@@ -1,5 +1,6 @@
 /**
- * Git 面板（M6 第四切片，外壳侧入口）：分支条 + 变更清单 + unified diff + 提交框。
+ * Git 面板（M6 第四切片 + 缺口第二批，外壳侧入口）：分支条 + 远端同步 + 变更清单 +
+ * unified diff + 提交框 + stash 面板。
  *
  * 三层分工与 `CheckpointPanel` 一致：状态与动作在 `git-store`，这里只做「用户点了什么」
  * 的转发与展示。分组成「已暂存 / 未暂存」两组，同一个文件可能同时出现在两组里
@@ -8,20 +9,43 @@
  * diff 的行号与增删配色都由 `parseUnifiedDiff` 算，组件只按 `kind` 上样式类；
  * 未跟踪文件不发 `git.diff`（两侧都没有基准版本），直接给一句说明——否则一次空 diff
  * 会被读成「没改动」。
+ *
+ * 缺口第二批新增的四处界面，各有必须钉住的行为：
+ *
+ * - **分支切换**：失败（`7006`）时把 `files` 逐条列出来，不许只显示一句「切换失败」；
+ * - **远端按钮**：`7007` / `7008` / `7009` 的提示来自 `git-api` 的人话表，`7009` 还多
+ *   一个「以它作上游推送」的按钮（分支名取自错误载荷，不让用户手填）；
+ * - **stash 面板**：`drop` 必须先弹确认（说明不可逆）；`pop` 撞 `7010` 时条目仍在，
+ *   界面既不能删掉那一行，也不能只报错不解释；
+ * - **强制推送**：与 `drop` 同一套确认弹窗，且文案由 store 提供（可被单测钉住）。
  */
 
 import { useEffect, useMemo, useState } from 'react'
 
-import type { GitStatusEntry } from '@ai-ide/shared-types'
+import type { GitStatusEntry, GitStashEntry } from '@ai-ide/shared-types'
 
 import { parseUnifiedDiff } from '../git-api'
 import {
+  applyStash,
+  cancelGitAction,
+  checkoutBranch,
   clearGitSelection,
   commitStaged,
+  confirmGitAction,
+  createBranch,
+  dismissGitError,
   dismissGitHint,
   entryStatusLabel,
+  fetchRemote,
   groupEntries,
+  popStash,
+  pullRemote,
+  pushRemote,
+  pushWithUpstream,
   refreshGit,
+  requestDropStash,
+  requestForcePush,
+  saveStash,
   selectGitEntry,
   setCommitMessage,
   stageAll,
@@ -43,9 +67,23 @@ function flagClass(letter: string): string {
   return 'git-entry__flag'
 }
 
+/**
+ * 远端分支名 → 建议的本地分支名（`origin/feat/x` → `feat/x`）。
+ *
+ * 只去掉第一段：`origin` 是远端名，后面整段才是分支名，`feat/x` 里的斜杠要留着。
+ */
+function localNameOf(remoteBranch: string): string {
+  const slash = remoteBranch.indexOf('/')
+  return slash === -1 ? remoteBranch : remoteBranch.slice(slash + 1)
+}
+
 export function GitPanel(): React.JSX.Element {
   const state = useGit()
   const [showBranches, setShowBranches] = useState(false)
+  const [showStashes, setShowStashes] = useState(true)
+  const [newBranch, setNewBranch] = useState('')
+  const [stashMessage, setStashMessage] = useState('')
+  const [includeUntracked, setIncludeUntracked] = useState(false)
   const [amend, setAmend] = useState(false)
   const [allowEmpty, setAllowEmpty] = useState(false)
 
@@ -64,6 +102,7 @@ export function GitPanel(): React.JSX.Element {
   )
   const stagedTotal = stagedCount(state.status)
   const busy = state.busy
+  const branchBusy = state.loading || busy
 
   const renderEntries = (entries: GitStatusEntry[], staged: boolean): React.JSX.Element => (
     <ul className="ai-list" data-testid={staged ? 'git-staged-list' : 'git-changes-list'}>
@@ -114,6 +153,49 @@ export function GitPanel(): React.JSX.Element {
     </ul>
   )
 
+  const renderStash = (entry: GitStashEntry): React.JSX.Element => (
+    <li key={`${entry.index}:${entry.oid}`} className="ai-list__item" data-testid="git-stash-row">
+      <span className="ai-list__meta" title={entry.message}>
+        stash@{`{${entry.index}}`}
+        <span className="ai-note"> {entry.short_oid}</span>
+        <br />
+        <span className="ai-note">{entry.message}</span>
+      </span>
+      <span className="ai-row">
+        <button
+          className="ai-button ai-button--tiny"
+          type="button"
+          data-testid="git-stash-pop"
+          disabled={busy}
+          title="取出并从列表删除该条（git stash pop）"
+          onClick={() => void popStash(entry.index)}
+        >
+          取出
+        </button>
+        <button
+          className="ai-button ai-button--tiny"
+          type="button"
+          data-testid="git-stash-apply"
+          disabled={busy}
+          title="取出但保留该条（git stash apply）"
+          onClick={() => void applyStash(entry.index)}
+        >
+          应用
+        </button>
+        <button
+          className="ai-button ai-button--tiny"
+          type="button"
+          data-testid="git-stash-drop"
+          disabled={busy}
+          title="删除该条（不可逆，会先弹确认）"
+          onClick={() => requestDropStash(entry.index)}
+        >
+          删除
+        </button>
+      </span>
+    </li>
+  )
+
   return (
     <div className="ai-section" data-testid="git-panel">
       <div className="git-branch">
@@ -147,40 +229,199 @@ export function GitPanel(): React.JSX.Element {
           className="ai-button ai-button--tiny"
           type="button"
           data-testid="git-refresh"
-          disabled={state.loading || busy}
+          disabled={branchBusy}
           onClick={() => void refreshGit()}
         >
           刷新
         </button>
       </div>
 
+      <div className="ai-row" data-testid="git-remote-actions">
+        <button
+          className="ai-button ai-button--tiny"
+          type="button"
+          data-testid="git-fetch"
+          disabled={branchBusy}
+          title="从远端取回引用，不改动本地分支（git fetch）"
+          onClick={() => void fetchRemote()}
+        >
+          获取
+        </button>
+        <button
+          className="ai-button ai-button--tiny"
+          type="button"
+          data-testid="git-pull"
+          disabled={branchBusy}
+          title="只做快进拉取（--ff-only），分叉时会被拒绝而不是生成合并提交"
+          onClick={() => void pullRemote()}
+        >
+          拉取
+        </button>
+        <button
+          className="ai-button ai-button--tiny"
+          type="button"
+          data-testid="git-push"
+          disabled={branchBusy}
+          title="推送到上游分支（git push，从不强推）"
+          onClick={() => void pushRemote()}
+        >
+          推送
+        </button>
+        <button
+          className="ai-button ai-button--tiny"
+          type="button"
+          data-testid="git-force-push"
+          disabled={branchBusy}
+          title="强制推送（--force-with-lease），会先弹确认"
+          onClick={() => requestForcePush()}
+        >
+          强制推送
+        </button>
+      </div>
+
       {showBranches ? (
-        <ul className="ai-list" data-testid="git-branches">
-          {state.branches.length === 0 ? (
-            <li className="ai-note">这个仓库还没有分支（或仍在加载）。</li>
-          ) : (
-            state.branches.slice(0, MAX_BRANCH_ROWS).map((branch) => (
-              <li key={branch.name} className="ai-list__item" title={branch.upstream ?? branch.oid}>
-                <span className="ai-list__meta">
-                  {branch.is_current ? '● ' : ''}
-                  {branch.name}
-                  {branch.is_remote ? '（远端）' : ''}
-                  <span className="ai-note"> {branch.short_oid}</span>
-                </span>
+        <div data-testid="git-branches">
+          <div className="ai-row">
+            <input
+              className="ai-input"
+              data-testid="git-new-branch-name"
+              placeholder="新分支名（从当前 HEAD 建）"
+              value={newBranch}
+              onChange={(event) => setNewBranch(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key !== 'Enter') return
+                event.preventDefault()
+                const name = newBranch.trim()
+                if (name.length === 0) return
+                setNewBranch('')
+                void createBranch(name)
+              }}
+            />
+            <button
+              className="ai-button ai-button--tiny"
+              type="button"
+              data-testid="git-create-branch"
+              disabled={branchBusy || newBranch.trim().length === 0}
+              onClick={() => {
+                const name = newBranch.trim()
+                if (name.length === 0) return
+                setNewBranch('')
+                void createBranch(name)
+              }}
+            >
+              新建并切换
+            </button>
+          </div>
+
+          <ul className="ai-list" data-testid="git-branch-list">
+            {state.branches.length === 0 ? (
+              <li className="ai-note">这个仓库还没有分支（或仍在加载）。</li>
+            ) : (
+              state.branches.slice(0, MAX_BRANCH_ROWS).map((branch) => {
+                const current = branch.is_current
+                const local = localNameOf(branch.name)
+                return (
+                  <li
+                    key={branch.name}
+                    className="ai-list__item"
+                    title={branch.upstream ?? branch.oid}
+                    data-testid="git-branch-row"
+                  >
+                    <span className="ai-list__meta">
+                      {current ? '● ' : ''}
+                      {branch.name}
+                      {branch.is_remote ? '（远端）' : ''}
+                      <span className="ai-note"> {branch.short_oid}</span>
+                      {branch.upstream === undefined ? null : (
+                        <span className="ai-note"> → {branch.upstream}</span>
+                      )}
+                    </span>
+                    <button
+                      className="ai-button ai-button--tiny"
+                      type="button"
+                      data-testid={branch.is_remote ? 'git-checkout-remote' : 'git-checkout'}
+                      disabled={branchBusy || (current && !branch.is_remote)}
+                      title={
+                        branch.is_remote
+                          ? `以 ${branch.name} 为起点建本地分支 ${local} 并切过去`
+                          : current
+                            ? '当前已在那个分支上'
+                            : `切换到 ${branch.name}（工作区有改动时会被拒绝）`
+                      }
+                      onClick={() =>
+                        void (branch.is_remote
+                          ? createBranch(local, branch.name)
+                          : checkoutBranch(branch.name))
+                      }
+                    >
+                      {branch.is_remote ? '检出' : current ? '当前' : '切换'}
+                    </button>
+                  </li>
+                )
+              })
+            )}
+            {state.branches.length > MAX_BRANCH_ROWS ? (
+              <li className="ai-note">
+                共 {state.branches.length} 个，只显示前 {MAX_BRANCH_ROWS} 个。
               </li>
-            ))
-          )}
-          {state.branches.length > MAX_BRANCH_ROWS ? (
-            <li className="ai-note">
-              共 {state.branches.length} 个，只显示前 {MAX_BRANCH_ROWS} 个。
-            </li>
-          ) : null}
-        </ul>
+            ) : null}
+          </ul>
+        </div>
       ) : null}
 
       {state.error !== null ? (
         <div className="ai-result ai-result--bad" data-testid="git-error">
-          {state.error}
+          <div>{state.error}</div>
+          {/* git 自己的原始报错。7007 的 non-fast-forward / 7008 的 Authentication failed
+              是用户搜索和贴给同事的唯一凭据，不能只留一句人话。 */}
+          {state.errorDetail !== null ? (
+            <pre className="ai-note" data-testid="git-error-detail">
+              {state.errorDetail}
+            </pre>
+          ) : null}
+          {state.errorFiles.length > 0 ? (
+            <div data-testid="git-error-files">
+              <div className="ai-note">
+                {/* 7006 是「有改动不许切」，7010 是「撞冲突」，两种清单必须分开说，
+                    否则冲突文件会被读成「只是没提交」。 */}
+                {state.errorCode === 7010
+                  ? `以下 ${state.errorFiles.length} 个文件在取出时冲突：`
+                  : `以下 ${state.errorFiles.length} 个文件有未提交改动：`}
+              </div>
+              <ul className="ai-list">
+                {state.errorFiles.map((file) => (
+                  <li key={file} className="ai-note" data-testid="git-error-file">
+                    {file}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          {state.errorBranch !== null ? (
+            <button
+              className="ai-button ai-button--tiny"
+              type="button"
+              data-testid="git-set-upstream"
+              disabled={busy}
+              title={`git push --set-upstream origin ${state.errorBranch}`}
+              onClick={() => void pushWithUpstream(state.errorBranch ?? '')}
+            >
+              以 {state.errorBranch} 为上游推送
+            </button>
+          ) : null}
+          {state.stashKept ? (
+            <div className="ai-note ai-note__warn" data-testid="git-stash-kept">
+              stash 条目没有被删除，仍在下面的列表里；解决冲突后可继续 pop / apply / drop。
+            </div>
+          ) : null}
+          <button
+            className="ai-button ai-button--tiny"
+            type="button"
+            data-testid="git-error-dismiss"
+            onClick={dismissGitError}
+          >
+            忽略
+          </button>
         </div>
       ) : null}
       {state.hint !== null ? (
@@ -194,6 +435,98 @@ export function GitPanel(): React.JSX.Element {
           >
             知道了
           </button>
+        </div>
+      ) : null}
+
+      <h4 className="ai-section__subtitle">
+        Stash（{state.stashes.length}）
+        <button
+          className="ai-button ai-button--tiny"
+          type="button"
+          data-testid="git-stashes-toggle"
+          onClick={() => setShowStashes((open) => !open)}
+        >
+          {showStashes ? '收起' : '展开'}
+        </button>
+      </h4>
+      {showStashes ? (
+        <div data-testid="git-stashes">
+          <div className="ai-row">
+            <input
+              className="ai-input"
+              data-testid="git-stash-message"
+              placeholder="stash 说明（可留空，git 会写 WIP on …）"
+              value={stashMessage}
+              onChange={(event) => setStashMessage(event.target.value)}
+            />
+            <button
+              className="ai-button ai-button--tiny"
+              type="button"
+              data-testid="git-stash-save"
+              disabled={busy}
+              title="把当前改动存进 stash（git stash push）"
+              onClick={() => {
+                const message = stashMessage.trim()
+                setStashMessage('')
+                void saveStash({
+                  message: message.length === 0 ? undefined : message,
+                  includeUntracked
+                })
+              }}
+            >
+              保存到 stash
+            </button>
+          </div>
+          <label className="git-check">
+            <input
+              type="checkbox"
+              data-testid="git-stash-untracked"
+              checked={includeUntracked}
+              onChange={(event) => setIncludeUntracked(event.target.checked)}
+            />
+            同时保存未跟踪文件
+          </label>
+
+          {state.stashes.length === 0 ? (
+            <div className="ai-note" data-testid="git-stash-empty">
+              {state.stashLoading ? '正在读取 stash…' : '没有 stash 条目。'}
+            </div>
+          ) : (
+            <ul className="ai-list" data-testid="git-stash-list">
+              {state.stashes.map(renderStash)}
+            </ul>
+          )}
+        </div>
+      ) : null}
+
+      {state.confirm !== null ? (
+        <div className="ai-result ai-result--bad" role="dialog" data-testid="git-confirm">
+          <div data-testid="git-confirm-title">{state.confirm.title}</div>
+          <div className="ai-note" data-testid="git-confirm-detail">
+            {state.confirm.detail}
+          </div>
+          <div className="ai-note ai-note__warn" data-testid="git-confirm-warning">
+            {state.confirm.warning}
+          </div>
+          <div className="ai-row">
+            <button
+              className="ai-button ai-button--primary"
+              type="button"
+              data-testid="git-confirm-ok"
+              disabled={busy}
+              onClick={() => void confirmGitAction()}
+            >
+              确认（不可撤销）
+            </button>
+            <button
+              className="ai-button ai-button--tiny"
+              type="button"
+              data-testid="git-confirm-cancel"
+              onClick={cancelGitAction}
+            >
+              取消
+            </button>
+          </div>
         </div>
       ) : null}
 
