@@ -168,6 +168,10 @@ async fn handle_request(peer: &Peer, state: &AppState, req: Request) {
         // 二进制报 7012——两条都不是「重试」，所以单独走 handler，不复用 stage。
         methods::git::STAGE_HUNK => git_api::stage_hunk(peer, state, &req).await,
         methods::git::UNSTAGE_HUNK => git_api::unstage_hunk(peer, state, &req).await,
+        // 合并冲突（缺口第五批）：读冲突块与解冲突都是独立 handler。失败码 7013/7014
+        // 的处置是「刷新冲突面板」，与一次 stage 失败的「重试」完全不同，因此不并进 stage。
+        methods::git::CONFLICT_READ => git_api::conflict_read(peer, state, &req).await,
+        methods::git::CONFLICT_RESOLVE => git_api::conflict_resolve(peer, state, &req).await,
 
         // MCP（M7 切片二）：连接由 core state 的管理器统一持有，每次调用现查活连接，
         // 因此「断连后工具自动下架」不需要额外清理逻辑——查不到就是不存在。

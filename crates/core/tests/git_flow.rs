@@ -237,6 +237,10 @@ fn capabilities_include_git_methods() {
         "git.stash_pop",
         "git.stash_apply",
         "git.stash_drop",
+        // 缺口第五批：合并冲突的两个方法同样在 `IMPLEMENTED` 里（dispatch 有真分支），
+        // 下面的 UU / AA / DU / UD 用例都是走能力清单里的这条路由去打的。
+        "git.conflict_read",
+        "git.conflict_resolve",
     ] {
         assert!(
             capabilities.iter().any(|item| item == method),
@@ -1346,4 +1350,634 @@ fn unstage_hunk_removes_only_the_selected_block() {
     assert_eq!(back[0].header(), drop.header());
     assert_eq!(back[0].body, drop.body);
     assert_eq!(repo.read("a.txt"), worktree, "取消暂存不得改工作区文件");
+}
+
+// ---------------------------------------------------------------------------
+// 缺口第五批：合并冲突（git.conflict_read / git.conflict_resolve）
+// ---------------------------------------------------------------------------
+
+impl TempRepo {
+    /// 打开 `merge.conflictStyle=diff3`。
+    ///
+    /// 默认的 `merge` 风格不写 `|||||||` 段，base 段就永远是 `None`，用例也只能验
+    /// 「两段对不对」。改成 diff3 之后 Git 才会把共同祖先版本也写进文件，本批新增的
+    /// base 段解析才有东西可对。
+    fn use_diff3(&self) {
+        self.git(&["config", "merge.conflictStyle", "diff3"]);
+    }
+
+    /// 从当前提交切出新分支（`checkout -b`）。
+    fn branch_off(&self, branch: &str) {
+        self.git(&["checkout", "-q", "-b", branch]);
+    }
+
+    fn checkout(&self, branch: &str) {
+        self.git(&["checkout", "-q", branch]);
+    }
+
+    /// 造一次**真的**冲突 merge，并断言 Git 确实拒绝了自动合并。
+    ///
+    /// 用 `--no-commit` 留住未合并状态：用例要读的是「正在冲突的仓库」，一旦 git 自己
+    /// 提交了，后面读到的就是干净的树，「冲突读错成空」这种 bug 会悄悄通过。
+    fn merge_expect_conflict(&self, branch: &str) {
+        let (ok, text) = self.try_git(&["merge", "--no-ff", "--no-commit", branch]);
+        assert!(!ok, "merge {branch} 应当冲突，实际成功：{text}");
+    }
+
+    /// `git status --porcelain=v2` 里该文件的未合并 XY（`UU` / `AA` / `DU` / `UD` …）。
+    ///
+    /// 直接读 git 自己给的两位字母，而不是拿内核的 `kind` 反推——否则「内核把 DU 认成
+    /// UD」这类错位，用例会跟着一起错到两边一致，白测一场。
+    fn unmerged_xy(&self, path: &str) -> Option<String> {
+        let text =
+            String::from_utf8_lossy(&self.stdout_of(&["status", "--porcelain=v2"])).to_string();
+        text.lines().find_map(|line| {
+            let fields: Vec<&str> = line.split(' ').collect();
+            if fields.first() != Some(&"u") {
+                return None;
+            }
+            if fields.last() != Some(&path) {
+                return None;
+            }
+            fields.get(1).map(|xy| xy.to_string())
+        })
+    }
+
+    /// merge base 的短哈希：diff3 风格里 `|||||||` 后面跟的就是它。
+    fn short_merge_base(&self) -> String {
+        let oid = String::from_utf8_lossy(&self.stdout_of(&["merge-base", "HEAD", "MERGE_HEAD"]))
+            .trim()
+            .to_string();
+        String::from_utf8_lossy(&self.stdout_of(&["rev-parse", "--short", &oid]))
+            .trim()
+            .to_string()
+    }
+
+    /// 索引侧（`--cached`）的 `A` / `M` / `D` 状态行，用于确认「解决结果真的进了索引」。
+    fn staged_status(&self) -> String {
+        String::from_utf8_lossy(&self.stdout_of(&["diff", "--cached", "--name-status"]))
+            .trim()
+            .to_string()
+    }
+}
+
+/// 一个 UU 冲突仓库：`s.txt` 三行，双方各改第 2 行。
+///
+/// 三行是为了让**整份文件**都落在同一个冲突块里：块边界、行号区间、三段内容三者
+/// 都能一眼定死，不会被「上下文行算不算块内」这种问题干扰。
+fn uu_conflict_repo(tag: &str) -> TempRepo {
+    let repo = TempRepo::new(tag);
+    repo.init();
+    repo.use_diff3();
+    repo.write("s.txt", "top\nbase line\nbottom\n");
+    repo.commit_all("基线");
+    let ours = repo.current_branch();
+    repo.branch_off("feature");
+    repo.write("s.txt", "top\ntheir line\nbottom\n");
+    repo.commit_all("对方改动");
+    repo.checkout(&ours);
+    repo.write("s.txt", "top\nour line\nbottom\n");
+    repo.commit_all("我方改动");
+    repo.merge_expect_conflict("feature");
+    repo
+}
+
+fn read_params(workspace_id: &str, path: &str) -> Value {
+    json!({ "workspace_id": workspace_id, "path": path })
+}
+
+/// 场景一（UU）：双改同一行。
+///
+/// 断言口径是**逐字**的：ours / base / theirs 三段必须与 Git 真正写进工作区的标记
+/// 内容一字不差，行号区间必须精确覆盖 `<<<<<<<` 到 `>>>>>>>`。只看「解析出了 1 块」
+/// 是没有意义的——块里的三段串位（ours 装成 theirs）在那种断言下照样通过。
+#[test]
+fn conflict_read_reports_uu_sections_verbatim() {
+    let (mut core, _data) = boot("git-conflict-uu");
+    let repo = uu_conflict_repo("conflict-uu");
+    let workspace_id = open_workspace(&mut core, &repo.root);
+
+    assert_eq!(
+        repo.unmerged_xy("s.txt").as_deref(),
+        Some("UU"),
+        "用例本身没造出 UU 冲突，工作区原文：\n{}",
+        repo.read("s.txt")
+    );
+
+    let read = core.ok("git.conflict_read", read_params(&workspace_id, "s.txt"));
+    assert_eq!(read["path"], json!("s.txt"));
+    assert_eq!(read["kind"], json!("both_modified"));
+    assert_eq!(read["xy"], json!("UU"));
+    assert_eq!(read["present"], json!(true));
+
+    let blocks = read["blocks"].as_array().expect("blocks 是数组");
+    assert_eq!(blocks.len(), 1, "整份文件落在同一块里：{read}");
+    let block = &blocks[0];
+    assert_eq!(block["index"], json!(0));
+
+    // 三段逐字核对：内容行不含标记行，空行也照原样保留。
+    //
+    // 只有第 2 行冲突，首尾的 `top` / `bottom` 是两侧共有的上下文，Git 会把它们留在
+    // 标记块**外面**——所以三段各只有一行，块也不是整份文件。这正是要用例逐字断言
+    // 的原因：把块当成整份文件去取一侧，会把上下文行也当成冲突内容重复一遍。
+    assert_eq!(block["ours"], json!(["our line"]));
+    assert_eq!(block["base"], json!(["base line"]));
+    assert_eq!(block["theirs"], json!(["their line"]));
+    // 标签同样取自 Git 的实际输出：ours 是 HEAD，theirs 是分支名，base 是短 oid。
+    assert_eq!(block["ours_label"], json!("HEAD"));
+    assert_eq!(block["theirs_label"], json!("feature"));
+    assert_eq!(block["base_label"], json!(repo.short_merge_base()));
+
+    // 行号是 1 起、含标记行的闭区间。真实布局（diff3）：
+    //   1 top / 2 <<<<<<< HEAD / 3 our line / 4 ||||||| <oid> / 5 base line /
+    //   6 ======= / 7 their line / 8 >>>>>>> feature / 9 bottom
+    // 共 9 行，块覆盖 2..=8；下面的行数断言与之一致，避免「区间报对但文件另有内容」。
+    assert_eq!(block["start_line"], json!(2));
+    assert_eq!(block["end_line"], json!(8));
+    assert_eq!(
+        repo.read("s.txt").lines().count(),
+        9,
+        "工作区原文行数与断言的行号区间不符：\n{}",
+        repo.read("s.txt")
+    );
+}
+
+/// 场景二（UU + ours）：取我方版本后，文件内容逐字等于我方原文，冲突消失且已落索引。
+#[test]
+fn conflict_resolve_ours_clears_conflict_and_keeps_ours() {
+    let (mut core, _data) = boot("git-conflict-ours");
+    let repo = uu_conflict_repo("conflict-ours");
+    let workspace_id = open_workspace(&mut core, &repo.root);
+
+    let resolved = core.ok(
+        "git.conflict_resolve",
+        json!({ "workspace_id": workspace_id, "path": "s.txt", "side": "ours" }),
+    );
+    assert_eq!(resolved["path"], json!("s.txt"));
+    assert_eq!(resolved["kind"], json!("both_modified"));
+    assert_eq!(resolved["resolved"], json!(true));
+    assert_eq!(resolved["still_conflicted"], json!(false));
+    assert_eq!(resolved["resolved_blocks"], json!(1));
+    assert_eq!(resolved["remaining"], json!([]), "只剩这一个冲突文件");
+
+    assert_eq!(repo.read("s.txt"), "top\nour line\nbottom\n");
+    assert!(
+        repo.unmerged_xy("s.txt").is_none(),
+        "git status 里不得再有未合并记录"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&repo.blob(":s.txt")),
+        "top\nour line\nbottom\n",
+        "解决结果必须已经进索引（stage 0）"
+    );
+}
+
+/// 场景三（UU + both）：两侧都留，顺序由 `theirs_first` 决定。
+///
+/// 同一份冲突按两种顺序各解一次，是为了钉住「拼接顺序」这条约定：外壳的按钮文案是
+/// 「我方在前 / 对方在前」，顺序反了用户看不出来，但结果就是错的。
+#[test]
+fn conflict_resolve_both_joins_sides_in_requested_order() {
+    for theirs_first in [false, true] {
+        let tag = if theirs_first {
+            "both-theirs"
+        } else {
+            "both-ours"
+        };
+        let (mut core, _data) = boot(&format!("git-conflict-{tag}"));
+        let repo = uu_conflict_repo(&format!("conflict-{tag}"));
+        let workspace_id = open_workspace(&mut core, &repo.root);
+
+        let resolved = core.ok(
+            "git.conflict_resolve",
+            json!({
+                "workspace_id": workspace_id,
+                "path": "s.txt",
+                "side": "both",
+                "theirs_first": theirs_first,
+            }),
+        );
+        assert_eq!(resolved["resolved"], json!(true));
+        assert_eq!(resolved["resolved_blocks"], json!(1));
+        assert_eq!(resolved["remaining"], json!([]));
+
+        let expected = if theirs_first {
+            // 块外只有共有的 top / bottom，块内两行按顺序拼：top / 对方 / 我方 / bottom
+            "top\ntheir line\nour line\nbottom\n"
+        } else {
+            "top\nour line\ntheir line\nbottom\n"
+        };
+        assert_eq!(
+            repo.read("s.txt"),
+            expected,
+            "theirs_first={theirs_first} 时拼接顺序不符"
+        );
+        assert!(repo.unmerged_xy("s.txt").is_none());
+    }
+}
+
+/// 场景四（AA）：双方各自新增了同名同路径文件，没有共同祖先版本。
+///
+/// `AA` 与 `UU` 的差别在 base：`AA` 的 base 段**存在但为空**（diff3 下 Git 仍写
+/// `|||||||` 行，紧接着就是 `=======`）。这里把 `Some([])` 与 `None` 分开验：
+/// 外壳靠这个区分「有祖先但为空」和「根本没有 base 段」。
+#[test]
+fn conflict_read_reports_aa_with_empty_base_section() {
+    let (mut core, _data) = boot("git-conflict-aa");
+    let repo = TempRepo::new("conflict-aa");
+    repo.init();
+    repo.use_diff3();
+    repo.write("other.txt", "x\n");
+    repo.commit_all("基线");
+    let ours = repo.current_branch();
+    repo.branch_off("feature");
+    repo.write("new.txt", "feature\nsecond\n");
+    repo.commit_all("对方新增");
+    repo.checkout(&ours);
+    repo.write("new.txt", "main\nsecond\n");
+    repo.commit_all("我方新增");
+    repo.merge_expect_conflict("feature");
+    let workspace_id = open_workspace(&mut core, &repo.root);
+
+    assert_eq!(
+        repo.unmerged_xy("new.txt").as_deref(),
+        Some("AA"),
+        "用例本身没造出 AA 冲突：\n{}",
+        repo.read("new.txt")
+    );
+
+    let read = core.ok("git.conflict_read", read_params(&workspace_id, "new.txt"));
+    assert_eq!(read["kind"], json!("both_added"));
+    assert_eq!(read["xy"], json!("AA"));
+    assert_eq!(read["present"], json!(true));
+
+    let blocks = read["blocks"].as_array().expect("blocks 是数组");
+    assert_eq!(blocks.len(), 1, "{read}");
+    assert_eq!(blocks[0]["ours"], json!(["main", "second"]));
+    assert_eq!(blocks[0]["theirs"], json!(["feature", "second"]));
+    assert_eq!(
+        blocks[0]["base"],
+        json!([]),
+        "AA 的 base 段存在但为空，不能折成 null：{read}"
+    );
+    assert!(blocks[0]["base_label"].is_string(), "AA 同样带 base 标签");
+
+    let resolved = core.ok(
+        "git.conflict_resolve",
+        json!({ "workspace_id": workspace_id, "path": "new.txt", "side": "both" }),
+    );
+    assert_eq!(resolved["kind"], json!("both_added"));
+    assert_eq!(resolved["resolved"], json!(true));
+    assert_eq!(repo.read("new.txt"), "main\nsecond\nfeature\nsecond\n");
+    assert!(repo.unmerged_xy("new.txt").is_none());
+    // 相对 HEAD 是「修改」而不是「新增」：我方分支本来就已经有这个文件，
+    // 解决只是把它在索引里从 stage 2/3 收敛成 stage 0。
+    assert_eq!(
+        repo.staged_status(),
+        "M\tnew.txt",
+        "AA 解决后相对 HEAD 是改动"
+    );
+}
+
+/// 场景五（DU）：我方删除、对方修改。工作区里是对方的版本，没有标记块可切。
+///
+/// 这类冲突**没有** `<<<<<<<`，`blocks` 必须为空而不是「解析失败」，`kind` 得让外壳
+/// 知道「取 ours 等于删文件」。这里取 theirs：文件回来、内容逐字是对方改的那份。
+#[test]
+fn conflict_resolve_theirs_of_du_restores_their_version() {
+    let (mut core, _data) = boot("git-conflict-du");
+    let repo = TempRepo::new("conflict-du");
+    repo.init();
+    repo.write("del.txt", "base\n");
+    repo.commit_all("基线");
+    let ours = repo.current_branch();
+    repo.branch_off("side");
+    repo.write("del.txt", "modified by them\n");
+    repo.commit_all("对方修改");
+    repo.checkout(&ours);
+    repo.git(&["rm", "-q", "--", "del.txt"]);
+    repo.commit_all("我方删除");
+    repo.merge_expect_conflict("side");
+    let workspace_id = open_workspace(&mut core, &repo.root);
+
+    assert_eq!(
+        repo.unmerged_xy("del.txt").as_deref(),
+        Some("DU"),
+        "用例本身没造出 DU 冲突"
+    );
+
+    let read = core.ok("git.conflict_read", read_params(&workspace_id, "del.txt"));
+    assert_eq!(read["kind"], json!("deleted_by_us"));
+    assert_eq!(read["xy"], json!("DU"));
+    assert_eq!(read["present"], json!(true), "工作区里留着对方的版本");
+    assert_eq!(
+        read["blocks"],
+        json!([]),
+        "一侧缺失的冲突没有标记块，不能报成解析失败"
+    );
+
+    let resolved = core.ok(
+        "git.conflict_resolve",
+        json!({ "workspace_id": workspace_id, "path": "del.txt", "side": "theirs" }),
+    );
+    assert_eq!(resolved["kind"], json!("deleted_by_us"));
+    assert_eq!(resolved["resolved"], json!(true));
+    assert_eq!(resolved["resolved_blocks"], json!(0), "没有块可替换");
+    assert_eq!(resolved["remaining"], json!([]));
+    assert_eq!(repo.read("del.txt"), "modified by them\n");
+    assert!(repo.unmerged_xy("del.txt").is_none());
+}
+
+/// 场景六（UD）：对方删除、我方修改。取 theirs 等于**删除**，必须走 `git rm` 落索引。
+///
+/// 这一条钉的是 `ConflictKind::missing()` 的方向性：若把 `UD` 认成 `DU`，取 theirs
+/// 会去找对方的文件版本，而对方压根没有——`checkout --theirs` 报错还是小事，最怕
+/// 写出一个空文件再 `add` 上去，等于把「删除」悄悄变成了「清空」。
+#[test]
+fn conflict_resolve_theirs_of_ud_deletes_the_file() {
+    let (mut core, _data) = boot("git-conflict-ud");
+    let repo = TempRepo::new("conflict-ud");
+    repo.init();
+    repo.write("del.txt", "base\n");
+    repo.commit_all("基线");
+    let ours = repo.current_branch();
+    repo.branch_off("side");
+    repo.git(&["rm", "-q", "--", "del.txt"]);
+    repo.commit_all("对方删除");
+    repo.checkout(&ours);
+    repo.write("del.txt", "modified by us\n");
+    repo.commit_all("我方修改");
+    repo.merge_expect_conflict("side");
+    let workspace_id = open_workspace(&mut core, &repo.root);
+
+    assert_eq!(
+        repo.unmerged_xy("del.txt").as_deref(),
+        Some("UD"),
+        "用例本身没造出 UD 冲突"
+    );
+
+    let read = core.ok("git.conflict_read", read_params(&workspace_id, "del.txt"));
+    assert_eq!(read["kind"], json!("deleted_by_them"));
+    assert_eq!(read["xy"], json!("UD"));
+    assert_eq!(read["present"], json!(true), "工作区里留着我方的版本");
+    assert_eq!(read["blocks"], json!([]));
+
+    let resolved = core.ok(
+        "git.conflict_resolve",
+        json!({ "workspace_id": workspace_id, "path": "del.txt", "side": "theirs" }),
+    );
+    assert_eq!(resolved["kind"], json!("deleted_by_them"));
+    assert_eq!(resolved["resolved"], json!(true));
+    assert_eq!(resolved["remaining"], json!([]));
+
+    assert!(
+        !repo.root.join("del.txt").exists(),
+        "取已删除的那一侧，工作区文件必须消失"
+    );
+    assert!(
+        repo.unmerged_xy("del.txt").is_none(),
+        "git status 里不得再有未合并记录"
+    );
+    assert_eq!(
+        repo.staged_status(),
+        "D\tdel.txt",
+        "删除必须已经进索引（不是留个工作区删除）"
+    );
+}
+
+/// 反向用例：非冲突文件调两个新方法必须报 7013，而不是「读出一份没有块的冲突」。
+///
+/// 7013 / 7004 分开验：前者是「文件不在冲突里，去刷新冲突面板」，后者是「参数写错，
+/// 去改调用」。把这类误用折成「成功 + 空 blocks」，外壳会把一个普通文件显示成待解决
+/// 冲突，用户点「取 ours」就等于把工作区改动覆盖掉。
+#[test]
+fn conflict_methods_reject_non_conflict_file_with_7013() {
+    let (mut core, _data) = boot("git-conflict-clean");
+    let repo = TempRepo::new("conflict-clean");
+    repo.init();
+    repo.write("a.txt", "line1\n");
+    repo.commit_all("基线");
+    repo.write("a.txt", "line1 changed\n");
+    let workspace_id = open_workspace(&mut core, &repo.root);
+
+    let (code, err) = error_body(
+        &mut core,
+        "git.conflict_read",
+        read_params(&workspace_id, "a.txt"),
+    );
+    assert_eq!(code, 7013, "非冲突文件读冲突：{err}");
+    assert_eq!(err["data"]["path"], json!("a.txt"));
+
+    let (code, err) = error_body(
+        &mut core,
+        "git.conflict_resolve",
+        json!({ "workspace_id": workspace_id, "path": "a.txt", "side": "ours" }),
+    );
+    assert_eq!(code, 7013, "非冲突文件解冲突：{err}");
+    assert_eq!(err["data"]["path"], json!("a.txt"));
+
+    // 参数层：认不出的 side、以及既没 side 也没 content，都不许猜，直接 7004。
+    let (code, err) = error_body(
+        &mut core,
+        "git.conflict_resolve",
+        json!({ "workspace_id": workspace_id, "path": "a.txt", "side": "mine" }),
+    );
+    assert_eq!(code, 7004, "未知 side 必须报参数非法：{err}");
+    assert_eq!(err["data"]["side"], json!("mine"));
+
+    let (code, _err) = error_body(
+        &mut core,
+        "git.conflict_resolve",
+        read_params(&workspace_id, "a.txt"),
+    );
+    assert_eq!(code, 7004, "side 与 content 全空必须报参数非法");
+}
+
+/// 反向用例（7014）：调用方记下的块布局已经过期，不能按旧行号切。
+#[test]
+fn conflict_resolve_reports_7014_when_layout_drifts() {
+    let (mut core, _data) = boot("git-conflict-drift");
+    let repo = uu_conflict_repo("conflict-drift");
+    let workspace_id = open_workspace(&mut core, &repo.root);
+
+    let read = core.ok("git.conflict_read", read_params(&workspace_id, "s.txt"));
+    assert_eq!(read["blocks"].as_array().map(|b| b.len()), Some(1));
+    let snapshot_start = read["blocks"][0]["start_line"].clone();
+
+    // 外壳以为有 2 块（中途有别人往文件里又插了一块）：现状是 1 块，必须拒绝。
+    let (code, err) = error_body(
+        &mut core,
+        "git.conflict_resolve",
+        json!({
+            "workspace_id": workspace_id,
+            "path": "s.txt",
+            "side": "ours",
+            "expect_blocks": 2,
+        }),
+    );
+    assert_eq!(code, 7014, "块数不符必须报冲突已变化：{err}");
+    assert_eq!(err["data"]["path"], json!("s.txt"));
+    assert_eq!(repo.read("s.txt").lines().count(), 9, "报错时不得动过文件");
+
+    // 起始行对不上同样拒绝。
+    let (code, _err) = error_body(
+        &mut core,
+        "git.conflict_resolve",
+        json!({
+            "workspace_id": workspace_id,
+            "path": "s.txt",
+            "side": "ours",
+            "expect_start_line": 99,
+        }),
+    );
+    assert_eq!(code, 7014);
+
+    // 布局对上了才执行。
+    let resolved = core.ok(
+        "git.conflict_resolve",
+        json!({
+            "workspace_id": workspace_id,
+            "path": "s.txt",
+            "side": "ours",
+            "expect_blocks": 1,
+            "expect_start_line": snapshot_start,
+        }),
+    );
+    assert_eq!(resolved["resolved"], json!(true));
+    assert_eq!(repo.read("s.txt"), "top\nour line\nbottom\n");
+}
+
+/// 场景七（防误判）：正文里本来就有像标记的普通文本，不能被当成冲突块。
+///
+/// 真冲突文件里出现 `<<<<<<<` 是很常见的（这个仓库自己的文档就在讨论标记语法）。
+/// 只认「恰好 7 个标记字符 + 至少一个空格的标签」并且配对到底才算块，否则：
+/// 把正文当块 → 解决时会把正文整段删掉；把块当正文 → 用户点了「取 ours」什么也没变。
+#[test]
+fn conflict_scan_ignores_marker_like_text_outside_blocks() {
+    let (mut core, _data) = boot("git-conflict-guard");
+    let repo = TempRepo::new("conflict-guard");
+    repo.init();
+    repo.use_diff3();
+
+    // 前 6 行全是「像标记但不是标记」的正文：
+    // 缩进过的、只有 6 个字符的、8 个字符的、没有标签的、8 个等号的。
+    let decoys = [
+        "a <<<<<<< not at column 0",
+        "<<<<<<<",
+        "<<<<<<",
+        "<<<<<<<<",
+        "========",
+        ">>>>>>>",
+    ];
+    let mut body = String::new();
+    for line in decoys {
+        body.push_str(line);
+        body.push('\n');
+    }
+    for index in 1..=10 {
+        body.push_str(&format!("filler {index:02}\n"));
+    }
+    body.push_str("target line\n");
+    body.push_str("tail\n");
+    repo.write("fp.txt", &body);
+    repo.commit_all("基线");
+
+    let ours = repo.current_branch();
+    repo.branch_off("feature");
+    let theirs = body.replace("target line\n", "target line by them\n");
+    repo.write("fp.txt", &theirs);
+    repo.commit_all("对方改动");
+    repo.checkout(&ours);
+    let mine = body.replace("target line\n", "target line by us\n");
+    repo.write("fp.txt", &mine);
+    repo.commit_all("我方改动");
+    repo.merge_expect_conflict("feature");
+    let workspace_id = open_workspace(&mut core, &repo.root);
+
+    assert_eq!(repo.unmerged_xy("fp.txt").as_deref(), Some("UU"));
+
+    let read = core.ok("git.conflict_read", read_params(&workspace_id, "fp.txt"));
+    let blocks = read["blocks"].as_array().expect("blocks 是数组");
+    assert_eq!(blocks.len(), 1, "六行像标记的正文不得被数成冲突块：{read}");
+    let block = &blocks[0];
+    assert!(
+        block["start_line"].as_u64().unwrap_or(0) > 6,
+        "真块在第 6 行之后，块起点却报成 {}：{read}",
+        block["start_line"]
+    );
+    for decoy in decoys {
+        let in_ours = block["ours"]
+            .as_array()
+            .is_some_and(|lines| lines.iter().any(|line| line.as_str() == Some(decoy)));
+        assert!(!in_ours, "正文行 {decoy:?} 被吸进了 ours 段：{read}");
+    }
+    assert!(
+        block["ours"].as_array().is_some_and(|lines| lines
+            .iter()
+            .any(|line| line.as_str() == Some("target line by us"))),
+        "ours 段必须是我方改后的内容：{read}"
+    );
+    assert!(
+        block["theirs"].as_array().is_some_and(|lines| lines
+            .iter()
+            .any(|line| line.as_str() == Some("target line by them"))),
+        "theirs 段必须是对方改后的内容：{read}"
+    );
+
+    // 解决之后，六行正文必须原样还在——这才是「没被误判」的最终证明。
+    let resolved = core.ok(
+        "git.conflict_resolve",
+        json!({ "workspace_id": workspace_id, "path": "fp.txt", "side": "ours" }),
+    );
+    assert_eq!(resolved["resolved"], json!(true));
+    let after = repo.read("fp.txt");
+    for decoy in decoys {
+        assert!(
+            after.lines().any(|line| line == decoy),
+            "解决后正文行 {decoy:?} 不见了：\n{after}"
+        );
+    }
+    assert_eq!(after, mine, "取 ours 后文件必须逐字等于我方原文");
+}
+
+/// 场景八（多文件）：解决一个之后，`remaining` 必须给出其余仍在冲突的文件。
+///
+/// 外壳靠它决定「关不关冲突面板」：少报会让面板停在已解决的文件上，多报会让用户
+/// 一次次点「已解决」却关不掉。
+#[test]
+fn conflict_resolve_reports_remaining_conflicts() {
+    let (mut core, _data) = boot("git-conflict-remaining");
+    let repo = TempRepo::new("conflict-remaining");
+    repo.init();
+    repo.write("a.txt", "a-base\n");
+    repo.write("b.txt", "b-base\n");
+    repo.commit_all("基线");
+    let ours = repo.current_branch();
+    repo.branch_off("feature");
+    repo.write("a.txt", "a-theirs\n");
+    repo.write("b.txt", "b-theirs\n");
+    repo.commit_all("对方改动");
+    repo.checkout(&ours);
+    repo.write("a.txt", "a-ours\n");
+    repo.write("b.txt", "b-ours\n");
+    repo.commit_all("我方改动");
+    repo.merge_expect_conflict("feature");
+    let workspace_id = open_workspace(&mut core, &repo.root);
+
+    assert_eq!(repo.unmerged_xy("a.txt").as_deref(), Some("UU"));
+    assert_eq!(repo.unmerged_xy("b.txt").as_deref(), Some("UU"));
+
+    let first = core.ok(
+        "git.conflict_resolve",
+        json!({ "workspace_id": workspace_id, "path": "a.txt", "side": "ours" }),
+    );
+    assert_eq!(first["remaining"], json!(["b.txt"]), "另一个文件还在冲突");
+    assert_eq!(repo.read("a.txt"), "a-ours\n");
+
+    let second = core.ok(
+        "git.conflict_resolve",
+        json!({ "workspace_id": workspace_id, "path": "b.txt", "side": "theirs" }),
+    );
+    assert_eq!(second["remaining"], json!([]), "全部解决后剩余应为空");
+    assert_eq!(repo.read("b.txt"), "b-theirs\n");
 }

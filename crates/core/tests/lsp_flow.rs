@@ -165,10 +165,12 @@ fn capabilities_advertise_all_five_lsp_methods() {
     // 九个都在 `crates/git/src/repo.rs` 有真实实现、在 `git_api.rs` 接了处理器。
     // 89 → 91：缺口第四批补 `git.stage_hunk` / `git.unstage_hunk`（单块暂存），
     // 同样是真实实现 + 真实 dispatch 分支，不是名字占位。
+    // 91 → 93：缺口第五批补 `git.conflict_read` / `git.conflict_resolve`（合并冲突），
+    // 冲突解析与解决在 `crates/git` 真跑，7013 / 7014 是独立错误码。
     assert_eq!(
         capabilities.len(),
-        91,
-        "能力总数应为 91（74 + lsp 五项 + plugin.load_many + Git 深化九项 + 单 hunk 暂存两项），实际 {}",
+        93,
+        "能力总数应为 93（74 + lsp 五项 + plugin.load_many + Git 深化九项 + 单 hunk 暂存两项 + 冲突解决两项），实际 {}",
         capabilities.len()
     );
 }

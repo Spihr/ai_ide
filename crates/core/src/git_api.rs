@@ -42,6 +42,8 @@
 //! | stash pop/apply 冲突，stash 未被丢弃（`data.files` + `data.stash_kept`） | 7010 |
 //! | 单块暂存定位失效（文件被改、行号漂移；`data.expected` / `data.actual`） | 7011 |
 //! | 二进制文件不支持按 hunk 暂存（`data.path`） | 7012 |
+//! | 目标文件不在冲突状态（`data.path`） | 7013 |
+//! | 冲突块布局已变化（`data.expected` / `data.actual`） | 7014 |
 //!
 //! 7006~7010 是缺口第二批补的**专用**码。它们各自的用户下一步动作都不同（先提交 /
 //! 先 stash、先拉取、去登录、去设上游、去解冲突），所以不能退化成一个 7003——外壳
@@ -50,18 +52,28 @@
 //! 7011 / 7012 是第四批（单 hunk 暂存）补的。`7011` 的动作是「刷新后重选」，
 //! `7012` 的动作是「这条路本来就不通，改走整文件暂存」——把两者并进 `7003`，
 //! 外壳就只能笼统地说「操作失败」，用户会反复点同一个按钮。
+//!
+//! 7013 / 7014 是第五批（合并冲突）补的，同样是「刷新即可」而非「命令失败」：
+//! `7013` 说明冲突已经不在了（被解决 / 被 abort），`7014` 说明块布局变了。
+//! 两者都要求外壳重新 `git.conflict_read`，这跟一次普通的 `git.stage` 失败
+//! 完全不是一回事。
 
 use crate::dispatch::parse_params;
 use crate::peer::Peer;
 use crate::state::AppState;
-use ai_ide_git::{GitBranchInfo, GitError, GitRepo, GitStatus, GitStatusEntry, HunkSelector};
+use ai_ide_git::{
+    ConflictResolution, ConflictSide, GitBranchInfo, GitError, GitRepo, GitStatus, GitStatusEntry,
+    HunkSelector,
+};
 use ai_ide_protocol::dto::{
     GitBranch, GitBranchesParams, GitBranchesResult, GitCheckoutParams, GitCheckoutResult,
-    GitCommitParams, GitCommitResult, GitDiffParams, GitDiffResult, GitFetchParams, GitFetchResult,
-    GitPullParams, GitPullResult, GitPushParams, GitPushResult, GitStageHunkParams,
-    GitStageHunkResult, GitStageParams, GitStageResult, GitStashApplyParams, GitStashApplyResult,
-    GitStashDropParams, GitStashDropResult, GitStashListParams, GitStashListResult, GitStashParams,
-    GitStashResult, GitStatusParams, GitStatusResult, GitUnstageHunkParams, GitUnstageHunkResult,
+    GitCommitParams, GitCommitResult, GitConflictBlock, GitConflictReadParams,
+    GitConflictReadResult, GitConflictResolveParams, GitConflictResolveResult, GitDiffParams,
+    GitDiffResult, GitFetchParams, GitFetchResult, GitPullParams, GitPullResult, GitPushParams,
+    GitPushResult, GitStageHunkParams, GitStageHunkResult, GitStageParams, GitStageResult,
+    GitStashApplyParams, GitStashApplyResult, GitStashDropParams, GitStashDropResult,
+    GitStashListParams, GitStashListResult, GitStashParams, GitStashResult, GitStatusParams,
+    GitStatusResult, GitUnstageHunkParams, GitUnstageHunkResult,
 };
 use ai_ide_protocol::{ErrorCode, ErrorObject, Request};
 use std::sync::Arc;
@@ -134,6 +146,21 @@ fn error_of(err: &GitError) -> ErrorObject {
             ErrorObject::new(ErrorCode::GIT_BINARY_HUNK, err.to_string())
                 .with_data(serde_json::json!({ "path": path }))
         }
+        // 7013：文件已不在冲突状态。不是参数错（路径没错），而是时机错——文件可能
+        // 已经被解决、被 abort 掉了。外壳的动作是刷新冲突列表，不是让用户改路径。
+        GitError::NotInConflict { path } => {
+            ErrorObject::new(ErrorCode::GIT_NOT_IN_CONFLICT, err.to_string())
+                .with_data(serde_json::json!({ "path": path }))
+        }
+        // 7014：冲突块布局变了。与 7011 同理：按过期布局硬切会删掉块外的内容，
+        // 所以这里也硬失败，`expected` / `actual` 让外壳讲清「你看到 3 块，现在是 2 块」。
+        GitError::ConflictChanged {
+            path,
+            expected,
+            actual,
+        } => ErrorObject::new(ErrorCode::GIT_CONFLICT_CHANGED, err.to_string()).with_data(
+            serde_json::json!({ "path": path, "expected": expected, "actual": actual }),
+        ),
         GitError::Command { args, stderr, code } => {
             ErrorObject::new(ErrorCode::GIT_COMMAND_FAILED, err.to_string())
                 .with_data(serde_json::json!({ "args": args, "stderr": stderr, "exit_code": code }))
@@ -398,6 +425,130 @@ pub async fn unstage_hunk(peer: &Peer, state: &AppState, req: &Request) {
                 staged_total: result.staged_total,
             }
         })
+    })
+    .await;
+
+    match outcome {
+        Ok((_, result)) => peer.respond(&req.id, &result).await,
+        Err(err) => peer.respond_error(&req.id, &err).await,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// git.conflict_read / git.conflict_resolve（缺口第五批）
+// ---------------------------------------------------------------------------
+
+fn conflict_block_of(block: ai_ide_git::GitConflictBlock) -> GitConflictBlock {
+    GitConflictBlock {
+        index: block.index,
+        start_line: block.start_line,
+        end_line: block.end_line,
+        ours_label: block.ours_label,
+        base_label: block.base_label,
+        theirs_label: block.theirs_label,
+        ours: block.ours,
+        base: block.base,
+        theirs: block.theirs,
+    }
+}
+
+fn conflict_of(conflict: ai_ide_git::GitConflict) -> GitConflictReadResult {
+    GitConflictReadResult {
+        path: conflict.path,
+        kind: conflict.kind.as_str().to_string(),
+        xy: conflict.xy,
+        present: conflict.present,
+        blocks: conflict.blocks.into_iter().map(conflict_block_of).collect(),
+    }
+}
+
+fn conflict_outcome_of(outcome: ai_ide_git::GitConflictOutcome) -> GitConflictResolveResult {
+    GitConflictResolveResult {
+        path: outcome.path,
+        kind: outcome.kind.as_str().to_string(),
+        resolved: outcome.resolved,
+        still_conflicted: outcome.still_conflicted,
+        resolved_blocks: outcome.resolved_blocks,
+        remaining: outcome.remaining,
+    }
+}
+
+/// 读取单个冲突文件的三段内容与行号区间。
+///
+/// `blocks` 与 `kind` 一起才构成完整信息：一侧缺失（`DU` / `UD`）或二进制冲突时
+/// `blocks` 为空，外壳得据 `kind` 改走「整份取一侧 / 删除」，不能当成「解析失败」。
+pub async fn conflict_read(peer: &Peer, state: &AppState, req: &Request) {
+    let params: GitConflictReadParams = match parse_params(req.params.as_ref()) {
+        Ok(params) => params,
+        Err(err) => return peer.respond_error(&req.id, &err).await,
+    };
+
+    let path = params.path.clone();
+    let outcome = run(state, params.workspace_id.as_deref(), move |repo| {
+        repo.conflict_read(&path).map(conflict_of)
+    })
+    .await;
+
+    match outcome {
+        Ok((_, result)) => peer.respond(&req.id, &result).await,
+        Err(err) => peer.respond_error(&req.id, &err).await,
+    }
+}
+
+/// 解决单个冲突文件：取一侧 / 两侧都留 / 写自定义全文，然后 `git add` 落索引。
+///
+/// `side` 认不出时**不猜**：静默按 ours 处理会在用户以为「取对方版本」时悄悄丢掉
+/// 自己的改动，所以这里直接 7004。`content` 与 `side` 全空同样是 7004——没有内容
+/// 就没有解决结果，不能把「什么都没给」当成「取 ours」。
+pub async fn conflict_resolve(peer: &Peer, state: &AppState, req: &Request) {
+    let params: GitConflictResolveParams = match parse_params(req.params.as_ref()) {
+        Ok(params) => params,
+        Err(err) => return peer.respond_error(&req.id, &err).await,
+    };
+
+    let side = match params.side.as_deref() {
+        Some(raw) => match ConflictSide::parse(raw, params.theirs_first) {
+            Some(side) => Some(side),
+            None => {
+                return peer
+                    .respond_error(
+                        &req.id,
+                        &ErrorObject::new(
+                            ErrorCode::GIT_INVALID_PARAMS,
+                            format!("side 只能是 ours / theirs / both，收到 {raw:?}"),
+                        )
+                        .with_data(serde_json::json!({ "path": params.path, "side": raw })),
+                    )
+                    .await
+            }
+        },
+        None => None,
+    };
+
+    if side.is_none() && params.content.is_none() {
+        return peer
+            .respond_error(
+                &req.id,
+                &ErrorObject::new(
+                    ErrorCode::GIT_INVALID_PARAMS,
+                    format!("{} 必须给出 side 或 content 之一", params.path),
+                )
+                .with_data(serde_json::json!({ "path": params.path })),
+            )
+            .await;
+    }
+
+    let resolution = ConflictResolution {
+        path: params.path.clone(),
+        // 写了 `content` 时 `side` 被忽略，占位取 ours 不影响写盘结果。
+        side: side.unwrap_or(ConflictSide::Ours),
+        content: params.content.clone(),
+        expect_blocks: params.expect_blocks,
+        expect_start_line: params.expect_start_line,
+    };
+
+    let outcome = run(state, params.workspace_id.as_deref(), move |repo| {
+        repo.conflict_resolve(&resolution).map(conflict_outcome_of)
     })
     .await;
 
