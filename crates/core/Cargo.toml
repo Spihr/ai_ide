@@ -34,6 +34,9 @@ base64 = { workspace = true }
 # P5 切片五：`host/net.fetch` 的出站传输。用 workspace 里已钉好的 reqwest（rustls +
 # webpki 根），不给 core 单独换一套 TLS 栈。
 reqwest = { workspace = true }
+# P5 切片八：`plugin.load_many` 的有界并发调度。只用到 `stream` 的
+# `iter` / `buffer_unordered`，不引入 `futures` 全量 crate（workspace 里 mcp 已用同一份）。
+futures-util = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

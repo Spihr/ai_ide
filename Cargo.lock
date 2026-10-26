@@ -46,6 +46,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
+ "futures-util",
  "reqwest",
  "serde",
  "serde_json",

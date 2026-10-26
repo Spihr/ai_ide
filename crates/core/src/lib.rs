@@ -116,6 +116,17 @@ fn session_store_path() -> std::path::PathBuf {
 pub async fn run() -> Result<()> {
     let state = Arc::new(AppState::new());
     let peer = Arc::new(Peer::new());
+
+    // 插件日志的磁盘副本（P5 切片八）：与内核日志同目录、同滚动、同脱敏，
+    // 只是文件族从 `core-*` 换成 `plugin-*`。装在 `run()` 而不是 `AppState::new()`：
+    // 单测会构造 AppState，装载器跑到用户默认目录里写文件是副作用污染。
+    match logging::plugin_log_writer() {
+        Some(writer) => {
+            info!(dir = %logging::log_dir().display(), "插件日志将追加写入 plugin-*.jsonl");
+            state.plugin_host().install_plugin_log_sink(writer);
+        }
+        None => info!("AI_IDE_LOG_JSONL 已关，插件日志只走事件通道"),
+    }
     // 把对端句柄交给状态：`workspace.changed` 这类事件需要主动推送。
     state.attach_peer(Arc::clone(&peer));
 

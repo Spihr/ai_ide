@@ -127,7 +127,7 @@ fn unimplemented_calls() -> Vec<(&'static str, Value)> {
 }
 
 #[test]
-fn capabilities_advertise_all_eleven_plugin_methods() {
+fn capabilities_advertise_all_twelve_plugin_methods() {
     let data = TempDataDir::new("plugin-caps");
     let mut core = Core::spawn(&data.root);
 
@@ -139,8 +139,15 @@ fn capabilities_advertise_all_eleven_plugin_methods() {
 
     assert_eq!(
         plugin_methods.len(),
-        11,
-        "能力清单里 plugin.* 应有 11 项（P5 切片二新增 plugin.command），实际 {plugin_methods:?}"
+        12,
+        "能力清单里 plugin.* 应有 12 项（P5 切片八新增 plugin.load_many），实际 {plugin_methods:?}"
+    );
+    // 只数总数不够：批量装载漏登记时总数会少，但更常见的是「加了别的项凑够数」。
+    assert!(
+        plugin_methods
+            .iter()
+            .any(|name| *name == "plugin.load_many"),
+        "能力清单必须包含 plugin.load_many，实际 {plugin_methods:?}"
     );
 }
 

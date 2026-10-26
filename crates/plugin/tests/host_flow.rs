@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ai_ide_plugin::{
     host::{Handshake, Host, LoadError, LoadSpec, Restart, MAX_AUTO_RESTARTS},
@@ -508,4 +508,444 @@ rl.on('line', (line) => {
     assert_eq!(handshake.tool_names(), vec!["echo".to_string()]);
     host.shutdown_all().await;
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// P5 切片八：多插件并发装载（互斥 / 隔离 / 广播独立）
+// ---------------------------------------------------------------------------
+
+/// 可编排的探针插件：三个可观测点，全部落在插件包里，测试直接读文件断言。
+///
+/// 1. `.starts`：本进程被启动了几次（每次启动 +1）——用来证明「同一 id 并发
+///    load 只起一个进程」，比看 `pid` 更硬：pid 复用/覆盖时 pid 也可能相等；
+/// 2. `.timeline`：`start <ms>` / `done <ms>` 两条记录——用来证明多个插件是
+///    **真的同时在等握手**，而不是排着队一个个来（时间窗重叠）；
+/// 3. `events.log`：收到的 `plugin/event` 通知逐条追加——用来证明事件广播只到
+///    订阅了该事件的插件，不串台。
+fn probe_script(tools: &[&str], delay_ms: u64, subscriptions: &[&str]) -> String {
+    let tool_list = tools
+        .iter()
+        .map(|name| {
+            format!(
+                "{{ name: {name:?}, description: {name:?}, risk: 'read', parameters: {{ type: 'object' }} }}"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sub_list = subscriptions
+        .iter()
+        .map(|name| format!("{name:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        r#"
+const fs = require('node:fs')
+const path = require('node:path')
+const readline = require('node:readline')
+const TOOLS = [{tool_list}]
+const SUBS = [{sub_list}]
+const startsFile = path.join(__dirname, '.starts')
+const timelineFile = path.join(__dirname, '.timeline')
+const eventsFile = path.join(__dirname, 'events.log')
+
+let seen = 0
+try {{ seen = parseInt(fs.readFileSync(startsFile, 'utf8'), 10) || 0 }} catch (e) {{}}
+seen += 1
+fs.writeFileSync(startsFile, String(seen))
+fs.appendFileSync(timelineFile, 'start ' + Date.now() + '\n')
+
+const rl = readline.createInterface({{ input: process.stdin, crlfDelay: Infinity }})
+function send(frame) {{ process.stdout.write(JSON.stringify(frame) + '\n') }}
+rl.on('line', (line) => {{
+  if (!line.trim()) return
+  const frame = JSON.parse(line)
+  if (frame.method === 'plugin/handshake' || frame.method === 'plugin/initialize') {{
+    // 故意慢一点回握手：并发装载的证据就是「多个插件的等待窗口重叠」。
+    setTimeout(() => {{
+      send({{ jsonrpc: '2.0', id: frame.id, result: {{
+        pluginApi: {{ major: 1, minor: 0 }},
+        name: 'Probe',
+        version: '0.1.0',
+        tools: TOOLS,
+        commands: [],
+        subscriptions: SUBS
+      }} }})
+      fs.appendFileSync(timelineFile, 'done ' + Date.now() + '\n')
+    }}, {delay_ms})
+  }} else if (frame.method === 'plugin/event') {{
+    fs.appendFileSync(eventsFile, JSON.stringify(frame.params) + '\n')
+  }} else if (frame.method === 'plugin/shutdown') {{
+    send({{ jsonrpc: '2.0', id: frame.id, result: {{}} }})
+    setTimeout(() => process.exit(0), 10)
+  }} else {{
+    send({{ jsonrpc: '2.0', id: frame.id, error: {{ code: -32601, message: 'unimplemented: ' + frame.method }} }})
+  }}
+}})
+"#
+    )
+}
+
+/// 起一个立刻崩掉的入口：进程起来就退，装载必失败，且不是「清单不合法」那种
+/// 前置失败——用它验证「失败发生在装载过程中，其他插件照样能装完」。
+fn crashing_script() -> String {
+    "process.exit(3)\n".to_string()
+}
+
+/// 按指定 id / 订阅清单造插件包（`package()` 把 id 写死成 demo-node，这里需要多
+/// 个不同 id 同场）。
+fn package_for(
+    dir: &Path,
+    id: &str,
+    tools: &[&str],
+    subscriptions: &[&str],
+    entry_source: &str,
+) -> ValidatedManifest {
+    let manifest = json!({
+        "id": id,
+        "name": format!("Probe {id}"),
+        "version": "0.1.0",
+        "pluginApi": "1.0",
+        "main": "index.cjs",
+        "capabilities": ["fs.read"],
+        "tools": tools.iter().map(|name| json!({
+            "name": name,
+            "description": format!("{name} 的说明"),
+            "risk": "read",
+            "parameters": { "type": "object" },
+        })).collect::<Vec<_>>(),
+        "commands": [],
+        "subscriptions": subscriptions,
+    });
+    std::fs::write(
+        dir.join("plugin.json"),
+        serde_json::to_vec_pretty(&manifest).expect("序列化清单"),
+    )
+    .expect("写清单");
+    std::fs::write(dir.join("index.cjs"), entry_source).expect("写入口");
+    validate(dir, &manifest).expect("清单应合法")
+}
+
+fn spec_for<'a>(
+    dir: &'a Path,
+    id: &'a str,
+    validated: &'a ValidatedManifest,
+    granted: &[&str],
+) -> LoadSpec<'a> {
+    LoadSpec {
+        plugin_id: id,
+        install_dir: dir,
+        validated,
+        requested: validated.manifest.capabilities.clone(),
+        granted: granted.iter().map(|value| value.to_string()).collect(),
+        workspace: Value::Null,
+    }
+}
+
+fn read_lines(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn read_starts(dir: &Path) -> u32 {
+    std::fs::read_to_string(dir.join(".starts"))
+        .expect("读启动计数")
+        .trim()
+        .parse()
+        .expect("计数应是整数")
+}
+
+/// `.timeline` 里的 `start` / `done` 时间戳（毫秒）。
+fn read_window(dir: &Path) -> (u64, u64) {
+    let mut start = None;
+    let mut done = None;
+    for line in read_lines(&dir.join(".timeline")) {
+        let mut parts = line.split_whitespace();
+        match (parts.next(), parts.next()) {
+            (Some("start"), Some(value)) => start = value.parse::<u64>().ok(),
+            (Some("done"), Some(value)) => done = value.parse::<u64>().ok(),
+            _ => {}
+        }
+    }
+    (start.expect("应记录 start"), done.expect("应记录 done"))
+}
+
+#[tokio::test]
+async fn same_id_concurrent_load_starts_exactly_one_process() {
+    if !node_ready() {
+        eprintln!("跳过：本机没有 node");
+        return;
+    }
+    let dir = scratch("same-id");
+    // 握手故意慢 400ms：没有 per-id 闸门时，第二个 load 会在这 400ms 里
+    // 从 alive() 里看不到任何东西，于是也起一个进程。
+    let validated = package_for(
+        &dir,
+        "demo-node",
+        &["echo"],
+        &[],
+        &probe_script(&["echo"], 400, &[]),
+    );
+    let host = Host::new();
+
+    let (first, second) = tokio::join!(
+        host.load(spec_for(&dir, "demo-node", &validated, &["fs.read"])),
+        host.load(spec_for(&dir, "demo-node", &validated, &["fs.read"])),
+    );
+    let first = first.expect("第一次装载应成功");
+    let second = second.expect("并发第二次装载应复用而不是失败");
+
+    assert_eq!(first.pid, second.pid, "同一 id 并发装载只能是同一个进程");
+    assert_ne!(
+        first.reused, second.reused,
+        "两次都 reused 或都没 reused 说明互斥失效"
+    );
+    assert_eq!(
+        read_starts(&dir),
+        1,
+        "插件进程只应被启动一次（每次启动都会把 .starts +1）"
+    );
+    assert_eq!(
+        host.running_ids(),
+        vec!["demo-node".to_string()],
+        "装载表里只应有一个条目"
+    );
+    assert_eq!(
+        host.running_tools("demo-node"),
+        vec!["plugin__demo-node__echo".to_string()],
+        "复用不能把工具表搞成重复项"
+    );
+
+    host.shutdown_all().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn different_plugins_load_concurrently_with_overlapping_handshakes() {
+    if !node_ready() {
+        eprintln!("跳过：本机没有 node");
+        return;
+    }
+    let root = scratch("parallel");
+    let ids = ["alpha", "beta", "gamma"];
+    let tools: [&[&str]; 3] = [&["a_one", "a_two"], &["b_one"], &["c_one"]];
+
+    let mut dirs = Vec::new();
+    let mut validated = Vec::new();
+    for (index, id) in ids.iter().enumerate() {
+        let dir = root.join(id);
+        std::fs::create_dir_all(&dir).expect("建插件目录");
+        validated.push(package_for(
+            &dir,
+            id,
+            tools[index],
+            &[],
+            &probe_script(tools[index], 300, &[]),
+        ));
+        dirs.push(dir);
+    }
+
+    let host = Host::new();
+    let (a, b, c) = tokio::join!(
+        host.load(spec_for(&dirs[0], ids[0], &validated[0], &["fs.read"])),
+        host.load(spec_for(&dirs[1], ids[1], &validated[1], &["fs.read"])),
+        host.load(spec_for(&dirs[2], ids[2], &validated[2], &["fs.read"])),
+    );
+    for (id, loaded) in ids.iter().zip([a, b, c]) {
+        let loaded = loaded.unwrap_or_else(|error| panic!("{id} 应装载成功，实际 {error:?}"));
+        assert!(loaded.pid.is_some());
+        assert!(!loaded.reused, "首次装载不该被当成复用");
+    }
+
+    // 隔离与冲突：三个插件同时在跑，工具名各带自己的前缀，谁也不占谁的位。
+    let mut running = host.running_ids();
+    running.sort();
+    assert_eq!(running, vec!["alpha", "beta", "gamma"]);
+    assert_eq!(
+        host.running_tools("alpha"),
+        vec![
+            "plugin__alpha__a_one".to_string(),
+            "plugin__alpha__a_two".to_string()
+        ]
+    );
+    assert_eq!(
+        host.running_tools("beta"),
+        vec!["plugin__beta__b_one".to_string()]
+    );
+    assert_eq!(
+        host.running_tools("gamma"),
+        vec!["plugin__gamma__c_one".to_string()]
+    );
+    assert_eq!(host.tool_catalog().len(), 4, "工具总表应等于三个插件之和");
+
+    // 并发证据：三个插件的握手等待窗口必须互相重叠。串行装载时，前一个的
+    // `done` 一定早于后一个的 `start`，这里就必然失败。
+    let windows: Vec<(u64, u64)> = dirs.iter().map(|dir| read_window(dir)).collect();
+    let latest_start = windows
+        .iter()
+        .map(|(start, _)| *start)
+        .max()
+        .expect("有窗口");
+    let earliest_done = windows.iter().map(|(_, done)| *done).min().expect("有窗口");
+    assert!(
+        latest_start < earliest_done,
+        "三个握手窗口没有重叠（{windows:?}），说明装载是串行的而不是并发的"
+    );
+    for dir in &dirs {
+        assert_eq!(read_starts(dir), 1, "每个插件只该启动一次");
+    }
+
+    host.shutdown_all().await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn one_plugin_failure_does_not_disturb_the_others() {
+    if !node_ready() {
+        eprintln!("跳过：本机没有 node");
+        return;
+    }
+    let root = scratch("isolate");
+    let good_a = root.join("good-a");
+    let broken = root.join("broken");
+    let good_b = root.join("good-b");
+    for dir in [&good_a, &broken, &good_b] {
+        std::fs::create_dir_all(dir).expect("建插件目录");
+    }
+
+    let validated_a = package_for(
+        &good_a,
+        "good-a",
+        &["echo"],
+        &[],
+        &probe_script(&["echo"], 50, &[]),
+    );
+    // 入口一起进程就退出：失败点在「起进程之后」，不是清单校验阶段。
+    let validated_broken = package_for(&broken, "broken", &["echo"], &[], &crashing_script());
+    let validated_b = package_for(
+        &good_b,
+        "good-b",
+        &["echo"],
+        &[],
+        &probe_script(&["echo"], 50, &[]),
+    );
+
+    let host = Host::new();
+    let (a, bad, b) = tokio::join!(
+        host.load(spec_for(&good_a, "good-a", &validated_a, &["fs.read"])),
+        host.load(spec_for(&broken, "broken", &validated_broken, &["fs.read"])),
+        host.load(spec_for(&good_b, "good-b", &validated_b, &["fs.read"])),
+    );
+
+    assert!(a.is_ok(), "坏插件的失败不能传染给 good-a：{:?}", a.err());
+    assert!(b.is_ok(), "坏插件的失败不能传染给 good-b：{:?}", b.err());
+    assert!(
+        matches!(
+            bad,
+            Err(LoadError::Crashed { .. }) | Err(LoadError::Timeout { .. })
+        ),
+        "坏插件应如实报装载失败，实际 {bad:?}"
+    );
+
+    let mut running = host.running_ids();
+    running.sort();
+    assert_eq!(running, vec!["good-a".to_string(), "good-b".to_string()]);
+    assert!(!host.is_running("broken"), "失败的插件不应留在装载表里");
+    assert_eq!(
+        host.running_tools("good-a"),
+        vec!["plugin__good-a__echo".to_string()]
+    );
+    assert!(host.running_tools("broken").is_empty());
+
+    host.shutdown_all().await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn state_broadcast_reaches_only_subscribing_plugin() {
+    if !node_ready() {
+        eprintln!("跳过：本机没有 node");
+        return;
+    }
+    let root = scratch("broadcast");
+    let listener = root.join("listener");
+    let bystander = root.join("bystander");
+    for dir in [&listener, &bystander] {
+        std::fs::create_dir_all(dir).expect("建插件目录");
+    }
+
+    let validated_listener = package_for(
+        &listener,
+        "listener",
+        &["echo"],
+        &["plugin.state_changed"],
+        &probe_script(&["echo"], 20, &["plugin.state_changed"]),
+    );
+    let validated_bystander = package_for(
+        &bystander,
+        "bystander",
+        &["echo"],
+        &[],
+        &probe_script(&["echo"], 20, &[]),
+    );
+
+    let host = Host::new();
+    host.load(spec_for(
+        &listener,
+        "listener",
+        &validated_listener,
+        &["fs.read"],
+    ))
+    .await
+    .expect("listener 应装载成功");
+    host.load(spec_for(
+        &bystander,
+        "bystander",
+        &validated_bystander,
+        &["fs.read"],
+    ))
+    .await
+    .expect("bystander 应装载成功");
+
+    // 广播的是 bystander 的状态迁移：只有订阅了这个事件的 listener 该收到。
+    let delivered = host.announce_state("bystander", "ready");
+    assert_eq!(delivered, 1, "只应投递给订阅了该事件的那一个插件");
+
+    // 事件是异步写出到插件 stdin 的，给它一点时间落盘。
+    let events_file = listener.join("events.log");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if events_file.exists() && !read_lines(&events_file).is_empty() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "listener 一直没收到状态广播");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    let received = read_lines(&events_file);
+    assert_eq!(
+        received.len(),
+        1,
+        "listener 只应收到本插件那一条：{received:?}"
+    );
+    assert!(
+        received[0].contains("plugin.state_changed") && received[0].contains("bystander"),
+        "广播内容应是 bystander 的状态迁移，实际 {}",
+        received[0]
+    );
+    assert!(
+        !bystander.join("events.log").exists(),
+        "没订阅的插件不该收到任何事件"
+    );
+    assert_eq!(
+        host.pending_events("bystander"),
+        0,
+        "未订阅的插件队列应保持为空"
+    );
+
+    host.shutdown_all().await;
+    let _ = std::fs::remove_dir_all(&root);
 }

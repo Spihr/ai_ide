@@ -169,6 +169,8 @@ async fn handle_request(peer: &Peer, state: &AppState, req: Request) {
         methods::plugin::INSTALL => plugin_api::install(peer, state, &req).await,
         methods::plugin::UNINSTALL => plugin_api::uninstall(peer, state, &req).await,
         methods::plugin::LOAD => plugin_api::load(peer, state, &req).await,
+        // P5 切片八：批量并发装载（单插件语义与 `plugin.load` 同一段实现）。
+        methods::plugin::LOAD_MANY => plugin_api::load_many(peer, state, &req).await,
         methods::plugin::UNLOAD => plugin_api::unload(peer, state, &req).await,
         methods::plugin::RELOAD => plugin_api::reload(peer, state, &req).await,
         methods::plugin::CALL => plugin_api::call(peer, state, &req).await,
