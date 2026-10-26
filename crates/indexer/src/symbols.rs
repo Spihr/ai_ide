@@ -107,6 +107,8 @@ pub fn search(root: &Path, index: &FileIndex, params: &SearchSymbolsParams) -> S
 
     SearchSymbolsResult {
         symbols: hits.into_iter().map(|(_, symbol)| symbol).collect(),
+        // 索引在手时符号结果是完整的；降级标记由内核在「索引未就绪」时置真。
+        indexing: false,
     }
 }
 

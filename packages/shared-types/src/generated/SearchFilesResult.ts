@@ -4,4 +4,11 @@ import type { FileMatch } from "./FileMatch";
 /**
  * `search.files` 响应结果。
  */
-export type SearchFilesResult = { matches: Array<FileMatch>, };
+export type SearchFilesResult = { matches: Array<FileMatch>, 
+/**
+ * 索引是否仍在后台构建；`true` 时 `matches` 是降级结果（可能为空）。
+ *
+ * 与 `search.symbols` 同义：区分「真的没这个文件」与「还没扫完」，前端据此
+ * 提示「索引中」而不是把空结果当成结论。
+ */
+indexing: boolean, };

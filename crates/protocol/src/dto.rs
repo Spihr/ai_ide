@@ -209,6 +209,16 @@ pub struct WorkspaceIndexedEvent {
     pub workspace_id: String,
     /// 最终规模统计。
     pub stats: WorkspaceStats,
+    /// 本次构建耗时（毫秒），从开始遍历到索引可用。
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub duration_ms: u64,
+    /// 是否为增量构建。
+    ///
+    /// 当前内核每次都是全量重建（`false`）；字段先占位，等增量重建落地后
+    /// 前端不必再改协议就能区分「补扫了几个文件」与「重扫了整库」。
+    #[serde(default)]
+    pub incremental: bool,
 }
 
 /// `workspace.close` 请求参数。
@@ -467,6 +477,12 @@ pub struct FileMatch {
 #[ts(export)]
 pub struct SearchFilesResult {
     pub matches: Vec<FileMatch>,
+    /// 索引是否仍在后台构建；`true` 时 `matches` 是降级结果（可能为空）。
+    ///
+    /// 与 `search.symbols` 同义：区分「真的没这个文件」与「还没扫完」，前端据此
+    /// 提示「索引中」而不是把空结果当成结论。
+    #[serde(default)]
+    pub indexing: bool,
 }
 
 /// `search.content` 请求参数。
@@ -590,6 +606,9 @@ pub struct SearchSymbolsParams {
 pub struct SearchSymbolsResult {
     /// 命中上限由内核固定（200 条），按相关度排序。
     pub symbols: Vec<Symbol>,
+    /// 索引是否仍在后台构建；`true` 时 `symbols` 是降级结果（可能为空）。
+    #[serde(default)]
+    pub indexing: bool,
 }
 
 // ---------------------------------------------------------------------------

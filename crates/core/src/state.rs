@@ -19,6 +19,96 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+/// 一次后台索引构建的凭据。
+///
+/// 拿它才能把构建结果写回缓存（[`IndexRegistry::store_if_current`]）：工作区在构建
+/// 途中被关掉时，登记会被 [`IndexRegistry::drop_index`] 摘掉，迟到的结果随之作废——
+/// 否则关掉的索引会被写回，变成一份没人再删得掉的残留。
+pub struct IndexBuild {
+    workspace_id: String,
+}
+
+/// 各工作区的文件索引缓存 + 在途构建登记表。
+///
+/// 从 [`AppState`] 里抽成独立句柄（`Arc<IndexRegistry>`）而不是留在 `AppState` 上：
+/// 后台索引任务要 `tokio::spawn` 到 'static，`AppState` 本身不实现 Clone，只有把
+/// 「索引这一块」单独做成可克隆的句柄，构建完成后才能写回结果并推送事件。
+#[derive(Default)]
+pub struct IndexRegistry {
+    /// 键为 `workspace_id`。
+    indices: Mutex<HashMap<String, Arc<FileIndex>>>,
+    /// 在途构建的 `workspace_id` 集合。
+    builds: Mutex<HashSet<String>>,
+}
+
+impl IndexRegistry {
+    /// 取已就绪的索引。
+    pub fn get(&self, workspace_id: &str) -> Option<Arc<FileIndex>> {
+        self.indices.lock().ok()?.get(workspace_id).map(Arc::clone)
+    }
+
+    /// 无条件写回索引（同步构建路径与单测用）。
+    pub fn put(&self, workspace_id: &str, index: Arc<FileIndex>) {
+        if let Ok(mut map) = self.indices.lock() {
+            map.insert(workspace_id.to_string(), index);
+        }
+    }
+
+    /// 登记一次构建；同一工作区已有构建在跑时返回 `None`（不重复遍历）。
+    pub fn begin_build(&self, workspace_id: &str) -> Option<IndexBuild> {
+        let mut builds = self.builds.lock().ok()?;
+        if !builds.insert(workspace_id.to_string()) {
+            return None;
+        }
+        Some(IndexBuild {
+            workspace_id: workspace_id.to_string(),
+        })
+    }
+
+    /// 是否有构建正在进行（前端「索引中」状态的兜底判据）。
+    pub fn is_building(&self, workspace_id: &str) -> bool {
+        self.builds
+            .lock()
+            .map(|builds| builds.contains(workspace_id))
+            .unwrap_or(false)
+    }
+
+    /// 写回构建结果。返回 `false` 表示这次构建已作废（工作区被关掉），调用方不应再推事件。
+    pub fn store_if_current(&self, build: &IndexBuild, index: Arc<FileIndex>) -> bool {
+        // 先摘登记再判是否还在：`drop_index` 会先摘登记，于是「摘不到」就等于「已作废」。
+        let still_registered = self
+            .builds
+            .lock()
+            .map(|mut builds| builds.remove(&build.workspace_id))
+            .unwrap_or(false);
+        if !still_registered {
+            return false;
+        }
+        let Ok(mut map) = self.indices.lock() else {
+            return false;
+        };
+        map.insert(build.workspace_id.clone(), index);
+        true
+    }
+
+    /// 结束一次失败 / 首轮无结果的构建，保留旧缓存。
+    pub fn abandon(&self, build: &IndexBuild) {
+        if let Ok(mut builds) = self.builds.lock() {
+            builds.remove(&build.workspace_id);
+        }
+    }
+
+    /// 丢弃索引并作废在途构建（关闭工作区时调用）。
+    pub fn drop_index(&self, workspace_id: &str) {
+        if let Ok(mut builds) = self.builds.lock() {
+            builds.remove(workspace_id);
+        }
+        if let Ok(mut map) = self.indices.lock() {
+            map.remove(workspace_id);
+        }
+    }
+}
+
 /// 全局状态。
 ///
 /// M0 只保存进程启动时刻与取消登记表；M1 起挂上工作区注册表、文件索引缓存
@@ -30,7 +120,10 @@ pub struct AppState {
     /// 已打开的工作区。协议里每个工作区都有独立 id，注册表天然支持多例。
     workspaces: WorkspaceManager,
     /// 各工作区的文件路径索引，键为 `workspace_id`。
-    indices: Mutex<HashMap<String, Arc<FileIndex>>>,
+    ///
+    /// 用 `Arc<IndexRegistry>` 而不是裸 `Mutex<HashMap>`：后台索引任务要在
+    /// `tokio::spawn` 之后写回结果（见 [`IndexRegistry`]）。
+    indices: Arc<IndexRegistry>,
     /// 当前活动工作区；协议中不带 `workspace_id` 的方法默认作用于它。
     active: Mutex<Option<String>>,
     /// 对端句柄，用于主动推送事件。单测里不注入，事件静默丢弃。
@@ -108,7 +201,7 @@ impl AppState {
             started_at: Instant::now(),
             cancelled: Mutex::new(HashSet::new()),
             workspaces: WorkspaceManager::new(),
-            indices: Mutex::new(HashMap::new()),
+            indices: Arc::new(IndexRegistry::default()),
             active: Mutex::new(None),
             peer: Mutex::new(None),
             // 用默认落盘路径起步；单测用 `with_llm_runtime` 换成临时目录 + 替身传输。
@@ -295,21 +388,22 @@ impl AppState {
 
     /// 取已建好的索引。
     pub fn index(&self, workspace_id: &str) -> Option<Arc<FileIndex>> {
-        self.indices.lock().ok()?.get(workspace_id).map(Arc::clone)
+        self.indices.get(workspace_id)
+    }
+
+    /// 索引缓存句柄（后台索引任务用）。
+    pub fn indices_handle(&self) -> Arc<IndexRegistry> {
+        Arc::clone(&self.indices)
     }
 
     /// 缓存索引。
     pub fn put_index(&self, workspace_id: &str, index: Arc<FileIndex>) {
-        if let Ok(mut map) = self.indices.lock() {
-            map.insert(workspace_id.to_string(), index);
-        }
+        self.indices.put(workspace_id, index);
     }
 
-    /// 丢弃索引（关闭工作区时调用）。
+    /// 丢弃索引（关闭工作区时调用），同时作废在途的后台构建。
     pub fn drop_index(&self, workspace_id: &str) {
-        if let Ok(mut map) = self.indices.lock() {
-            map.remove(workspace_id);
-        }
+        self.indices.drop_index(workspace_id);
     }
 
     /// 已打开的工作区数量。
@@ -329,6 +423,51 @@ pub fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn index_build_is_single_flight() {
+        let registry = IndexRegistry::default();
+        let build = registry.begin_build("ws-1").expect("首次登记应成功");
+        assert!(registry.is_building("ws-1"));
+        assert!(
+            registry.begin_build("ws-1").is_none(),
+            "同一工作区不允许并发建两次索引"
+        );
+
+        let index =
+            Arc::new(FileIndex::build(&empty_dir("single-flight")).expect("空目录可建索引"));
+        assert!(registry.store_if_current(&build, index));
+        assert!(!registry.is_building("ws-1"), "构建结束后应摘掉登记");
+        assert!(registry.get("ws-1").is_some(), "结果应写回缓存");
+    }
+
+    #[test]
+    fn close_during_build_discards_result() {
+        let registry = IndexRegistry::default();
+        let build = registry.begin_build("ws-2").expect("首次登记应成功");
+        // 构建途中关掉工作区：索引缓存被丢，在途构建必须作废。
+        registry.drop_index("ws-2");
+        let index = Arc::new(FileIndex::build(&empty_dir("discard")).expect("空目录可建索引"));
+        assert!(
+            !registry.store_if_current(&build, index),
+            "工作区已关闭，迟到的构建结果必须作废"
+        );
+        assert!(
+            registry.get("ws-2").is_none(),
+            "作废的索引不得留在缓存里（否则关掉的工作区仍会被搜索到）"
+        );
+        assert!(!registry.is_building("ws-2"));
+    }
+
+    /// 建一个只属于本用例的空目录：索引构建要真读盘，但内容为空就够验证登记语义。
+    fn empty_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ai-ide-index-registry-{tag}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        dir
+    }
 
     #[test]
     fn uptime_is_monotonic() {

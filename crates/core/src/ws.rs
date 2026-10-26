@@ -15,19 +15,20 @@ use crate::peer::Peer;
 use crate::state::AppState;
 use ai_ide_indexer::{grep, symbols, FileIndex, IndexError};
 use ai_ide_protocol::dto::{
-    OkResult, SearchContentParams, SearchFilesParams, SearchSymbolsParams, WorkspaceChangedEvent,
-    WorkspaceCloseParams, WorkspaceCreateParams, WorkspaceDeleteParams, WorkspaceOpenParams,
-    WorkspaceOpenResult, WorkspaceReadFileParams, WorkspaceRenameParams, WorkspaceRevealParams,
+    OkResult, SearchContentParams, SearchFilesParams, SearchFilesResult, SearchSymbolsParams,
+    SearchSymbolsResult, WorkspaceChangedEvent, WorkspaceCloseParams, WorkspaceCreateParams,
+    WorkspaceDeleteParams, WorkspaceIndexedEvent, WorkspaceOpenParams, WorkspaceOpenResult,
+    WorkspaceReadFileParams, WorkspaceRenameParams, WorkspaceRevealParams, WorkspaceStats,
     WorkspaceTreeParams, WorkspaceTreeResult, WorkspaceWriteFileParams,
 };
 use ai_ide_protocol::{methods, ErrorObject, PathChange, Request};
 use ai_ide_workspace::{fs_ops, Workspace, WorkspaceError};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::task;
 use tokio::time::timeout;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
 // 错误适配
@@ -87,19 +88,14 @@ pub async fn open(peer: &Peer, state: &AppState, req: &Request) {
         Err(err) => return peer.respond_error(&req.id, &ws_error(&err)).await,
     };
 
-    // 索引命中缓存就复用；否则现建。重复 open 同一目录不会重复遍历。
-    let stats = match state.index(&workspace.id) {
-        Some(index) => index.stats(),
+    // 索引不在请求路径上同步建：首次打开先回一份「索引中」快照（空统计 + indexing），
+    // 遍历交给后台任务，就绪后由 `workspace.indexed` 推送真实规模。大库首次打开
+    // 因此不再被整库遍历阻塞。缓存命中则照旧直接复用。
+    let (stats, indexing) = match state.index(&workspace.id) {
+        Some(index) => (index.stats(), false),
         None => {
-            let root = workspace.root.clone();
-            match blocking(move || FileIndex::build(&root)).await {
-                Ok(index) => {
-                    let stats = index.stats();
-                    state.put_index(&workspace.id, Arc::new(index));
-                    stats
-                }
-                Err(err) => return peer.respond_error(&req.id, &err).await,
-            }
+            spawn_index_build(state, &workspace);
+            (WorkspaceStats::default(), true)
         }
     };
 
@@ -134,8 +130,8 @@ pub async fn open(peer: &Peer, state: &AppState, req: &Request) {
         root: workspace.root.display().to_string(),
         name: workspace.name.clone(),
         stats,
-        // 索引是同步建完才回的，所以这里恒为 false。
-        indexing: false,
+        // 首次打开时索引在后台建，这里为真；缓存命中时为假。
+        indexing,
     };
     peer.respond(&req.id, &result).await;
 }
@@ -447,40 +443,93 @@ fn reveal_in_explorer(abs: &Path) -> Result<(), WorkspaceError> {
 // search.files / search.content
 // ---------------------------------------------------------------------------
 
-/// 取（或兜底建）工作区的文件索引。
+/// 起一次后台索引构建（同一工作区同一时刻最多一个）。
 ///
-/// 符号检索复用同一份索引，不自己再遍历目录：否则「忽略规则」「隐藏文件」会有
-/// 两份实现，迟早出现「树里看不见、符号却能搜到」。
-async fn ensure_index(
-    peer: &Peer,
-    state: &AppState,
-    req_id: &str,
-    workspace_id: &str,
-) -> Option<Arc<FileIndex>> {
-    if let Some(index) = state.index(workspace_id) {
-        return Some(index);
-    }
-
-    // 正常路径下 open 已经建好索引；这里兜底，避免「先搜索后打开」的调用直接失败。
-    let workspace = match state.workspace(Some(workspace_id)) {
-        Ok(workspace) => workspace,
-        Err(err) => {
-            peer.respond_error(req_id, &ws_error(&err)).await;
-            return None;
-        }
+/// 构建放阻塞池（遍历 + `ignore` 规则是纯磁盘活），完成后写回缓存并向对端推
+/// `workspace.indexed`。工作区在途中被关掉时结果会被 [`IndexRegistry::store_if_current`]
+/// 判为作废：既不留缓存，也不推事件——「关掉的工作区还在推送」是最难解释的一种泄漏。
+fn spawn_index_build(state: &AppState, workspace: &Arc<Workspace>) {
+    let registry = state.indices_handle();
+    let Some(build) = registry.begin_build(&workspace.id) else {
+        // 已经在建：重复 open、或打开后立刻搜索，都会走到这里。
+        return;
     };
     let root = workspace.root.clone();
-    match blocking(move || FileIndex::build(&root)).await {
-        Ok(index) => {
-            let index = Arc::new(index);
-            state.put_index(&workspace.id, Arc::clone(&index));
-            Some(index)
+    let workspace_id = workspace.id.clone();
+    let root_label = root.display().to_string();
+    let peer = state.peer();
+    tokio::spawn(async move {
+        let started = Instant::now();
+        let built = task::spawn_blocking(move || FileIndex::build(&root)).await;
+        match built {
+            Ok(Ok(index)) => {
+                let duration_ms = started.elapsed().as_millis() as u64;
+                let stats = index.stats();
+                if !registry.store_if_current(&build, Arc::new(index)) {
+                    debug!(
+                        workspace_id = %workspace_id,
+                        "索引构建完成但工作区已关闭，结果丢弃"
+                    );
+                    return;
+                }
+                info!(
+                    workspace_id = %workspace_id,
+                    root = %root_label,
+                    files = stats.files,
+                    dirs = stats.dirs,
+                    duration_ms,
+                    "后台索引已就绪"
+                );
+                if let Some(peer) = peer {
+                    // 全量重建：`incremental` 恒为假，字段先占位（见协议 DTO 注释）。
+                    peer.notify(
+                        methods::event::WORKSPACE_INDEXED,
+                        &WorkspaceIndexedEvent {
+                            workspace_id: workspace_id.clone(),
+                            stats,
+                            duration_ms,
+                            incremental: false,
+                        },
+                    )
+                    .await;
+                }
+            }
+            Ok(Err(err)) => {
+                registry.abandon(&build);
+                warn!(
+                    workspace_id = %workspace_id,
+                    root = %root_label,
+                    error = %err,
+                    "后台索引失败，检索保持降级"
+                );
+            }
+            Err(err) => {
+                registry.abandon(&build);
+                warn!(
+                    workspace_id = %workspace_id,
+                    error = %err,
+                    "后台索引任务异常退出"
+                );
+            }
         }
-        Err(err) => {
-            peer.respond_error(req_id, &err).await;
-            None
-        }
+    });
+}
+
+/// 取**已就绪**的索引；未就绪则启动后台构建并返回 `Ok(None)`。
+///
+/// `Err` 只表示工作区不存在（调用方要报 1001）；「还没建好」不是错误，而是降级：
+/// 调用方回空结果 + `indexing: true`，让前端提示「索引中」而不是「没有这个文件」。
+fn ready_index(
+    state: &AppState,
+    workspace_id: &str,
+) -> Result<Option<Arc<FileIndex>>, WorkspaceError> {
+    if let Some(index) = state.index(workspace_id) {
+        return Ok(Some(index));
     }
+    // 兜底「先搜索后打开」：不是当场建，而是把构建踢到后台，本次请求先降级。
+    let workspace = state.workspace(Some(workspace_id))?;
+    spawn_index_build(state, &workspace);
+    Ok(None)
 }
 
 pub async fn search_files(peer: &Peer, state: &AppState, req: &Request) {
@@ -489,22 +538,17 @@ pub async fn search_files(peer: &Peer, state: &AppState, req: &Request) {
         Err(err) => return peer.respond_error(&req.id, &err).await,
     };
 
-    let index = match state.index(&params.workspace_id) {
-        Some(index) => index,
-        None => {
-            // 正常路径下 open 已经建好索引；这里兜底，避免「先搜索后打开」的调用直接失败。
-            let workspace = match state.workspace(Some(&params.workspace_id)) {
-                Ok(workspace) => workspace,
-                Err(err) => return peer.respond_error(&req.id, &ws_error(&err)).await,
+    let index = match ready_index(state, &params.workspace_id) {
+        Ok(Some(index)) => index,
+        Ok(None) => {
+            // 索引还在后台建：给降级形状（空表 + 就绪标记），请求不为此等待整库遍历。
+            let result = SearchFilesResult {
+                matches: Vec::new(),
+                indexing: true,
             };
-            let root = workspace.root.clone();
-            let index = match blocking(move || FileIndex::build(&root)).await {
-                Ok(index) => Arc::new(index),
-                Err(err) => return peer.respond_error(&req.id, &err).await,
-            };
-            state.put_index(&workspace.id, Arc::clone(&index));
-            index
+            return peer.respond(&req.id, &result).await;
         }
+        Err(err) => return peer.respond_error(&req.id, &ws_error(&err)).await,
     };
 
     // 模糊匹配要在整个索引上跑一遍，放阻塞池，别占 async worker。
@@ -550,8 +594,17 @@ pub async fn search_symbols(peer: &Peer, state: &AppState, req: &Request) {
         Err(err) => return peer.respond_error(&req.id, &err).await,
     };
 
-    let Some(index) = ensure_index(peer, state, &req.id, &params.workspace_id).await else {
-        return;
+    let index = match ready_index(state, &params.workspace_id) {
+        Ok(Some(index)) => index,
+        Ok(None) => {
+            // 与 `search.files` 同一套降级：索引未就绪时回空表 + 就绪标记。
+            let result = SearchSymbolsResult {
+                symbols: Vec::new(),
+                indexing: true,
+            };
+            return peer.respond(&req.id, &result).await;
+        }
+        Err(err) => return peer.respond_error(&req.id, &ws_error(&err)).await,
     };
 
     // 逐文件读盘 + 正则匹配是纯 CPU / IO 活，放阻塞池，别占 async worker。

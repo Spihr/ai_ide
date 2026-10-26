@@ -111,6 +111,35 @@ impl Core {
         response.get("result").cloned().unwrap_or(Value::Null)
     }
 
+    /// 等一条指定方法的通知（`workspace.indexed` 等），期间收到的其它帧先攒着。
+    fn wait_notification(&mut self, method: &str) -> Value {
+        if let Some(position) = self
+            .pending_events
+            .iter()
+            .position(|event| event.get("method").and_then(Value::as_str) == Some(method))
+        {
+            return self.pending_events.remove(position);
+        }
+        loop {
+            let value = self.read_frame(method);
+            if value.get("method").and_then(Value::as_str) == Some(method) {
+                return value;
+            }
+            self.pending_events.push(value);
+        }
+    }
+
+    /// 等某个工作区的索引就绪事件，返回事件的 `params`（报文里的真实载荷）。
+    fn wait_indexed(&mut self, workspace_id: &str) -> Value {
+        loop {
+            let event = self.wait_notification("workspace.indexed");
+            let params = event.get("params").cloned().unwrap_or(Value::Null);
+            if params.get("workspace_id").and_then(Value::as_str) == Some(workspace_id) {
+                return params;
+            }
+        }
+    }
+
     /// 取请求的协议错误码。
     fn error_code(&mut self, method: &str, params: Value) -> i64 {
         let response = self.call(method, params);
@@ -205,7 +234,7 @@ fn 完整链路_打开_树_读写_检索_关闭() {
     assert!(capabilities.contains(&"workspace.read_file".to_string()));
     assert!(capabilities.contains(&"search.content".to_string()));
 
-    // 2) 打开工作区：索引随 open 一起建好。
+    // 2) 打开工作区：索引在后台建（open 不再同步等整库遍历），先拿到 `indexing` 标记。
     let workspace_id = open(&mut core, &ws_dir.root);
 
     // 3) 目录树：一层、按「目录优先」排序，忽略项不返回。
@@ -258,6 +287,8 @@ fn 完整链路_打开_树_读写_检索_关闭() {
     assert_eq!(conflict, 3003, "写入冲突应复用 3003");
 
     // 7) 文件名模糊检索：`mnrs` 是 `main.rs` 的子序列。
+    //    检索依赖后台索引，先等 `workspace.indexed` 就绪（事件必须真的到达）。
+    core.wait_indexed(&workspace_id);
     let files = core.ok(
         "search.files",
         json!({ "workspace_id": workspace_id, "query": "mnrs" }),
@@ -360,6 +391,8 @@ fn 符号检索_走分发_支持种类过滤与空结果() {
     let ws_dir = TempWorkspace::new("symbols");
     let mut core = Core::spawn();
     let workspace_id = open(&mut core, &ws_dir.root);
+    // 符号检索同样吃后台索引：等就绪事件到了再断言命中。
+    core.wait_indexed(&workspace_id);
 
     // 1) 基础命中：`main` 是 `src/main.rs` 里的函数，range 落在第 1–3 行。
     let hit = core.ok(
@@ -404,4 +437,116 @@ fn 符号检索_走分发_支持种类过滤与空结果() {
         json!({ "workspace_id": "00000000-0000-4000-8000-000000000000", "query": "main" }),
     );
     assert_eq!(unknown, 1001, "未知工作区应返回 1001");
+}
+
+/// 后台索引（本轮任务）：三条可观测行为必须同时成立。
+///
+/// 1. `workspace.open` 不再同步等整库遍历——首次打开回 `indexing: true` + 空统计；
+/// 2. 索引未就绪时的检索请求不被阻塞，回降级形状（空表 + `indexing: true`），
+///    而不是把「还没扫完」说成「没有」；
+/// 3. 索引完成后内核主动推 `workspace.indexed`，载荷是真实字段
+///    （`workspace_id` / `stats` 的 files·dirs·ignored / `duration_ms` / `incremental`）。
+///
+/// 为什么要造 1500 个文件：小目录的构建可能在一帧之内跑完，`indexing: true` 这条
+/// 断言会随机器快慢飘。把库撑到「必然要花几毫秒」，断言才稳定、才不是靠运气绿。
+#[test]
+fn 后台索引_打开不阻塞_完成推送workspace_indexed() {
+    let ws_dir = TempWorkspace::new("async-index");
+    for index in 0..1500 {
+        std::fs::write(
+            ws_dir.root.join("src").join(format!("mod_{index}.rs")),
+            format!("pub fn helper_{index}() {{}}\n"),
+        )
+        .expect("写源文件");
+    }
+
+    let mut core = Core::spawn();
+    let opened = core.ok(
+        "workspace.open",
+        json!({ "path": ws_dir.root.display().to_string() }),
+    );
+    let workspace_id = opened["workspace_id"]
+        .as_str()
+        .expect("workspace_id 必须是字符串")
+        .to_string();
+    assert_eq!(
+        opened["indexing"],
+        json!(true),
+        "首次打开必须回「索引中」而不是等整库遍历：{opened}"
+    );
+    assert_eq!(
+        opened["stats"]["files"],
+        json!(0),
+        "索引中时的统计是空快照：{opened}"
+    );
+
+    // 2) 打开后立刻检索：允许「已经建完」，但不允许「空表 + indexing:false」这种
+    //    把未就绪伪装成没有结果的形状。
+    let immediate = core.ok(
+        "search.symbols",
+        json!({ "workspace_id": workspace_id, "query": "helper_1" }),
+    );
+    assert!(
+        immediate.get("indexing").is_some(),
+        "search.symbols 必须带就绪标记：{immediate}"
+    );
+    if immediate["indexing"] == json!(true) {
+        assert_eq!(
+            immediate["symbols"].as_array().map(Vec::len),
+            Some(0),
+            "未就绪时必须是空表的降级结果：{immediate}"
+        );
+    }
+    let immediate_files = core.ok(
+        "search.files",
+        json!({ "workspace_id": workspace_id, "query": "mod_1" }),
+    );
+    assert!(
+        immediate_files.get("indexing").is_some(),
+        "search.files 必须带同一个就绪标记：{immediate_files}"
+    );
+
+    // 3) 后台建完：内核主动推事件，字段一个都不能少。
+    let indexed = core.wait_indexed(&workspace_id);
+    assert!(
+        indexed["stats"]["files"].as_u64().unwrap_or(0) >= 1500,
+        "文件数必须覆盖全部源文件：{indexed}"
+    );
+    assert!(
+        indexed["stats"]["dirs"].as_u64().unwrap_or(0) >= 1,
+        "目录数至少要含 src：{indexed}"
+    );
+    assert!(
+        indexed["stats"]["ignored"].is_u64(),
+        "ignored 是整数：{indexed}"
+    );
+    assert!(indexed["duration_ms"].is_u64(), "耗时是毫秒整数：{indexed}");
+    assert_eq!(
+        indexed["incremental"],
+        json!(false),
+        "当前每次都是全量重建：{indexed}"
+    );
+
+    // 4) 就绪后同一查询：标记归位，结果真的出来了。
+    let after = core.ok(
+        "search.symbols",
+        json!({ "workspace_id": workspace_id, "query": "helper_1" }),
+    );
+    assert_eq!(
+        after["indexing"],
+        json!(false),
+        "索引就绪后不应再标索引中：{after}"
+    );
+    let symbols = after["symbols"].as_array().expect("symbols 是数组");
+    assert!(
+        symbols
+            .iter()
+            .any(|symbol| symbol["name"] == json!("helper_1")),
+        "就绪后应命中 helper_1：{after}"
+    );
+    assert_eq!(
+        symbols[0]["path"],
+        json!("src/mod_1.rs"),
+        "path 是相对工作区根、以 / 分隔的路径"
+    );
 }

@@ -249,6 +249,9 @@ impl FileIndex {
             .clamp(1, 2000);
         SearchFilesResult {
             matches: self.search_files(&params.query, params.glob.as_deref(), limit),
+            // 索引已在手上，这份结果就是完整的——降级标记只在「索引还没建好」时为真，
+            // 那个判断在内核的请求路径上，不在索引自己身上。
+            indexing: false,
         }
     }
 }

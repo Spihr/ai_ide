@@ -8,4 +8,15 @@ export type WorkspaceIndexedEvent = { workspace_id: string,
 /**
  * 最终规模统计。
  */
-stats: WorkspaceStats, };
+stats: WorkspaceStats, 
+/**
+ * 本次构建耗时（毫秒），从开始遍历到索引可用。
+ */
+duration_ms: number, 
+/**
+ * 是否为增量构建。
+ *
+ * 当前内核每次都是全量重建（`false`）；字段先占位，等增量重建落地后
+ * 前端不必再改协议就能区分「补扫了几个文件」与「重扫了整库」。
+ */
+incremental: boolean, };

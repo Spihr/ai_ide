@@ -8,4 +8,8 @@ export type SearchSymbolsResult = {
 /**
  * 命中上限由内核固定（200 条），按相关度排序。
  */
-symbols: Array<Symbol>, };
+symbols: Array<Symbol>, 
+/**
+ * 索引是否仍在后台构建；`true` 时 `symbols` 是降级结果（可能为空）。
+ */
+indexing: boolean, };
