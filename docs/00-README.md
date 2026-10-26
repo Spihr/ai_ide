@@ -72,15 +72,15 @@
 - `session.*`：`create` / `list` / `get` / `update` / `delete` / `append_message` / `messages` / `export`（Markdown / JSON，`out_path` 由系统保存对话框决定）/ `fork`；`audit.list` 只读查询（会话创建 / 更新 / 删除 / 导出 / 分叉留痕，存储层已脱敏）
 - `checkpoint.*`：`create`（手动快照，或由 Agent 写入钩子自动留痕）/ `list` / `restore`（回滚后逐文件重算 SHA-256 复核，结果折成 `verified`）/ `delete`；快照内容落 `<data_dir>/checkpoints/<工作区键>/<检查点 id>/`，单文件 8 MiB、单检查点 5000 文件 / 256 MiB 上限，超限计入 `skipped`
 - `permission.*`：`list` / `revoke`；`allow_always` 决定经 `permission_rule` 表持久化（迁移 `0003_permission_rule.sql`），重启后仍生效，可按工作区撤销
-- 日志：`<data_dir>/logs/core-YYYY-MM-DD.jsonl`（一行一条 JSON，按天滚动 + 单文件 32 MiB 上限），出口复用 `ai_ide_store::redact` 的同一套脱敏规则；插件日志另起一族 `<data_dir>/logs/plugin-YYYY-MM-DD.jsonl`（`host/log` 的磁盘副本，同滚动 / 同脱敏，前缀 `plugin`）；外壳侧还有 `<userData>/logs/core-shell-YYYY-MM-DD.log`（内核 stderr 与 `core.log` 事件的原始文本，8 MiB 滚动）；`AI_IDE_LOG_JSONL` / `AI_IDE_LOG_REDACT` / `AI_IDE_LOG_DIR` / `AI_IDE_LOG_PROBE` 四个开关
+- 日志：`<data_dir>/logs/core-YYYY-MM-DD.jsonl`（一行一条 JSON，按天滚动 + 单文件 32 MiB 上限），出口复用 `ai_ide_store::redact` 的同一套脱敏规则；插件日志另起一族 `<data_dir>/logs/plugin-YYYY-MM-DD.jsonl`（`host/log` 的磁盘副本，同滚动 / 同脱敏，前缀 `plugin`）；外壳侧还有 `<userData>/logs/core-shell-YYYY-MM-DD.log`（内核 stderr 与 `core.log` 事件的原始文本，8 MiB 滚动）；`AI_IDE_LOG_JSONL` / `AI_IDE_LOG_REDACT` / `AI_IDE_LOG_DIR` / `AI_IDE_LOG_PROBE` / `AI_IDE_CORE_LOG_PUSH` 五个开关（最后一个只关 `core.log` 事件推送，不影响 stderr 与 JSONL 落盘）
 - `provider.*` / `model.*`：`upsert` / `list` / `delete`（provider 另有 `test`）；目录落盘 `AI_IDE_DATA_DIR/providers.json`，密钥经 `ai-ide-llm` 的 `secret` 模块加密后存储
 - `llm.*`：`chat_stream`（流式，支持 `context.refs` 注入为前置 `system` 消息）、`cancel`、`list_models`、`count_tokens`（按模型族分流 tiktoken 精确计数 / 估算回落，`messages[]` 与 `texts[]` 相加）；上游协议为 OpenAI Chat Completions 兼容
 - 事件：`workspace.changed`、`provider.changed`、`llm.started` / `delta` / `reasoning` / `tool_call` / `usage` / `finished` / `error`、`terminal.data` / `terminal.exit`、`lsp.diagnostics`、`plugin.*` 四类审计与进度事件
 - 外壳能力：主进程策略闸门、内核进程监管与优雅退出、preload 能力收窄、渲染端工作区/文件树/多标签/搜索状态机与 Monaco 集成；M5 会话面板、检查点面板（列表 / 手动快照 / 回滚确认 / 删除）与权限面板（列表 / 撤销）及落盘桥（导出落点只经系统保存对话框、白名单按方法逐个放行）
 
-### 尚未实现（截至 2026-10-25）
+### 尚未实现（截至 2026-10-26）
 
-- 协议面：`workspace.indexed` / `core.log` 两个事件仍是主动推送缺口（`IMPLEMENTED` 现为 **80** 项——P5 切片八补 `plugin.load_many` 后从 79 涨到 80，`DECLARED_NOT_IMPLEMENTED` 为空表；`terminal.*` / `git.*` / `mcp.*` / `plugin.*` / `lsp.*` / `search.symbols` / `inline_edit.propose` 均已进常量表并由 `crates/core` 接线，本文旧版把这几组写作「未进协议常量表」属倒挂，已订正）；`core.log` 只剩内核侧未推，外壳侧已接齐（主进程映射 → 落盘 `core-shell-*.log` → 渲染端订阅 → 状态栏最近一行）
+- 协议面：`workspace.indexed` 仍是主动推送缺口（`IMPLEMENTED` 现为 **80** 项——P5 切片八补 `plugin.load_many` 后从 79 涨到 80，`DECLARED_NOT_IMPLEMENTED` 为空表；`terminal.*` / `git.*` / `mcp.*` / `plugin.*` / `lsp.*` / `search.symbols` / `inline_edit.propose` 均已进常量表并由 `crates/core` 接线，本文旧版把这几组写作「未进协议常量表」属倒挂，已订正）；`core.log` 已闭合成**双向**通道：内核 `CoreLogLayer` 主动推送 → 主进程映射 → 落盘 `core-shell-*.log` → 渲染端订阅 → 状态栏最近一行
 - 模块：`parser`（tree-sitter 符号表尚未引入，`search.symbols` 走的是自研文本抽取）
 - 界面：Tab 补全、列表与审计分页加载、消息级分叉入口未开工；已接入渲染端的有 M2 Provider 配置 / 对话面板、M3 `@` 补全与引用 chip、M4 Agent 运行面板与审批卡片、M5 会话 / 检查点 / 权限面板、M6 终端与 Git 面板、M7 MCP 面板、符号浮层（`Ctrl+T`）、Inline Edit 浮层（`Ctrl+K`）与 LSP 状态 / 重启命令
 - LSP 侧：语言服务器需本机自备（按 `crates/lsp/src/registry.rs` 探测并探测失败即降级为「不可用」，未内置下载 / 安装）；格式化、重命名、代码动作等未接 Monaco provider；多根工作区只起工作区根那一份连接
@@ -103,7 +103,18 @@
 
 本轮改动要点：`plugin.load_many` 进 `IMPLEMENTED`（79 → 80，四处同步：Rust `methods.rs`、`packages/shared-types/src/index.ts`、`methods-contract.test.ts` 的 `toHaveLength(80)`、`main/policy.ts` 白名单，另附 ts-rs 生成的 4 个 `PluginLoadMany*` / `PluginLoadFailure` 类型）；`Host` 增 per-id `tokio::sync::Mutex` 装载闸门（`load` / `unload` 共用，同 id 并发只起一个进程，不同 id 仍并行）；`plugin.log` 由 `DailyJsonlWriter` 换前缀族追加到 `plugin-*.jsonl`；外壳 `core-log-file.ts` + `core-log-store.ts` 把 `core.log` 事件与 stderr 一起落盘并接到状态栏。
 
-**未做**：内核侧 `core.log` 主动推送仍是缺口；`load_many` 只在内核侧提供协议方法与调度（默认并发 4、硬上限 16、单次最多 32 个插件），渲染端尚无批量装载入口。
+### 质量门禁实测（2026-10-26，插件 P5 切片九：内核 core.log 推送 + 渲染端批量启用）
+
+- `cargo fmt --all --check`：退出码 0（无 diff）。
+- `cargo clippy --workspace --all-targets -- -D warnings`：退出码 0（构建期仍有 ts-rs 的 `failed to parse serde attribute` 噪声，来自第三方 proc-macro，非本项目代码）。
+- `cargo test --workspace`：**50 个测试目标（38 个测试二进制 + 12 组 Doc-tests），1317 passed / 0 failed / 9 ignored**。本轮新增 `crates/core/src/core_log.rs` 9 项（转发 / 未装 sink 不做事 / 转发回调内再打日志不递归 / 本模块 target 不上报 / 密钥打码 / `AI_IDE_LOG_REDACT=off` 可关 / 按字符截断 4 KiB / 级别小写 / 通道端到端），既有 1308 项全部保持通过。
+- `pnpm typecheck`（`tsc --noEmit`）：退出码 0。首跑在 `plugin-store.test.ts:931-932` 报 `TS2532`（`failures[0]` 可能为 undefined），改用可选链后复跑通过。
+- `pnpm test`（vitest）：**29 文件 526 项全过**，其中 `plugin-store.test.ts` 42 项（本轮新增批量装载 12 项：候选筛选 / 参数透传 / 进度逐条推进 / 部分失败不影响成功项 / 未知 id 记 6101 / 失败项可单独重试 / 结果条人话 / 重新拉清单）、`plugin-api.test.ts` 15 项。
+- `pnpm lint`（`eslint .`）：退出码 0，零告警输出。
+
+本轮改动要点：内核新增 `crates/core/src/core_log.rs`（`CoreLogLayer` + 无界通道 + `pump`），在 `init_tracing` 挂 layer、在 `run()` 里拿到 `Peer` 后装落点并起泵，把 tracing 事件抬成 `core.log` 通知；防递归三层（线程本地重入闸门 `Pushing` / 本模块 `PUSH_TARGET` 前缀丢弃 / `crate::peer` 自身日志不上报），脱敏复用 `ai_ide_store::redact_text`、超长按 4 KiB 截断，`AI_IDE_CORE_LOG_PUSH=off` 可只留文件出口。渲染端新增「全部启用（N）」按钮（候选 = 已停用 + 已崩溃，按下前就显示会起几个进程），进度取内核广播的 `plugin.state_changed`，结果条逐行给失败插件、错误码与人话原因，支持单项重试，失败不牵连成功项。
+
+**未做**：`workspace.indexed` 主动推送仍是缺口；批量装载的并发上限沿用内核默认（4）/ 硬上限（16）/ 单批 32 个，渲染端暂不提供滑杆。
 
 ## 建议阅读顺序
 
