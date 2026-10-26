@@ -26,6 +26,7 @@ import {
   describePluginError,
   pluginApi,
   pluginErrorIssues,
+  pluginHintForError,
   type PluginIssue
 } from './plugin-api'
 
@@ -50,6 +51,79 @@ export type PluginBusyAction =
 export interface PendingRevoke {
   pluginId: string
   capability: string
+}
+
+/**
+ * 批量装载里**单个**插件的失败。
+ *
+ * 内核把「谁没起来、为什么」放在 `items[].error` 里（`code` + `message`），而不是
+ * 让整批变成一次 JSON-RPC 错误——5 个里挂 1 个时，调用方要的是另外 4 个的结果
+ * 加上这 1 个的原因。所以这里也逐条留，不折叠成一句话。
+ */
+export interface PluginBatchFailure {
+  pluginId: string
+  code: number
+  message: string
+  /** 由 `code` 翻出来的人话（认不出的码为空串）。 */
+  hint: string
+}
+
+/**
+ * 「全部启用」一次批量的进度与结局。
+ *
+ * `done` 的推进有两条路：装载期间靠 `plugin.state_changed`（内核每落一次账本就广播
+ * 一次，`ready` / `crashed` / `needs_grant` 都是终态），请求返回后按 `items` 一次性
+ * 补齐。两条路都走 `counted` 去重，否则同一次装载会把进度算两遍——面板上的
+ * 「3 / 5」突然跳到「6 / 5」比不显示进度更糟。
+ */
+export interface PluginBatchState {
+  /** 本次请求的插件 id（去重保序，与内核返回的 `items` 同序）。 */
+  requested: string[]
+  total: number
+  done: number
+  /** 已经计入 `done` 的插件 id。 */
+  counted: string[]
+  succeeded: string[]
+  failures: PluginBatchFailure[]
+  /** 内核归一后的实际并发度；请求还没回来时为 `null`。 */
+  maxConcurrent: number | null
+  running: boolean
+}
+
+/** 装载后能到达的终态：出现其中之一就代表这个插件已经结算了。 */
+const BATCH_TERMINAL_STATES: readonly string[] = ['ready', 'crashed', 'needs_grant']
+
+/** 可以被「全部启用」挑中的状态：已经跑着的（`ready`）不必再起，待授权的不许起。 */
+const BATCH_CANDIDATE_STATES: readonly string[] = ['disabled', 'crashed']
+
+/**
+ * 「全部启用」的候选：已停用 + 已崩溃。
+ *
+ * `ready` 排除在外——它本来就在跑，再 `load` 一次只会被内核按 `alive()` 复用，
+ * 白白多一次握手往返；`needs_grant` 也排除，那会必然拿到 `6103`（内核不 spawn），
+ * 批量里塞一堆注定失败的行，只会把真正的失败淹掉。
+ */
+export function loadablePluginIds(plugins: readonly PluginSummary[]): string[] {
+  return plugins
+    .filter((plugin) => BATCH_CANDIDATE_STATES.includes(plugin.state))
+    .map((plugin) => plugin.id)
+}
+
+/** 批量结果的一句话小结（面板与提示共用，便于单测钉住措辞里的数字）。 */
+export function describePluginBatch(batch: PluginBatchState): string {
+  const concurrency = batch.maxConcurrent === null ? '' : `（并发 ${batch.maxConcurrent}）`
+  if (batch.running) {
+    return `正在并发装载 ${batch.total} 个插件${concurrency}：已完成 ${batch.done} / ${batch.total}。`
+  }
+  const failed = batch.failures.length
+  const succeeded = batch.succeeded.length
+  if (failed === 0) {
+    return `已装载 ${succeeded} 个插件${concurrency}，全部成功。`
+  }
+  if (succeeded === 0) {
+    return `${batch.total} 个插件都没能装载${concurrency}：失败原因见下方清单，修好后可单独重试。`
+  }
+  return `已装载 ${batch.total} 个插件${concurrency}：成功 ${succeeded} 个、失败 ${failed} 个。失败的那几个不影响已成功的插件，它们已在运行。`
 }
 
 export interface PluginStoreState {
@@ -83,6 +157,8 @@ export interface PluginStoreState {
   errorDetails: PluginIssue[]
   /** 正在等第二次点击确认的撤销；`null` 表示没有上膛的撤销。 */
   pendingRevoke: PendingRevoke | null
+  /** 最近一次「全部启用」的进度与结局；`null` 表示这次会话还没跑过批量。 */
+  batch: PluginBatchState | null
 }
 
 function initialState(): PluginStoreState {
@@ -99,7 +175,8 @@ function initialState(): PluginStoreState {
     hint: null,
     error: null,
     errorDetails: [],
-    pendingRevoke: null
+    pendingRevoke: null,
+    batch: null
   }
 }
 
@@ -280,6 +357,164 @@ export async function reloadPlugin(pluginId: string): Promise<boolean> {
 }
 
 type RuntimeAction = 'load' | 'unload' | 'reload'
+
+/**
+ * 「全部启用」（P5 切片八）：把当前所有「已停用 / 已崩溃」的插件一次性交给
+ * `plugin.load_many` 并发装载。
+ *
+ * ## 为什么面板要这条，而不是循环调 `load`
+ *
+ * 循环 `load` 是**串行**的：每个插件都要握手一轮，10 个插件就是 10 次往返叠着
+ * 等，中途一个超时还会把后面全堵住。`load_many` 在内核侧用 `buffer_unordered`
+ * 并发起进程，并且**单个失败只落在它自己那一项上**——这正是面板需要的语义：
+ * 5 个里挂 1 个，另外 4 个照常起来。
+ *
+ * ## 进度从哪来
+ *
+ * 请求是一次性的，`onProgress` 这类回调协议里没有。所以进度取自**内核本来就会
+ * 广播的 `plugin.state_changed`**（每次落账本都发一次），由
+ * [`notePluginBatchProgress`] 折算成「已完成 N / 总数」；请求返回后再按 `items`
+ * 一次性补齐（两者共用 `counted` 去重）。
+ *
+ * 失败项**不会被丢掉**：逐条进 `batch.failures`，连带 `hint`（6102/6103 的人话），
+ * 面板按行列出插件名与原因。成功项不受影响，`hint` 里明确说清这一点。
+ */
+export async function loadPluginsMany(pluginIds?: string[]): Promise<boolean> {
+  if (state.batch?.running === true) return false
+  if (state.busyPlugin !== null || state.installing) {
+    // 单插件动作与批量同时进行会让 `busyPlugin` 指向一个「正在被批量装」的插件，
+    // 面板上的按钮状态就说不清了。宁可让用户等这一次。
+    setState({ error: '正在处理另一个装载请求，等它结束后再批量启用。', errorDetails: [] })
+    return false
+  }
+
+  const requested = dedupeIds(pluginIds ?? loadablePluginIds(state.plugins))
+  if (requested.length === 0) {
+    setState({
+      hint: '没有可批量启用的插件：已经在运行的不用再启用，待授权的需要先在详情里授权。',
+      error: null,
+      errorDetails: []
+    })
+    return false
+  }
+  if (requested.length > PLUGIN_BATCH_MAX) {
+    setState({
+      error: `一次最多并发启用 ${PLUGIN_BATCH_MAX} 个插件，当前选中 ${requested.length} 个，请分批。`,
+      errorDetails: []
+    })
+    return false
+  }
+
+  setState({
+    batch: {
+      requested,
+      total: requested.length,
+      done: 0,
+      counted: [],
+      succeeded: [],
+      failures: [],
+      maxConcurrent: null,
+      running: true
+    },
+    error: null,
+    errorDetails: [],
+    hint: null
+  })
+
+  try {
+    const result = await pluginApi.loadMany(requested)
+    const succeeded: string[] = []
+    const failures: PluginBatchFailure[] = []
+    for (const item of result.items) {
+      if (item.error === null) {
+        succeeded.push(item.plugin_id)
+      } else {
+        failures.push({
+          pluginId: item.plugin_id,
+          code: item.error.code,
+          message: item.error.message,
+          hint: pluginHintForError(item.error.code)
+        })
+      }
+    }
+    // 请求返回即「全部结算」：内核按入参顺序回 `items`，缺项不该出现，但真缺了
+    // 也不能让进度条永远卡在 N-1，所以这里直接按总数收口。
+    setState({
+      batch: {
+        requested,
+        total: requested.length,
+        done: requested.length,
+        counted: [...requested],
+        succeeded,
+        failures,
+        maxConcurrent: result.max_concurrent,
+        running: false
+      }
+    })
+    await refreshPlugins()
+    if (state.selectedId !== null) await fetchPluginDetail(state.selectedId)
+    return failures.length === 0
+  } catch (error) {
+    setState({
+      batch: {
+        requested,
+        total: requested.length,
+        done: 0,
+        counted: [],
+        succeeded: [],
+        failures: [],
+        maxConcurrent: null,
+        running: false
+      },
+      error: describePluginError(error),
+      errorDetails: pluginErrorIssues(error)
+    })
+    await refreshPlugins()
+    return false
+  }
+}
+
+/** 一次批量最多多少个插件：与内核 `plugin.load_many` 的单次上限一致。 */
+export const PLUGIN_BATCH_MAX = 32
+
+function dedupeIds(pluginIds: readonly string[]): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const raw of pluginIds) {
+    const id = raw.trim()
+    if (id.length === 0 || seen.has(id)) continue
+    seen.add(id)
+    out.push(id)
+  }
+  return out
+}
+
+/**
+ * 批量装载期间，按 `plugin.state_changed` 推进「已完成」计数。
+ *
+ * 只认本次 `requested` 里的插件、只在 `running` 期间生效、每个 id 只计一次：
+ * 内核装载一个插件会广播多次状态（`loading` → `ready`），把 `loading` 也计数
+ * 就会让进度条跑得比实际快。
+ */
+export function notePluginBatchProgress(pluginId: string, pluginState: string): void {
+  const batch = state.batch
+  if (batch === null || !batch.running) return
+  if (!batch.requested.includes(pluginId)) return
+  if (batch.counted.includes(pluginId)) return
+  if (!BATCH_TERMINAL_STATES.includes(pluginState)) return
+  setState({
+    batch: {
+      ...batch,
+      done: Math.min(batch.total, batch.done + 1),
+      counted: [...batch.counted, pluginId]
+    }
+  })
+}
+
+/** 关掉批量结果条（用户看完失败清单后）。 */
+export function dismissPluginBatch(): void {
+  setState({ batch: null })
+}
 
 /**
  * 三个装载动作的公共骨架：置忙 → 调内核 → 拉清单 → 拉详情 → 收忙。

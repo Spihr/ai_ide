@@ -30,12 +30,17 @@ import type { AiIdeApi } from '../../shared/ipc'
 import { encodeRpcErrorPayload } from '../../shared/ipc'
 import {
   cancelRevoke,
+  describePluginBatch,
+  dismissPluginBatch,
   dismissPluginError,
   getPluginState,
   grantCapabilities,
   initPlugins,
   installPlugin,
+  loadablePluginIds,
   loadPlugin,
+  loadPluginsMany,
+  notePluginBatchProgress,
   refreshPlugins,
   reloadPlugin,
   resetPluginState,
@@ -60,6 +65,10 @@ interface Harness {
   setRemovedDir: (value: boolean) => void
   /** 下一次 load/reload 的结果：成功起进程，还是崩了（内核落 crashed + last_error）。 */
   setLoadOutcome: (value: 'ready' | 'crashed') => void
+  /** 批量装载里指定这些 id 失败（其余照常成功），并指定内核归一后的并发度。 */
+  setBatchFailures: (ids: string[], maxConcurrent?: number) => void
+  /** 让 `plugin.load_many` 整个请求失败（运输层/参数层错误，而非单项失败）。 */
+  setBatchRequestError: (message: string | null) => void
   /** 计数：某个方法被调了几次。 */
   count: (method: string) => number
 }
@@ -86,6 +95,9 @@ function installHarness(): Harness {
   let plugins: PluginSummary[] = [plugin('hello.world', { name: 'Hello' })]
   let removedDir = true
   let loadOutcome: 'ready' | 'crashed' = 'ready'
+  let batchFailures: string[] = []
+  let batchMaxConcurrent = 4
+  let batchRequestError: string | null = null
 
   const api = {
     request: async (method: string, params?: unknown) => {
@@ -165,6 +177,42 @@ function installHarness(): Harness {
             ]
           }
         }
+        case Methods.plugin.loadMany: {
+          // 内核语义：按入参顺序回 items；单项失败只体现在该项 error 上，其余照常成功。
+          if (batchRequestError !== null) throw new Error(batchRequestError)
+          const ids = (p.plugin_ids ?? []) as string[]
+          const items = ids.map((id) => {
+            const index = plugins.findIndex((item) => item.id === id)
+            if (index < 0) {
+              return {
+                plugin_id: id,
+                result: null,
+                error: { code: 6101, message: 'plugin not found' }
+              }
+            }
+            const current = plugins[index] as PluginSummary
+            if (batchFailures.includes(id)) {
+              plugins[index] = {
+                ...current,
+                state: 'crashed',
+                last_error: '子进程退出码 1：入口文件不存在',
+                restarts: current.restarts + 1
+              }
+              return {
+                plugin_id: id,
+                result: null,
+                error: { code: 6102, message: '插件已崩溃，工具已下架' }
+              }
+            }
+            plugins[index] = { ...current, state: 'ready', last_error: undefined }
+            return {
+              plugin_id: id,
+              result: { plugin: { ...plugins[index] }, tools: [] },
+              error: null
+            }
+          })
+          return { items, max_concurrent: batchMaxConcurrent }
+        }
         case Methods.plugin.unload: {
           const id = String(p.plugin_id)
           const index = plugins.findIndex((item) => item.id === id)
@@ -233,6 +281,13 @@ function installHarness(): Harness {
     },
     setLoadOutcome: (value) => {
       loadOutcome = value
+    },
+    setBatchFailures: (ids, maxConcurrent) => {
+      batchFailures = ids
+      if (maxConcurrent !== undefined) batchMaxConcurrent = maxConcurrent
+    },
+    setBatchRequestError: (message) => {
+      batchRequestError = message
     },
     count: (method) => calls.filter((call) => call.method === method).length
   }
@@ -806,3 +861,229 @@ describe('能力授权与撤销', () => {
     expect(state.error).toContain('[6106]')
   })
 })
+
+/**
+ * P5 切片八「全部启用」（`plugin.load_many`）。
+ *
+ * 这里钉的是**批量与串行的差别**：
+ *
+ * - 候选只挑已停用 / 已崩溃——`ready` 再装一次是白跑一趟握手，`needs_grant` 必然
+ *   拿 6103，批量里塞满注定失败的行只会把真失败淹掉；
+ * - **单项失败不牵连其它项**：内核按项回报，store 必须逐项落账，成功的那些照旧
+ *   标记为已装载，而不是整批报红；
+ * - 进度靠 `plugin.state_changed` 折算，且**每个 id 只计一次**（内核装一个插件会
+ *   广播多次状态，全计就会跑出「6 / 5」）。
+ */
+describe('全部启用（批量装载）', () => {
+  const batch = (): PluginSummary[] => [
+    plugin('a.one', { name: 'A', state: 'disabled' }),
+    plugin('b.two', { name: 'B', state: 'crashed', restarts: 1 }),
+    plugin('c.three', { name: 'C', state: 'ready' }),
+    plugin('d.four', { name: 'D', state: 'needs_grant' })
+  ]
+
+  it('候选只要已停用 + 已崩溃，ready 与待授权都不进批量', () => {
+    expect(loadablePluginIds(batch())).toEqual(['a.one', 'b.two'])
+  })
+
+  it('一次请求装入全部候选，params 与协议一致', async () => {
+    const harness = installHarness()
+    harness.setPlugins(batch())
+    await refreshPlugins()
+
+    const ok = await loadPluginsMany()
+    expect(ok).toBe(true)
+
+    expect(harness.count(Methods.plugin.loadMany)).toBe(1)
+    // 逐个点「加载」才是串行的老路：批量入口不许退化成循环 load
+    expect(harness.count(Methods.plugin.load)).toBe(0)
+
+    const request = harness.calls.find((call) => call.method === Methods.plugin.loadMany)
+    expect(request?.params).toEqual({ plugin_ids: ['a.one', 'b.two'], max_concurrent: null })
+
+    const state = getPluginState()
+    expect(state.batch).not.toBeNull()
+    expect(state.batch?.total).toBe(2)
+    expect(state.batch?.done).toBe(2)
+    expect(state.batch?.succeeded).toEqual(['a.one', 'b.two'])
+    expect(state.batch?.failures).toEqual([])
+    expect(state.batch?.running).toBe(false)
+    // 装完要拉清单：行上的状态与工具数都是内核写进账本的
+    expect(harness.count(Methods.plugin.list)).toBeGreaterThanOrEqual(2)
+    expect(state.plugins.find((item) => item.id === 'a.one')?.state).toBe('ready')
+  })
+
+  it('一个插件崩了：其余照常算成功，失败项带码与人话，且不影响已成功的', async () => {
+    const harness = installHarness()
+    harness.setPlugins(batch())
+    await refreshPlugins()
+    harness.setBatchFailures(['b.two'], 3)
+
+    const ok = await loadPluginsMany()
+    // 返回 false 表示「不是全绿」，但请求本身成功了，成功的那些插件已经在跑
+    expect(ok).toBe(false)
+
+    const state = getPluginState()
+    expect(state.batch?.maxConcurrent).toBe(3)
+    expect(state.batch?.succeeded).toEqual(['a.one'])
+    expect(state.batch?.failures).toHaveLength(1)
+    expect(state.batch?.failures[0]).toMatchObject({ pluginId: 'b.two', code: 6102 })
+    expect(state.batch?.failures[0]?.hint.length).toBeGreaterThan(0)
+    expect(state.batch?.failures[0]?.message).toContain('崩溃')
+
+    // 结果条不能是红一片的「全失败」：成功的那一项仍被记为已装载
+    expect(state.plugins.find((item) => item.id === 'a.one')?.state).toBe('ready')
+    expect(state.plugins.find((item) => item.id === 'b.two')?.state).toBe('crashed')
+
+    const summary = describePluginBatch(state.batch!)
+    expect(summary).toContain('成功 1 个')
+    expect(summary).toContain('失败 1 个')
+    expect(summary).toContain('不影响已成功的插件')
+  })
+
+  it('内核不认识的 id 也按单项失败落账（6101），不炸整批', async () => {
+    const harness = installHarness()
+    harness.setPlugins(batch())
+    await refreshPlugins()
+
+    const ok = await loadPluginsMany(['a.one', 'ghost.plugin'])
+    expect(ok).toBe(false)
+
+    const state = getPluginState()
+    expect(state.batch?.succeeded).toEqual(['a.one'])
+    expect(state.batch?.failures[0]).toMatchObject({ pluginId: 'ghost.plugin', code: 6101 })
+  })
+
+  it('入参去重保序：同一个 id 出现在两处只装一次', async () => {
+    const harness = installHarness()
+    harness.setPlugins(batch())
+    await refreshPlugins()
+
+    await loadPluginsMany(['a.one', ' b.two ', 'a.one', ''])
+    const request = harness.calls.find((call) => call.method === Methods.plugin.loadMany)
+    expect(request?.params).toEqual({ plugin_ids: ['a.one', 'b.two'], max_concurrent: null })
+  })
+
+  it('没有候选时不发请求，就地说明原因', async () => {
+    const harness = installHarness()
+    harness.setPlugins([plugin('c.three', { state: 'ready' })])
+    await refreshPlugins()
+
+    const ok = await loadPluginsMany()
+    expect(ok).toBe(false)
+    expect(harness.count(Methods.plugin.loadMany)).toBe(0)
+    expect(getPluginState().hint).toContain('没有可批量启用')
+  })
+
+  it('超过单次上限（32）时不发请求，提示分批', async () => {
+    const harness = installHarness()
+    const many = Array.from({ length: 33 }, (_, index) =>
+      plugin(`p.${index}`, { state: 'disabled' })
+    )
+    harness.setPlugins(many)
+    await refreshPlugins()
+
+    const ok = await loadPluginsMany()
+    expect(ok).toBe(false)
+    expect(harness.count(Methods.plugin.loadMany)).toBe(0)
+    expect(getPluginState().error).toContain('32')
+  })
+
+  it('正在跑单插件动作时不让批量插队', async () => {
+    const harness = installHarness()
+    harness.setPlugins(batch())
+    await refreshPlugins()
+
+    // 造一个「单插件动作在飞」的现场：loadPlugin 未完成时批量必须拒绝
+    const pending = loadPlugin('a.one')
+    const ok = await loadPluginsMany()
+    expect(ok).toBe(false)
+    expect(getPluginState().error).toContain('另一个装载请求')
+
+    // 把这一只请求收口，别把忙标记漏给下一条用例
+    await pending
+  })
+
+  it('整批请求失败（运输层）：错误留下，进度条不留一个永远转的 running', async () => {
+    const harness = installHarness()
+    harness.setPlugins(batch())
+    await refreshPlugins()
+    harness.setBatchRequestError('[5003] ledger io failed')
+
+    const ok = await loadPluginsMany()
+    expect(ok).toBe(false)
+
+    const state = getPluginState()
+    expect(state.error).toContain('[5003]')
+    expect(state.batch?.running).toBe(false)
+    expect(state.batch?.done).toBe(0)
+    expect(state.batch?.succeeded).toEqual([])
+  })
+
+  it('进度按状态事件推进：只认本次候选、只在终态计、每个 id 只计一次', async () => {
+    // 让请求挂住：手动控制 resolve 时机，观察 running 期间的进度
+    let release: () => void = () => {}
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const harness = installHarnessWithGate(gate, batch())
+    // 先让 store 看到清单：候选是从 state.plugins 里挑的，不是从假内核里挑的
+    await refreshPlugins()
+
+    const pending = loadPluginsMany()
+    expect(getPluginState().batch?.running).toBe(true)
+
+    // `loading` 不是终态，不能计数
+    notePluginBatchProgress('a.one', 'loading')
+    expect(getPluginState().batch?.done).toBe(0)
+
+    notePluginBatchProgress('a.one', 'ready')
+    expect(getPluginState().batch?.done).toBe(1)
+    // 同一个插件再来一条终态事件：不重复计
+    notePluginBatchProgress('a.one', 'ready')
+    expect(getPluginState().batch?.done).toBe(1)
+
+    // 不在本次候选里的插件（ready 的老插件）不计
+    notePluginBatchProgress('c.three', 'ready')
+    expect(getPluginState().batch?.done).toBe(1)
+
+    notePluginBatchProgress('b.two', 'crashed')
+    expect(getPluginState().batch?.done).toBe(2)
+
+    release()
+    await pending
+    // 请求收口后再补齐一次，仍然不会超过总数
+    expect(getPluginState().batch?.done).toBe(2)
+    expect(getPluginState().batch?.running).toBe(false)
+    expect(harness.count(Methods.plugin.loadMany)).toBe(1)
+  })
+
+  it('dismissPluginBatch 收起结果条', async () => {
+    const harness = installHarness()
+    harness.setPlugins(batch())
+    await refreshPlugins()
+
+    await loadPluginsMany()
+    expect(getPluginState().batch).not.toBeNull()
+    dismissPluginBatch()
+    expect(getPluginState().batch).toBeNull()
+  })
+})
+
+/**
+ * 让 `plugin.load_many` 停在半路（其余方法照旧即时返回），用来观察 running 期间的进度。
+ */
+function installHarnessWithGate(gate: Promise<void>, plugins: PluginSummary[]): Harness {
+  const harness = installHarness()
+  harness.setPlugins(plugins)
+  const original = (window as unknown as { aiide: AiIdeApi }).aiide
+  const gated = {
+    ...original,
+    request: async (method: string, params?: unknown) => {
+      if (method === Methods.plugin.loadMany) await gate
+      return original.request(method, params)
+    }
+  } as unknown as AiIdeApi
+  vi.stubGlobal('window', { aiide: gated })
+  return harness
+}

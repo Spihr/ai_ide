@@ -43,6 +43,8 @@ import {
   type PluginInstallResult,
   type PluginListParams,
   type PluginListResult,
+  type PluginLoadManyParams,
+  type PluginLoadManyResult,
   type PluginLoadParams,
   type PluginLoadResult,
   type PluginReloadParams,
@@ -270,6 +272,25 @@ export const pluginApi = {
     window.aiide.request(Methods.plugin.load, {
       plugin_id: pluginId
     } satisfies PluginLoadParams) as Promise<PluginLoadResult>,
+
+  /**
+   * 批量装载（`plugin.load_many`，P5 切片八）：一次请求起多个子进程。
+   *
+   * 与 `load` 的差别只在**调度**：不同插件并发装载（内核 `buffer_unordered`），
+   * 并发度由 `maxConcurrent` 归一（缺省 4、`0` 视同缺省、超上限截断），**不是**
+   * 语义参数，写错不会报错。返回的 `items` 顺序与入参一致。
+   *
+   * **部分失败不是请求失败**：某个插件崩了只体现在它自己的 `error` 上，其余照常
+   * 返回结果。整批只在运输层/参数层出错（`-32602`、`5003`）时才抛。
+   */
+  loadMany: (
+    pluginIds: string[],
+    maxConcurrent?: number | null
+  ): Promise<PluginLoadManyResult> =>
+    window.aiide.request(Methods.plugin.loadMany, {
+      plugin_ids: pluginIds,
+      max_concurrent: maxConcurrent ?? null
+    } satisfies PluginLoadManyParams) as Promise<PluginLoadManyResult>,
 
   /**
    * 卸载（停止）：停子进程 + 下架工具，**保留安装目录与账本**。
