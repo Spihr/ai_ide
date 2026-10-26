@@ -265,6 +265,34 @@ export type { GitCommitResult } from "./generated/GitCommitResult";
 export type { GitBranchesParams } from "./generated/GitBranchesParams";
 export type { GitBranchesResult } from "./generated/GitBranchesResult";
 export type { GitBranch } from "./generated/GitBranch";
+
+// ---- git.* 分支切换与远端同步（M6 切片四：checkout / fetch / pull / push）----
+//
+// `GitCheckoutParams.create` 为真走 `-b`，`start_point` 只在新建时生效；`GitPushParams`
+// **没有** `force` 字段，强推只能 `force_with_lease`——外壳必须为它单独做二次确认。
+export type { GitCheckoutParams } from "./generated/GitCheckoutParams";
+export type { GitCheckoutResult } from "./generated/GitCheckoutResult";
+export type { GitFetchParams } from "./generated/GitFetchParams";
+export type { GitRefUpdate } from "./generated/GitRefUpdate";
+export type { GitFetchResult } from "./generated/GitFetchResult";
+export type { GitPullParams } from "./generated/GitPullParams";
+export type { GitPullResult } from "./generated/GitPullResult";
+export type { GitPushParams } from "./generated/GitPushParams";
+export type { GitPushResult } from "./generated/GitPushResult";
+
+// ---- git.* stash（M6 切片四：stash / stash_list / stash_pop / stash_apply / stash_drop）----
+//
+// `GitStashApplyResult` 只承载**成功**路径：冲突一律是 `7010`（`data.files` + `data.stash_kept`），
+// 所以「取出成功」与「取出撞冲突」在外壳上是两套话术，不会混。
+export type { GitStashEntry } from "./generated/GitStashEntry";
+export type { GitStashParams } from "./generated/GitStashParams";
+export type { GitStashResult } from "./generated/GitStashResult";
+export type { GitStashListParams } from "./generated/GitStashListParams";
+export type { GitStashListResult } from "./generated/GitStashListResult";
+export type { GitStashApplyParams } from "./generated/GitStashApplyParams";
+export type { GitStashApplyResult } from "./generated/GitStashApplyResult";
+export type { GitStashDropParams } from "./generated/GitStashDropParams";
+export type { GitStashDropResult } from "./generated/GitStashDropResult";
 export type { McpServerInfo } from "./generated/McpServerInfo";
 export type { McpServersParams } from "./generated/McpServersParams";
 export type { McpServersResult } from "./generated/McpServersResult";
@@ -474,6 +502,19 @@ export const Methods = {
     stage: "git.stage",
     commit: "git.commit",
     branches: "git.branches",
+    // M6 切片四：分支切换 + 远端同步。`pull` 只有快进（`--ff-only`），`push` 只有
+    // `--force-with-lease`——协议层不给「合并式拉取」和「裸强推」留字段。
+    checkout: "git.checkout",
+    fetch: "git.fetch",
+    pull: "git.pull",
+    push: "git.push",
+    // M6 切片四：stash 五项。`stash_pop` / `stash_apply` 共用一套参数与结果，
+    // 差别只在成功之后删不删这条 stash。
+    stash: "git.stash",
+    stashList: "git.stash_list",
+    stashPop: "git.stash_pop",
+    stashApply: "git.stash_apply",
+    stashDrop: "git.stash_drop",
   },
   mcp: {
     servers: "mcp.servers",
@@ -544,7 +585,10 @@ export const Methods = {
  * 再加 M3 切片一的 `search.symbols`（符号检索内核面：七种语言的声明抽取，
  * 外壳入口留待下一片），以及 M3 切片三的 `inline_edit.propose`（选区改写内核面：
  * 一次补全 + 结构化 diff，内核不写盘），再加语言服务的 `lsp.*` 五项（启动 /
- * 关闭 / 清单 / 查询 / 同步，内核 `lsp_api.rs` 已接线），共 80 项，
+ * 关闭 / 清单 / 查询 / 同步，内核 `lsp_api.rs` 已接线），再加 M6 切片四的
+ * `git.*` 九项（分支切换 `git.checkout`、远端同步 `git.fetch` / `git.pull` /
+ * `git.push`、stash 五项 `git.stash` / `git.stash_list` / `git.stash_pop` /
+ * `git.stash_apply` / `git.stash_drop`），共 89 项，
  * 与 Rust `methods::IMPLEMENTED` 逐项对齐。
  */
 export const IMPLEMENTED_METHODS = [
@@ -606,6 +650,16 @@ export const IMPLEMENTED_METHODS = [
   Methods.git.stage,
   Methods.git.commit,
   Methods.git.branches,
+  // M6 切片四：分支切换 / 远端同步 / stash。
+  Methods.git.checkout,
+  Methods.git.fetch,
+  Methods.git.pull,
+  Methods.git.push,
+  Methods.git.stash,
+  Methods.git.stashList,
+  Methods.git.stashPop,
+  Methods.git.stashApply,
+  Methods.git.stashDrop,
   Methods.mcp.servers,
   Methods.mcp.connect,
   Methods.mcp.disconnect,
