@@ -72,7 +72,7 @@
 - `session.*`：`create` / `list` / `get` / `update` / `delete` / `append_message` / `messages` / `export`（Markdown / JSON，`out_path` 由系统保存对话框决定）/ `fork`；`audit.list` 只读查询（会话创建 / 更新 / 删除 / 导出 / 分叉留痕，存储层已脱敏）
 - `checkpoint.*`：`create`（手动快照，或由 Agent 写入钩子自动留痕）/ `list` / `restore`（回滚后逐文件重算 SHA-256 复核，结果折成 `verified`）/ `delete`；快照内容落 `<data_dir>/checkpoints/<工作区键>/<检查点 id>/`，单文件 8 MiB、单检查点 5000 文件 / 256 MiB 上限，超限计入 `skipped`
 - `permission.*`：`list` / `revoke`；`allow_always` 决定经 `permission_rule` 表持久化（迁移 `0003_permission_rule.sql`），重启后仍生效，可按工作区撤销
-- 日志：`<data_dir>/logs/core-YYYY-MM-DD.jsonl`（一行一条 JSON，按天滚动 + 单文件 32 MiB 上限），出口复用 `ai_ide_store::redact` 的同一套脱敏规则；`AI_IDE_LOG_JSONL` / `AI_IDE_LOG_REDACT` / `AI_IDE_LOG_DIR` / `AI_IDE_LOG_PROBE` 四个开关
+- 日志：`<data_dir>/logs/core-YYYY-MM-DD.jsonl`（一行一条 JSON，按天滚动 + 单文件 32 MiB 上限），出口复用 `ai_ide_store::redact` 的同一套脱敏规则；插件日志另起一族 `<data_dir>/logs/plugin-YYYY-MM-DD.jsonl`（`host/log` 的磁盘副本，同滚动 / 同脱敏，前缀 `plugin`）；外壳侧还有 `<userData>/logs/core-shell-YYYY-MM-DD.log`（内核 stderr 与 `core.log` 事件的原始文本，8 MiB 滚动）；`AI_IDE_LOG_JSONL` / `AI_IDE_LOG_REDACT` / `AI_IDE_LOG_DIR` / `AI_IDE_LOG_PROBE` 四个开关
 - `provider.*` / `model.*`：`upsert` / `list` / `delete`（provider 另有 `test`）；目录落盘 `AI_IDE_DATA_DIR/providers.json`，密钥经 `ai-ide-llm` 的 `secret` 模块加密后存储
 - `llm.*`：`chat_stream`（流式，支持 `context.refs` 注入为前置 `system` 消息）、`cancel`、`list_models`、`count_tokens`（按模型族分流 tiktoken 精确计数 / 估算回落，`messages[]` 与 `texts[]` 相加）；上游协议为 OpenAI Chat Completions 兼容
 - 事件：`workspace.changed`、`provider.changed`、`llm.started` / `delta` / `reasoning` / `tool_call` / `usage` / `finished` / `error`、`terminal.data` / `terminal.exit`、`lsp.diagnostics`、`plugin.*` 四类审计与进度事件
@@ -80,7 +80,7 @@
 
 ### 尚未实现（截至 2026-10-25）
 
-- 协议面：`workspace.indexed` / `core.log` 两个事件仍是主动推送缺口（`IMPLEMENTED` 现为 **79** 项、`DECLARED_NOT_IMPLEMENTED` 为空表；`terminal.*` / `git.*` / `mcp.*` / `plugin.*` / `lsp.*` / `search.symbols` / `inline_edit.propose` 均已进常量表并由 `crates/core` 接线，本文旧版把这几组写作「未进协议常量表」属倒挂，已订正）
+- 协议面：`workspace.indexed` / `core.log` 两个事件仍是主动推送缺口（`IMPLEMENTED` 现为 **80** 项——P5 切片八补 `plugin.load_many` 后从 79 涨到 80，`DECLARED_NOT_IMPLEMENTED` 为空表；`terminal.*` / `git.*` / `mcp.*` / `plugin.*` / `lsp.*` / `search.symbols` / `inline_edit.propose` 均已进常量表并由 `crates/core` 接线，本文旧版把这几组写作「未进协议常量表」属倒挂，已订正）；`core.log` 只剩内核侧未推，外壳侧已接齐（主进程映射 → 落盘 `core-shell-*.log` → 渲染端订阅 → 状态栏最近一行）
 - 模块：`parser`（tree-sitter 符号表尚未引入，`search.symbols` 走的是自研文本抽取）
 - 界面：Tab 补全、列表与审计分页加载、消息级分叉入口未开工；已接入渲染端的有 M2 Provider 配置 / 对话面板、M3 `@` 补全与引用 chip、M4 Agent 运行面板与审批卡片、M5 会话 / 检查点 / 权限面板、M6 终端与 Git 面板、M7 MCP 面板、符号浮层（`Ctrl+T`）、Inline Edit 浮层（`Ctrl+K`）与 LSP 状态 / 重启命令
 - LSP 侧：语言服务器需本机自备（按 `crates/lsp/src/registry.rs` 探测并探测失败即降级为「不可用」，未内置下载 / 安装）；格式化、重命名、代码动作等未接 Monaco provider；多根工作区只起工作区根那一份连接
@@ -92,6 +92,18 @@
 ### 质量门禁实测（2026-10-25，LSP 收口）
 
 前端门禁本轮实跑：`pnpm typecheck`（`tsc --noEmit`）退出码 0；`pnpm test` **27 文件 500 项全过**，其中 LSP 相关 `lsp-providers.test.ts` 16 项（坐标换算、四 provider 的返回翻译、重复注册幂等、卸载统一 dispose）、`lsp-store.test.ts` 23 项、`command-registry.test.ts` 25 项、`command-palette-store.test.ts` 15 项。内核侧本轮未改动 Rust 代码，`cargo test --workspace` 沿用插件 P5 收口时的 **1128 passed / 0 failed / 9 ignored**（LSP 流水线测试 `crates/core/tests/lsp_flow.rs` 在 `e03ed64` 中已通过，`crates/protocol` 的 `IMPLEMENTED.len() == 79` 断言同轮生效）。
+
+### 质量门禁实测（2026-10-26，插件 P5 切片八：多插件并发装载 + 插件日志落盘）
+
+- `cargo fmt --all -- --check`：通过（本轮先修过 `logging.rs` / `plugin_flow.rs` / `host_flow.rs` 的格式）。
+- `cargo clippy --workspace --all-targets -- -D warnings`：退出码 0（构建期仍有 ts-rs 的 `failed to parse serde attribute` 噪声，非本项目代码）。
+- `cargo test --workspace`：**50 个测试目标，1308 passed / 0 failed / 9 ignored**。其中 `crates/plugin/tests/host_flow.rs` 13 项（含本轮新增 4 项并发用例）、`crates/core/tests/plugin_flow.rs` 与新增的 `plugin.load_many` 端到端、`crates/core/src/plugin_host.rs` 的 `plugin_log_is_appended_to_its_own_jsonl_file`（插件日志落盘一行一条 JSON、密钥打码、同日追加）、`crates/protocol` 的 `IMPLEMENTED.len() == 80` 断言。
+- `pnpm typecheck`（`tsc --noEmit`）：退出码 0。
+- `pnpm test`（vitest）：**29 文件 514 项全过**，其中本轮新增 `core-log-file.test.ts` 5 项（按天命名、追加、8 MiB 滚动、空目录自建、超限不抛错）与 `core-log-store.test.ts` 9 项（切行 / 残行拼接 / CRLF / 空行 / 上限与 dropped 计数 / 来源标记 / 事件切换 / 清空）。
+
+本轮改动要点：`plugin.load_many` 进 `IMPLEMENTED`（79 → 80，四处同步：Rust `methods.rs`、`packages/shared-types/src/index.ts`、`methods-contract.test.ts` 的 `toHaveLength(80)`、`main/policy.ts` 白名单，另附 ts-rs 生成的 4 个 `PluginLoadMany*` / `PluginLoadFailure` 类型）；`Host` 增 per-id `tokio::sync::Mutex` 装载闸门（`load` / `unload` 共用，同 id 并发只起一个进程，不同 id 仍并行）；`plugin.log` 由 `DailyJsonlWriter` 换前缀族追加到 `plugin-*.jsonl`；外壳 `core-log-file.ts` + `core-log-store.ts` 把 `core.log` 事件与 stderr 一起落盘并接到状态栏。
+
+**未做**：内核侧 `core.log` 主动推送仍是缺口；`load_many` 只在内核侧提供协议方法与调度（默认并发 4、硬上限 16、单次最多 32 个插件），渲染端尚无批量装载入口。
 
 ## 建议阅读顺序
 
