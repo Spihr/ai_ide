@@ -3,12 +3,15 @@
 use crate::error::{classify_hunk_apply_failure, GitError};
 use crate::exec::{normalize_path, Runner};
 use crate::model::{
-    GitBranches, GitCheckoutOutcome, GitCommitOutcome, GitDiff, GitFetchOutcome, GitFileHunks,
+    ConflictKind, ConflictResolution, ConflictSide, EntryKind, GitBranches, GitCheckoutOutcome,
+    GitCommitOutcome, GitConflict, GitConflictOutcome, GitDiff, GitFetchOutcome, GitFileHunks,
     GitHunkOutcome, GitPullOutcome, GitPushOutcome, GitRefUpdate, GitStageOutcome,
     GitStashApplyOutcome, GitStashDropOutcome, GitStashEntry, GitStashOutcome, GitStatus,
     HunkSelector, MAX_PULL_CHANGED_PATHS,
 };
-use crate::parse::{hunk_patch, parse_branches, parse_diff, parse_status, ParsedDiffFile};
+use crate::parse::{
+    hunk_patch, parse_branches, parse_diff, parse_status, scan_conflict_text, ParsedDiffFile,
+};
 use crate::{DIFF_LIMIT_BYTES, MAX_CONTEXT_LINES};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -280,6 +283,250 @@ impl GitRepo {
             unstage,
             staged_total: self.staged_count()?,
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // 合并冲突（缺口第五批）
+    // -----------------------------------------------------------------------
+
+    /// 读取单个冲突文件的冲突块。
+    ///
+    /// 只对**未合并**文件生效：普通改动文件调用会被 [`GitError::NotInConflict`] 拒掉。
+    /// 这不是过度严格——`conflict_read` 的返回值会被外壳当成「这里有冲突块可以点」，
+    /// 对一个普通文件返回空块列表，UI 只会显示「有冲突但解析不出来」，比直接报错更难排查。
+    ///
+    /// 三种「没有块」的情形都返回空 `blocks`，由外壳按整份取一侧处理：
+    /// 侧边缺失（`DU` / `UD` / `AU` / `UA`）、二进制冲突、以及两侧都删（文件根本不在了）。
+    pub fn conflict_read(&self, path: &str) -> Result<GitConflict, GitError> {
+        let path = normalize_path(path)?;
+        let (kind, xy) = self.unmerged_kind(&path)?;
+        let target = self.root.join(&path);
+        let present = target.is_file();
+
+        // 二进制冲突读成 `String` 会失败，此时不该报错：状态仍要能展示，
+        // 只是没有块可解析。`from_utf8` 的失败被折成空块列表。
+        let blocks = match std::fs::read(&target) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(text) => scan_conflict_text(&text)
+                    .blocks()
+                    .into_iter()
+                    .cloned()
+                    .collect(),
+                Err(_) => Vec::new(),
+            },
+            Err(_) => Vec::new(),
+        };
+
+        Ok(GitConflict {
+            path,
+            kind,
+            xy,
+            present,
+            blocks,
+        })
+    }
+
+    /// 解决单个冲突文件。
+    ///
+    /// 两条路径，都只在文件**确实未合并**时才会走到写盘：
+    ///
+    /// - 给 `content`：整份覆盖写盘（用户手改后提交的全文）；
+    /// - 给 `side`：按块替换（有标记时），或整份取一侧（无标记 / 二进制 / 侧边缺失）。
+    ///
+    /// 「侧边缺失」必须走删除：`DU` 的 ours 侧压根没有文件，`git checkout --ours`
+    /// 会留一个空文件，再 `git add` 就等于把「删除」提交成了「清空」。
+    ///
+    /// 写盘后**先看还有没有标记**再决定 `git add`：带着 `<<<<<<<` 提交上去是最糟的
+    /// 结果，宁可让索引停在未合并状态并回报 `still_conflicted`。
+    pub fn conflict_resolve(
+        &self,
+        resolution: &ConflictResolution,
+    ) -> Result<GitConflictOutcome, GitError> {
+        let path = normalize_path(&resolution.path)?;
+        let (kind, _xy) = self.unmerged_kind(&path)?;
+        let target = self.root.join(&path);
+
+        let text = match std::fs::read(&target) {
+            Ok(bytes) => String::from_utf8(bytes).ok(),
+            // 文件不在工作区（`DD`、或冲突后被人删掉）：下面按「无标记」处理。
+            Err(_) => None,
+        };
+        let scan = text.as_deref().map(scan_conflict_text);
+        let block_count = scan.as_ref().map_or(0, |scan| scan.block_count());
+        let start_line = scan.as_ref().and_then(|scan| scan.first_start_line());
+
+        // 调用方给的布局必须与现状一致：按过期序号切文本会把块外的内容当成标记删掉。
+        if let Some(expected) = resolution.expect_blocks {
+            if expected != block_count {
+                return Err(GitError::ConflictChanged {
+                    path,
+                    expected: format!("{expected} 个冲突块"),
+                    actual: Some(format!("{block_count} 个冲突块")),
+                });
+            }
+        }
+        if let Some(expected) = resolution.expect_start_line {
+            if start_line != Some(expected) {
+                return Err(GitError::ConflictChanged {
+                    path,
+                    expected: format!("首个冲突块起始于第 {expected} 行"),
+                    actual: Some(match start_line {
+                        Some(line) => format!("首个冲突块起始于第 {line} 行"),
+                        None => "文件里没有冲突块".to_string(),
+                    }),
+                });
+            }
+        }
+
+        // 自定义全文优先：`Some` 时就按调用方给的整份内容写，`side` 被忽略。
+        if let Some(content) = &resolution.content {
+            std::fs::write(&target, content)
+                .map_err(|err| GitError::Io(format!("{}: {err}", target.display())))?;
+            let leftover = scan_conflict_text(content).block_count();
+            return self.finish_conflict(path, kind, block_count, leftover > 0, false);
+        }
+
+        let side = resolution.side;
+        let rendered = scan
+            .as_ref()
+            .filter(|scan| scan.block_count() > 0)
+            .map(|scan| {
+                let pick = |block: &crate::model::GitConflictBlock| -> Vec<String> {
+                    match side {
+                        ConflictSide::Ours => block.ours.clone(),
+                        ConflictSide::Theirs => block.theirs.clone(),
+                        ConflictSide::Both { theirs_first } => {
+                            let (first, second) = if theirs_first {
+                                (&block.theirs, &block.ours)
+                            } else {
+                                (&block.ours, &block.theirs)
+                            };
+                            let mut merged = first.clone();
+                            merged.extend(second.iter().cloned());
+                            merged
+                        }
+                    }
+                };
+                scan.render(pick)
+            });
+
+        if let Some(output) = rendered {
+            std::fs::write(&target, &output)
+                .map_err(|err| GitError::Io(format!("{}: {err}", target.display())))?;
+            let leftover = scan_conflict_text(&output).block_count();
+            return self.finish_conflict(path, kind, block_count, leftover > 0, false);
+        }
+
+        // 到这里说明没有可切的块：文件里没标记（二进制 / 侧边缺失），或文件已不在。
+        if matches!(side, ConflictSide::Both { .. }) {
+            // 没有标记就没有「拼接」的依据，硬按 ours 写完再 add 会悄悄丢掉对方的改动。
+            return Err(GitError::Invalid(format!(
+                "{} 没有冲突标记，无法按 both 合并，请改用 ours / theirs 或直接写 content",
+                resolution.path
+            )));
+        }
+
+        let (ours_missing, theirs_missing) = kind.missing();
+        let remove = match side {
+            ConflictSide::Theirs => theirs_missing,
+            _ => ours_missing,
+        };
+        if remove {
+            // 取的那一侧没有这个文件：解决就是删除，`git rm` 同时落索引。
+            self.runner()
+                .execute(&[], &["rm", "--quiet", "--force", "--", &path], None)?;
+            return self.finish_conflict(path, kind, block_count, false, true);
+        }
+
+        let flag = if matches!(side, ConflictSide::Theirs) {
+            "--theirs"
+        } else {
+            "--ours"
+        };
+        let output = self
+            .runner()
+            .execute(&[], &["checkout", flag, "--", &path], None)?;
+        if !output.success {
+            return Err(GitError::Command {
+                args: format!("checkout {flag} -- {path}"),
+                stderr: output.stderr_trimmed(),
+                code: output.code,
+            });
+        }
+        self.finish_conflict(path, kind, block_count, false, false)
+    }
+
+    /// 冲突解决的收尾：按需 `git add`，并回报剩余冲突文件。
+    ///
+    /// `pre_staged` 用于「已经自己动过索引」的分支（取缺失侧时的 `git rm`）：那时索引
+    /// 里该路径已经没有任何 stage，再补一次 `git add --all -- <path>` 会因为 pathspec
+    /// 在索引和工作区里都找不到而直接以 128 失败——明明已经解决，却报成命令错误。
+    fn finish_conflict(
+        &self,
+        path: String,
+        kind: ConflictKind,
+        resolved_blocks: u32,
+        still_conflicted: bool,
+        pre_staged: bool,
+    ) -> Result<GitConflictOutcome, GitError> {
+        if !still_conflicted && !pre_staged {
+            // `--all` 而不是裸 `add`：一侧删除的冲突解决后工作区里没有文件，
+            // 裸 `add` 会以 `pathspec did not match` 失败。
+            let output = self
+                .runner()
+                .execute(&[], &["add", "--all", "--", &path], None)?;
+            if !output.success {
+                return Err(GitError::Command {
+                    args: format!("add --all -- {path}"),
+                    stderr: output.stderr_trimmed(),
+                    code: output.code,
+                });
+            }
+        }
+        let remaining = self.conflict_paths()?;
+        Ok(GitConflictOutcome {
+            resolved: !still_conflicted && !remaining.iter().any(|item| item == &path),
+            still_conflicted,
+            path,
+            kind,
+            resolved_blocks,
+            remaining,
+        })
+    }
+
+    /// 当前所有未合并文件（相对工作区根、已排序）。
+    pub fn conflict_paths(&self) -> Result<Vec<String>, GitError> {
+        let status = self.status()?;
+        let mut paths: Vec<String> = status
+            .entries
+            .into_iter()
+            .filter(|entry| entry.kind == EntryKind::Unmerged)
+            .map(|entry| entry.path)
+            .collect();
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+
+    /// 在 `status` 里确认路径确实未合并，并翻译成 [`ConflictKind`] 与两位 XY。
+    ///
+    /// 用 `status` 而不是 `git ls-files -u`：两处的「未合并」判定必须同源，否则会出现
+    /// 「列表里没有、点进去能读」的分裂状态。
+    fn unmerged_kind(&self, path: &str) -> Result<(ConflictKind, String), GitError> {
+        let status = self.status()?;
+        let entry = status
+            .entries
+            .into_iter()
+            .find(|entry| entry.path == path && entry.kind == EntryKind::Unmerged);
+        match entry {
+            Some(entry) => Ok((
+                ConflictKind::of(&entry.index, &entry.worktree),
+                format!("{}{}", entry.index, entry.worktree),
+            )),
+            None => Err(GitError::NotInConflict {
+                path: path.to_string(),
+            }),
+        }
     }
 
     /// 暂存 / 取消暂存。

@@ -7,7 +7,9 @@
 //! 这里是纯函数，输入输出都是字节 / 字符串，因此可以拿固定样本做单测——不必为了
 //! 测「重命名怎么解析」去构造一个真仓库。
 
-use crate::model::{EntryKind, GitBranchInfo, GitFileHunks, GitHunk, GitStatus, GitStatusEntry};
+use crate::model::{
+    EntryKind, GitBranchInfo, GitConflictBlock, GitFileHunks, GitHunk, GitStatus, GitStatusEntry,
+};
 
 /// 解析 `git status --porcelain=v2 --branch --untracked-files=all -z --relative`。
 ///
@@ -515,6 +517,273 @@ pub(crate) fn hunk_patch(file: &ParsedDiffFile, hunk: &GitHunk) -> String {
         out.push('\n');
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// 冲突标记扫描（缺口第五批）
+// ---------------------------------------------------------------------------
+
+/// 冲突标记的重复字符数。
+///
+/// git 写出来的一律是整整 7 个（`<<<<<<<` / `|||||||` / `=======` / `>>>>>>>`），
+/// 因此这里按**恰好 7 个**认。这条不只是格式洁癖：正文里本来就存在看起来像标记的
+/// 东西——Markdown 的分隔线 `--------`、RST 标题下划线 `========`、从别处粘进文件的
+/// diff 片段——放宽成「7 个及以上」会让 `========`（8 个）之类的行被当成段分隔。
+const MARKER_WIDTH: usize = 7;
+
+/// 带标签的标记行最短长度：7 个标记 + 1 个空格 + 至少 1 个字符的标签。
+const LABELED_MARKER_MIN_LEN: usize = MARKER_WIDTH + 2;
+
+/// 识别一行是不是冲突标记，返回 `(标记字符, 标签)`；`=======` 的标签是空串。
+///
+/// 三重门槛，缺一不可：
+///
+/// 1. 首字符必须是四个标记字符之一；
+/// 2. 前缀**恰好** [`MARKER_WIDTH`] 个重复字符；
+/// 3. `<<<<<<<` / `|||||||` / `>>>>>>>` 后面必须紧跟空格与**非空**标签（git 会把
+///    分支名或提交说明写在那里），`=======` 后面必须是空的。
+///
+/// 第 3 条是最关键的一条：`<<<<<<<` 单独出现在代码里（注释、正则、字符串）时后面
+/// 往往没有 ` <label>`，据此就能把它留在正文里。
+fn conflict_marker(line: &str) -> Option<(char, String)> {
+    let lead = line.chars().next()?;
+    if !matches!(lead, '<' | '|' | '=' | '>') {
+        return None;
+    }
+    let width = line
+        .as_bytes()
+        .iter()
+        .take_while(|byte| **byte == lead as u8)
+        .count();
+    if width != MARKER_WIDTH {
+        return None;
+    }
+    let rest = &line[width..];
+    if lead == '=' {
+        return if rest.trim().is_empty() {
+            Some((lead, String::new()))
+        } else {
+            None
+        };
+    }
+    if line.len() < LABELED_MARKER_MIN_LEN {
+        return None;
+    }
+    let label = rest.strip_prefix(' ')?.trim().to_string();
+    if label.is_empty() {
+        return None;
+    }
+    Some((lead, label))
+}
+
+/// 冲突块当前收的是哪一段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Section {
+    /// `<<<<<<<` 之后、`|||||||` / `=======` 之前。
+    Ours,
+    /// `|||||||` 之后、`=======` 之前（只有 `diff3` 风格才有这一段）。
+    Base,
+    /// `=======` 之后、`>>>>>>>` 之前。
+    Theirs,
+}
+
+/// 正在收集的冲突块。
+struct OpenBlock {
+    start_line: u32,
+    ours_label: String,
+    base_label: Option<String>,
+    section: Section,
+    ours: Vec<String>,
+    base: Option<Vec<String>>,
+    theirs: Vec<String>,
+    /// 已经吃进来的原始行（含标记行）。配对校验失败时整块退回正文，一个字都不能丢。
+    raw: Vec<String>,
+}
+
+impl OpenBlock {
+    fn start(line_no: u32, label: String, marker_line: &str) -> Self {
+        Self {
+            start_line: line_no,
+            ours_label: label,
+            base_label: None,
+            section: Section::Ours,
+            ours: Vec::new(),
+            base: None,
+            theirs: Vec::new(),
+            raw: vec![marker_line.to_string()],
+        }
+    }
+}
+
+/// 冲突文本里的一个片段：普通行，或一个解析成功的冲突块。
+enum ConflictPiece {
+    Lines(Vec<String>),
+    Block(GitConflictBlock),
+}
+
+fn take_plain(plain: &mut Vec<String>) -> Option<ConflictPiece> {
+    if plain.is_empty() {
+        return None;
+    }
+    Some(ConflictPiece::Lines(std::mem::take(plain)))
+}
+
+/// 一个文本文件的冲突扫描结果。
+///
+/// 除了冲突块，还记住原文件的**换行风格**与**末尾有没有换行**：解决冲突要按原样
+/// 写回，否则「解决完了」会顺手把整份文件的换行从 `CRLF` 改成 `LF`，`git status`
+/// 里就成了一处用户没做过的改动。
+pub(crate) struct ConflictScan {
+    pieces: Vec<ConflictPiece>,
+    eol: &'static str,
+    trailing_newline: bool,
+}
+
+impl ConflictScan {
+    /// 解析出的冲突块（按出现顺序）。
+    pub(crate) fn blocks(&self) -> Vec<&GitConflictBlock> {
+        self.pieces
+            .iter()
+            .filter_map(|piece| match piece {
+                ConflictPiece::Block(block) => Some(block),
+                ConflictPiece::Lines(_) => None,
+            })
+            .collect()
+    }
+
+    /// 冲突块数量。
+    pub(crate) fn block_count(&self) -> u32 {
+        self.blocks().len() as u32
+    }
+
+    /// 第一个冲突块的起始行（1 起），没有则为 `None`。
+    pub(crate) fn first_start_line(&self) -> Option<u32> {
+        self.pieces.iter().find_map(|piece| match piece {
+            ConflictPiece::Block(block) => Some(block.start_line),
+            ConflictPiece::Lines(_) => None,
+        })
+    }
+
+    /// 按 `pick` 挑出的内容重建全文：冲突块被替换，冲突块之外的每一行逐字保留。
+    pub(crate) fn render<F>(&self, pick: F) -> String
+    where
+        F: Fn(&GitConflictBlock) -> Vec<String>,
+    {
+        let mut out: Vec<String> = Vec::new();
+        for piece in &self.pieces {
+            match piece {
+                ConflictPiece::Lines(lines) => out.extend(lines.iter().cloned()),
+                ConflictPiece::Block(block) => out.extend(pick(block)),
+            }
+        }
+        if out.is_empty() {
+            return String::new();
+        }
+        let mut text = out.join(self.eol);
+        if self.trailing_newline {
+            text.push_str(self.eol);
+        }
+        text
+    }
+}
+
+/// 扫描一份冲突文本，切出所有**成对**的冲突块。
+///
+/// 配对校验的口径：`<<<<<<<` → （可选 `|||||||`）→ `=======` → `>>>>>>>`，四者必须
+/// 按序齐全才算一个块。缺任何一环（`<<<<<<<` 之后到文件结尾都没等到 `>>>>>>>`、
+/// 孤立的 `=======`、`<<<<<<<` 里又套了一个 `<<<<<<<`）都不会被认成冲突块，而是
+/// **整块连同上一个未闭合块的内容一起退回正文**。宁可报「没有冲突块」让上层走
+/// 整份取一侧的路，也不能凭半截标记重建出一份缺了半个文件的「解决结果」。
+pub(crate) fn scan_conflict_text(text: &str) -> ConflictScan {
+    let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let trailing_newline = text.ends_with('\n');
+    let mut pieces: Vec<ConflictPiece> = Vec::new();
+    let mut plain: Vec<String> = Vec::new();
+    let mut block_count: u32 = 0;
+    let mut open: Option<OpenBlock> = None;
+    let mut line_no: u32 = 0;
+
+    for line in text.lines() {
+        line_no += 1;
+        let marker = conflict_marker(line);
+        let Some(mut current) = open.take() else {
+            match marker {
+                Some(('<', label)) => {
+                    pieces.extend(take_plain(&mut plain));
+                    open = Some(OpenBlock::start(line_no, label, line));
+                }
+                // 孤立的 `=======` / `|||||||` / `>>>>>>>`：前面没有 `<<<<<<<`，
+                // 只是正文里的一行。
+                _ => plain.push(line.to_string()),
+            }
+            continue;
+        };
+
+        match marker {
+            // 上一个块还没闭合就又来了 `<<<<<<<`：整块退回正文，再以这一行为新开头。
+            Some(('<', label)) => {
+                plain.append(&mut current.raw);
+                open = Some(OpenBlock::start(line_no, label, line));
+            }
+            // `|||||||` 只能出现在 ours 段之后、且只能出现一次。
+            Some(('|', label)) if current.section == Section::Ours && current.base.is_none() => {
+                current.raw.push(line.to_string());
+                current.base = Some(Vec::new());
+                current.base_label = Some(label);
+                current.section = Section::Base;
+                open = Some(current);
+            }
+            // `=======` 把 ours（或 diff3 的 base）与 theirs 分开；重复出现的不算标记。
+            Some(('=', _)) if current.section != Section::Theirs => {
+                current.raw.push(line.to_string());
+                current.section = Section::Theirs;
+                open = Some(current);
+            }
+            // `>>>>>>>` 收尾：只有已经从 `=======` 走到 theirs 段才认。
+            Some(('>', label)) if current.section == Section::Theirs => {
+                current.raw.push(line.to_string());
+                pieces.extend(take_plain(&mut plain));
+                pieces.push(ConflictPiece::Block(GitConflictBlock {
+                    index: block_count,
+                    start_line: current.start_line,
+                    end_line: line_no,
+                    ours_label: current.ours_label,
+                    base_label: current.base_label,
+                    theirs_label: label,
+                    ours: current.ours,
+                    base: current.base,
+                    theirs: current.theirs,
+                }));
+                block_count += 1;
+            }
+            // 其余（非标记行、或本块接不上的标记）：当内容收进当前段。
+            _ => {
+                current.raw.push(line.to_string());
+                match current.section {
+                    Section::Ours => current.ours.push(line.to_string()),
+                    Section::Base => current
+                        .base
+                        .get_or_insert_with(Vec::new)
+                        .push(line.to_string()),
+                    Section::Theirs => current.theirs.push(line.to_string()),
+                }
+                open = Some(current);
+            }
+        }
+    }
+
+    if let Some(mut current) = open.take() {
+        // 到文件结尾都没闭合：整块退回正文。
+        pieces.extend(take_plain(&mut plain));
+        plain.append(&mut current.raw);
+    }
+    pieces.extend(take_plain(&mut plain));
+
+    ConflictScan {
+        pieces,
+        eol,
+        trailing_newline,
+    }
 }
 
 #[cfg(test)]

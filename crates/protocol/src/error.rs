@@ -159,6 +159,19 @@ impl ErrorCode {
     /// 与 `7011` 分开：这不是「定位失败、刷新再试」，而是「这个文件永远不能这么做」，
     /// 外壳应当把该文件的逐块按钮直接置灰，并引导用户整文件暂存。
     pub const GIT_BINARY_HUNK: Self = Self(7012);
+    /// 目标文件当前不处于冲突状态（`git.conflict_read` / `git.conflict_resolve` 只对
+    /// 未合并文件生效）。
+    ///
+    /// 与 `7004`（参数非法）分开：路径本身没写错，错的是**时机**——文件可能已经被解决
+    /// 了、被 abort 掉了、或者用户点的是同一目录下另一个文件。外壳应当刷新冲突列表，
+    /// 而不是让用户去改路径。
+    pub const GIT_NOT_IN_CONFLICT: Self = Self(7013);
+    /// 冲突块布局已变化：文件里的块数或首块位置与调用方看到的不一致。
+    ///
+    /// 与 `7011`（单块暂存漂移）同一姿态：按过期布局切文本会删掉块外的内容，
+    /// 所以宁可让外壳重新 `conflict_read` 一次。`data.expected` / `data.actual`
+    /// 带两侧布局描述。
+    pub const GIT_CONFLICT_CHANGED: Self = Self(7014);
 
     // ---------- 8xxx MCP ----------
     /// Server 名不在 `mcp.json` 里：写错了名字，或配置文件根本没装载。
@@ -524,6 +537,8 @@ mod tests {
         assert_eq!(ErrorCode::GIT_STASH_CONFLICT.as_i32(), 7010);
         assert_eq!(ErrorCode::GIT_HUNK_DRIFTED.as_i32(), 7011);
         assert_eq!(ErrorCode::GIT_BINARY_HUNK.as_i32(), 7012);
+        assert_eq!(ErrorCode::GIT_NOT_IN_CONFLICT.as_i32(), 7013);
+        assert_eq!(ErrorCode::GIT_CONFLICT_CHANGED.as_i32(), 7014);
         // 相邻段（终端 6xxx / MCP 8xxx）不能被挤占。
         assert!(!(6001..=6099).contains(&ErrorCode::GIT_UNAVAILABLE.as_i32()));
         assert!(!(8001..=8099).contains(&ErrorCode::GIT_BINARY_HUNK.as_i32()));

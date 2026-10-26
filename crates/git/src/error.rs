@@ -90,6 +90,31 @@ pub enum GitError {
         actual: Option<String>,
     },
 
+    /// 目标文件当前不处于冲突状态。
+    ///
+    /// `conflict_read` / `conflict_resolve` 只对**未合并**文件生效：对一个普通改动
+    /// 文件「取 ours」，等于把工作区里用户刚写的东西悄悄换成索引版本。所以这里必须
+    /// 硬失败，而不是降级成「整份 checkout」。
+    #[error("文件不在冲突状态：{path}")]
+    NotInConflict {
+        /// 相对工作区根的路径。
+        path: String,
+    },
+
+    /// 冲突块布局与调用方看到的不一致：文件被别的进程改过，块数或起始行变了。
+    ///
+    /// 与 [`GitError::HunkDrifted`] 同一思路——按过期的块序号去切文本，会把不该删的
+    /// 内容当成冲突标记删掉，所以宁可按新布局重来一次，也不按旧序号硬切。
+    #[error("冲突块已变化：{path}（期望 {expected}）")]
+    ConflictChanged {
+        /// 相对工作区根的路径。
+        path: String,
+        /// 调用方期望的布局。
+        expected: String,
+        /// 当前实际布局；文件里已没有冲突块时为 `None`。
+        actual: Option<String>,
+    },
+
     /// git 命令非零退出。`args` 是去掉全局参数后的子命令与实参，`stderr` 是原文。
     #[error("git {args} 失败（退出码 {code:?}）：{stderr}")]
     Command {

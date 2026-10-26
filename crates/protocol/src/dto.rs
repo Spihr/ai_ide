@@ -2605,6 +2605,135 @@ pub struct GitUnstageHunkResult {
     pub staged_total: u64,
 }
 
+/// 文件里的一个冲突块（一对 `<<<<<<<` … `>>>>>>>`）。
+///
+/// 行号是 1 起的闭区间、**含标记行**：外壳据此把冲突区高亮出来，所以 `end_line` 是
+/// `>>>>>>>` 那一行，而不是最后一个内容行。`ours` / `base` / `theirs` 只放内容行，
+/// 标记行本身不在里面（否则外壳想把块替换成一看就得自己认出哪几行是标记）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitConflictBlock {
+    /// 块序号（0 起，按文件内出现顺序）。
+    #[ts(type = "number")]
+    pub index: u32,
+    /// `<<<<<<<` 所在行号（1 起）。
+    #[ts(type = "number")]
+    pub start_line: u32,
+    /// `>>>>>>>` 所在行号（1 起）。
+    #[ts(type = "number")]
+    pub end_line: u32,
+    /// `<<<<<<<` 后的 ours 标签（合并时是分支名）。
+    pub ours_label: String,
+    /// `|||||||` 后的 base 标签；只有 `merge.conflictStyle=diff3` 才有。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub base_label: Option<String>,
+    /// `>>>>>>>` 后的 theirs 标签。
+    pub theirs_label: String,
+    /// ours 段内容行（保留空行，不含标记行）。
+    pub ours: Vec<String>,
+    /// base 段内容行；非 `diff3` 风格为 `null`——空数组表示「有这一段但没有内容」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub base: Option<Vec<String>>,
+    /// theirs 段内容行。
+    pub theirs: Vec<String>,
+}
+
+/// `git.conflict_read` 请求参数。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitConflictReadParams {
+    /// 工作区 id；缺省作用于活动工作区。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub workspace_id: Option<String>,
+    /// 文件路径（相对工作区根）。
+    pub path: String,
+}
+
+/// `git.conflict_read` 响应结果。
+///
+/// `blocks` 为空不代表「没有冲突」：二进制冲突、一侧缺失（`DU` / `UD`）、两侧都删
+/// 都存在「有冲突但没有标记可解析」的情况。外壳应据 `kind` 决定是渲染逐块按钮，
+/// 还是只给「整份取一侧 / 删除」。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitConflictReadResult {
+    /// 文件路径（相对工作区根）。
+    pub path: String,
+    /// 冲突类型：`both_modified` / `both_added` / `both_deleted` / `deleted_by_us` /
+    /// `deleted_by_them` / `added_by_us` / `added_by_them` / `other`。
+    pub kind: String,
+    /// `git status` 的两位 XY 原文（`UU` / `AA` / `DU` …），`kind` 为 `other` 时唯一依据。
+    pub xy: String,
+    /// 工作区里是否真的有这个文件。
+    pub present: bool,
+    /// 冲突块清单。
+    pub blocks: Vec<GitConflictBlock>,
+}
+
+/// `git.conflict_resolve` 请求参数。
+///
+/// 三种解决方式，优先级：`content` > `side`。
+///
+/// - `side = "ours"` / `"theirs"`：逐块取其一段；没有标记可切时整份取那一侧
+///   （那一侧本来没有文件，则删除该文件，而不是留一个空文件）；
+/// - `side = "both"`：逐块把两侧都留下，`theirs_first` 决定拼接顺序；
+/// - `content`：调用方手里的整份全文，原样覆盖写盘。
+///
+/// `expect_*` 是**乐观锁**：与现状不符即 7014，绝不按过期布局硬切。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitConflictResolveParams {
+    /// 工作区 id；缺省作用于活动工作区。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub workspace_id: Option<String>,
+    /// 文件路径（相对工作区根）。
+    pub path: String,
+    /// 取哪一侧：`ours` / `theirs` / `both`；写了 `content` 时忽略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub side: Option<String>,
+    /// `side = "both"` 时 theirs 是否排在前面；缺省 `false`（ours 在前）。
+    #[serde(default)]
+    pub theirs_first: bool,
+    /// 自定义全文：`Some` 时整份覆盖写盘。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub content: Option<String>,
+    /// 调用方看到的冲突块数量；不一致即 7014。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[ts(type = "number")]
+    pub expect_blocks: Option<u32>,
+    /// 调用方看到的首个冲突块起始行；不一致即 7014。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[ts(type = "number")]
+    pub expect_start_line: Option<u32>,
+}
+
+/// `git.conflict_resolve` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitConflictResolveResult {
+    /// 被解决的文件。
+    pub path: String,
+    /// 冲突类型。
+    pub kind: String,
+    /// 文件是否已离开未合并状态（即确实 `git add` 成功）。
+    pub resolved: bool,
+    /// 写盘后是否仍带冲突标记；`true` 时**没有** `git add`，索引保持未合并。
+    pub still_conflicted: bool,
+    /// 本次替换掉的冲突块数量。
+    #[ts(type = "number")]
+    pub resolved_blocks: u32,
+    /// 解决后仓库里剩下的冲突文件（已排序），外壳可直接重新渲染冲突面板。
+    pub remaining: Vec<String>,
+}
+
 /// `git.commit` 请求参数。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]

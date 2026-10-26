@@ -207,6 +207,18 @@ pub mod git {
     pub const STAGE_HUNK: &str = "git.stage_hunk";
     /// 按块取消暂存：把指定 hunk 从索引里反向撤掉（`git apply --cached --reverse`）。
     pub const UNSTAGE_HUNK: &str = "git.unstage_hunk";
+    /// 读取单个冲突文件的冲突块（ours / base / theirs 三段 + 行号区间）。
+    ///
+    /// 与 [`STATUS`] 分开：`status` 只说「这个文件未合并」，说不出「冲突在第几行、
+    /// 哪一段是我的」。要让用户逐块解决，就得把标记解析成结构化数据。
+    /// 非冲突文件调用报 7013，而不是返回空块列表。
+    pub const CONFLICT_READ: &str = "git.conflict_read";
+    /// 解决单个冲突文件：按块取一侧 / 两侧都留 / 写入自定义全文，然后 `git add`。
+    ///
+    /// 与 [`STAGE`] 分开：这里的失败不是「git 命令失败」，而是「文件已经不在冲突状态」
+    /// （7013）或「冲突块布局已经变了」（7014）——两条都需要外壳刷新冲突面板，
+    /// 与一次普通的暂存失败处置完全不同。
+    pub const CONFLICT_RESOLVE: &str = "git.conflict_resolve";
 }
 
 /// MCP 连接与工具（M7 切片二）。
@@ -445,6 +457,12 @@ pub const IMPLEMENTED: &[&str] = &[
     // 那部分能力提前记在这里。
     git::STAGE_HUNK,
     git::UNSTAGE_HUNK,
+    // 缺口第五批：Git 合并冲突解决（内核侧）。能力数 91 → 93。
+    // `repo.conflict_read` 真解析冲突标记（带长度与配对校验），`repo.conflict_resolve`
+    // 真写盘 + 真 `git add`，`git_api.rs` 有对应处理器、7013 / 7014 两条独立码，
+    // 所以进 `IMPLEMENTED`；前端冲突面板不在本批。
+    git::CONFLICT_READ,
+    git::CONFLICT_RESOLVE,
     // M7 切片二：MCP 连接与工具（实现在 `crates/mcp`，dispatch 已接线）。
     mcp::SERVERS,
     mcp::CONNECT,
@@ -493,9 +511,10 @@ mod tests {
 
     #[test]
     fn implemented_list_covers_core_m1_m2_agent_domains() {
-        // 缺口第四批补了两个单 hunk 暂存方法后 89 → 91；这个数与 `core.hello`
-        // 回报的能力数、以及 `crates/core/tests/lsp_flow.rs` 的断言必须一致。
-        assert_eq!(IMPLEMENTED.len(), 91);
+        // 缺口第四批补了两个单 hunk 暂存方法后 89 → 91；缺口第五批再补两个冲突
+        // 解决方法后 91 → 93；这个数与 `core.hello` 回报的能力数、以及
+        // `crates/core/tests/lsp_flow.rs` 的断言必须一致。
+        assert_eq!(IMPLEMENTED.len(), 93);
         assert!(IMPLEMENTED.contains(&"core.ping"));
         assert!(IMPLEMENTED.contains(&"$/cancelRequest"));
         assert!(IMPLEMENTED.contains(&"workspace.read_file"));
@@ -653,12 +672,14 @@ mod tests {
         assert_eq!(all.len(), total, "两张表不得有重叠");
         // LSP 五个接线后 79；P5 切片八补 `plugin.load_many` 后 80；
         // 缺口第二批 Git 深化补九个（checkout / fetch / pull / push / stash 系列）后 89；
-        // 缺口第四批补两个单 hunk 暂存（stage_hunk / unstage_hunk）后 91，待接线仍为 0。
-        assert_eq!(IMPLEMENTED.len(), 91, "缺口第四批后应为 91 个已接线方法");
+        // 缺口第四批补两个单 hunk 暂存（stage_hunk / unstage_hunk）后 91；
+        // 缺口第五批补两个冲突解决（conflict_read / conflict_resolve）后 93，
+        // 待接线仍为 0。
+        assert_eq!(IMPLEMENTED.len(), 93, "缺口第五批后应为 93 个已接线方法");
         assert_eq!(DECLARED_NOT_IMPLEMENTED.len(), 0);
         assert_eq!(
-            total, 91,
-            "应恰好覆盖协议里定义的全部 91 个请求方法（含 LSP 五个、plugin.load_many、Git 深化九个与单 hunk 暂存两个）"
+            total, 93,
+            "应恰好覆盖协议里定义的全部 93 个请求方法（含 LSP 五个、plugin.load_many、Git 深化九个、单 hunk 暂存两个与冲突解决两个）"
         );
     }
 
@@ -686,13 +707,13 @@ mod tests {
                 "{constant} 必须进能力清单：dispatch 已有真实分支"
             );
         }
-        // git 域恰好 16 个方法（5 个 M6 切片三 + 9 个缺口第二批 + 2 个缺口第四批），
-        // 不多不少。
+        // git 域恰好 18 个方法（5 个 M6 切片三 + 9 个缺口第二批 + 2 个缺口第四批
+        // + 2 个缺口第五批），不多不少。
         let git_methods = IMPLEMENTED
             .iter()
             .filter(|name| name.starts_with("git."))
             .count();
-        assert_eq!(git_methods, 16, "git 域应恰好 16 个已接线方法");
+        assert_eq!(git_methods, 18, "git 域应恰好 18 个已接线方法");
         // 危险动作必须留在协议里可寻址，但**不能**出现在待接线表里——
         // 「声明了却没实现」比「没声明」更糟：Main 会调它。
         for name in [git::PUSH, git::STASH_DROP] {
@@ -720,6 +741,32 @@ mod tests {
                 "{constant} 已有真实实现，不该留在待接线表"
             );
         }
+    }
+
+    /// 缺口第五批：冲突识别的两个方法必须名字固定 + 进能力清单。
+    ///
+    /// 与 `git.stage` 的区别在于失败语义：`conflict_resolve` 要能报 7013（文件已不在
+    /// 冲突状态）与 7014（冲突块布局变了）。名字一旦漂移，外壳的按钮就打到一个
+    /// 不存在的方法上，用户看到的是「点了没反应」，而不是「文件已经解决了」。
+    #[test]
+    fn git_conflict_methods_are_named_and_wired() {
+        for (constant, expected) in [
+            (git::CONFLICT_READ, "git.conflict_read"),
+            (git::CONFLICT_RESOLVE, "git.conflict_resolve"),
+        ] {
+            assert_eq!(constant, expected, "冲突解决方法名不得漂移");
+            assert!(
+                IMPLEMENTED.contains(&constant),
+                "{constant} 必须进能力清单：dispatch 已有真实分支"
+            );
+            assert!(
+                !DECLARED_NOT_IMPLEMENTED.contains(&constant),
+                "{constant} 已有真实实现，不该留在待接线表"
+            );
+        }
+        // 冲突解决不能退化成「带 side 参数的 git.stage」：一旦合并，非冲突文件的调用
+        // 就分不清该报 7004 还是 7013，外壳也没法据此刷新冲突面板。
+        assert_ne!(git::CONFLICT_RESOLVE, git::STAGE);
     }
 
     #[test]

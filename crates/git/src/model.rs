@@ -400,6 +400,226 @@ pub struct GitHunkOutcome {
     pub staged_total: u64,
 }
 
+// ---------------------------------------------------------------------------
+// 合并冲突（缺口第五批）
+// ---------------------------------------------------------------------------
+
+/// 未合并（冲突）的类型。
+///
+/// `git status` 的 `u` 记录已经用两位 XY 表达了这件事，但两位字母对调用方没有可读性：
+/// 在 UI 里「UU」与「AA」都只是「有冲突」，可用户下一步动作并不相同——`AA` 是两个分支
+/// 各自新增了同名文件，`DU` / `UD` 则有一侧压根没有这个文件（解决时可能是「删掉」）。
+/// 所以这里折成枚举，由 [`ConflictKind::of`] 统一翻译，避免每个调用方各猜一遍字母表。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictKind {
+    /// 双方都改（`UU`）：三段内容齐全，是最常见的冲突。
+    BothModified,
+    /// 双方都新增（`AA`）：两条历史各自新增了同名文件，没有共同祖先版本。
+    BothAdded,
+    /// 双方都删除（`DD`）：文件已从两侧删除，只剩索引里的三条未合并记录。
+    BothDeleted,
+    /// 我方删除、对方修改（`DU`）：工作区里是对方的版本。
+    DeletedByUs,
+    /// 对方删除、我方修改（`UD`）：工作区里是我方的版本。
+    DeletedByThem,
+    /// 我方新增、对方没有该文件（`AU`）。
+    AddedByUs,
+    /// 对方新增、我方没有该文件（`UA`）。
+    AddedByThem,
+    /// 其它未合并组合：不猜，交给调用方按 `xy` 原文处理。
+    Other,
+}
+
+impl ConflictKind {
+    /// 从 `git status --porcelain=v2` 的两位 XY 判定类型。
+    ///
+    /// 两位字母的顺序是 **X = 索引侧（ours / 已暂存）**、**Y = 工作区侧（theirs）**，
+    /// 与 `git status` 的短格式一致。认不出的组合一律落到 [`ConflictKind::Other`]，
+    /// 而不是硬套一个近似值——套错会让「该保留哪一侧」的判断整个反过来。
+    pub fn of(index: &str, worktree: &str) -> Self {
+        match (index, worktree) {
+            ("U", "U") => Self::BothModified,
+            ("A", "A") => Self::BothAdded,
+            ("D", "D") => Self::BothDeleted,
+            ("D", "U") => Self::DeletedByUs,
+            ("U", "D") => Self::DeletedByThem,
+            ("A", "U") => Self::AddedByUs,
+            ("U", "A") => Self::AddedByThem,
+            _ => Self::Other,
+        }
+    }
+
+    /// 协议里 `kind` 字段的取值。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BothModified => "both_modified",
+            Self::BothAdded => "both_added",
+            Self::BothDeleted => "both_deleted",
+            Self::DeletedByUs => "deleted_by_us",
+            Self::DeletedByThem => "deleted_by_them",
+            Self::AddedByUs => "added_by_us",
+            Self::AddedByThem => "added_by_them",
+            Self::Other => "other",
+        }
+    }
+
+    /// 对应的两位 XY，供外壳直接渲染（与 `git status` 短格式逐字一致）。
+    pub fn xy(self) -> Option<&'static str> {
+        match self {
+            Self::BothModified => Some("UU"),
+            Self::BothAdded => Some("AA"),
+            Self::BothDeleted => Some("DD"),
+            Self::DeletedByUs => Some("DU"),
+            Self::DeletedByThem => Some("UD"),
+            Self::AddedByUs => Some("AU"),
+            Self::AddedByThem => Some("UA"),
+            Self::Other => None,
+        }
+    }
+
+    /// 两侧是否**已有一侧把文件删掉了**：返回 `(ours 侧没有该文件, theirs 侧没有该文件)`。
+    ///
+    /// 「一侧没有文件」时，取那一侧就等于删文件；这个判断必须在写盘前做，否则
+    /// 「取 ours」会写出一个空文件、`git add` 之后又把空文件当成解决结果提交上去。
+    pub fn missing(self) -> (bool, bool) {
+        match self {
+            Self::BothModified | Self::BothAdded | Self::Other => (false, false),
+            Self::BothDeleted => (true, true),
+            // 我方删除：ours 侧没有文件。
+            Self::DeletedByUs | Self::AddedByThem => (true, false),
+            // 对方删除：theirs 侧没有文件。
+            Self::DeletedByThem | Self::AddedByUs => (false, true),
+        }
+    }
+
+    /// 是否存在「一侧没有文件」的情形（此时冲突正文里通常没有标记可解）。
+    pub fn has_missing_side(self) -> bool {
+        let (ours, theirs) = self.missing();
+        ours || theirs
+    }
+}
+
+/// 冲突解决时取哪一侧。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictSide {
+    /// 只保留 ours。
+    Ours,
+    /// 只保留 theirs。
+    Theirs,
+    /// 两侧都保留；`theirs_first` 决定拼接顺序（外壳的「ours 在前」/「theirs 在前」）。
+    Both {
+        /// `true` 表示 theirs 在前。
+        theirs_first: bool,
+    },
+}
+
+impl ConflictSide {
+    /// 解析协议里的 `side`。
+    ///
+    /// 认不出的取值返回 `None`，由 core 折成 7004（参数非法）：静默按 ours 处理会
+    /// 在用户以为「取对方版本」时悄悄丢掉自己的改动，这是不可接受的猜法。
+    pub fn parse(raw: &str, theirs_first: bool) -> Option<Self> {
+        match raw {
+            "ours" => Some(Self::Ours),
+            "theirs" => Some(Self::Theirs),
+            "both" => Some(Self::Both { theirs_first }),
+            _ => None,
+        }
+    }
+
+    /// 协议里 `side` 的规范取值。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ours => "ours",
+            Self::Theirs => "theirs",
+            Self::Both { .. } => "both",
+        }
+    }
+
+    /// 这次解决是否需要 ours 的内容。
+    pub fn keeps_ours(self) -> bool {
+        !matches!(self, Self::Theirs)
+    }
+
+    /// 这次解决是否需要 theirs 的内容。
+    pub fn keeps_theirs(self) -> bool {
+        !matches!(self, Self::Ours)
+    }
+}
+
+/// 文件里的**一个冲突块**（一对 `<<<<<<<` … `>>>>>>>`）。
+///
+/// 行号是 1 起的、含标记行的闭区间：外壳要据此把冲突区高亮出来，所以 `end_line`
+/// 必须是 `>>>>>>>` 那一行，而不是最后一个内容行。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitConflictBlock {
+    /// 块序号（0 起，按文件内出现顺序）。
+    pub index: u32,
+    /// `<<<<<<<` 所在行号（1 起）。
+    pub start_line: u32,
+    /// `>>>>>>>` 所在行号（1 起）。
+    pub end_line: u32,
+    /// `<<<<<<<` 后跟的 ours 标签（merge 时是分支名）。
+    pub ours_label: String,
+    /// `|||||||` 后跟的 base 标签；只有 `merge.conflictStyle=diff3` 才有。
+    pub base_label: Option<String>,
+    /// `>>>>>>>` 后跟的 theirs 标签。
+    pub theirs_label: String,
+    /// ours 段的内容行（不含标记行，保留原文件里的空行）。
+    pub ours: Vec<String>,
+    /// base 段的内容行；`diff3` 之外的风格下为 `None`——`Some(vec![])` 表示「有段但为空」。
+    pub base: Option<Vec<String>>,
+    /// theirs 段的内容行。
+    pub theirs: Vec<String>,
+}
+
+/// 一个冲突文件的读取结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitConflict {
+    /// 相对工作区根的路径（正斜杠）。
+    pub path: String,
+    /// 冲突类型。
+    pub kind: ConflictKind,
+    /// 两位 XY 原文；[`ConflictKind::Other`] 时这里仍然有值。
+    pub xy: String,
+    /// 工作区里是否真的有这个文件（`DD` 之类可能是 `false`）。
+    pub present: bool,
+    /// 解析出的冲突块；空表示「有冲突但没有标记」（二进制，或一侧缺失）。
+    pub blocks: Vec<GitConflictBlock>,
+}
+
+/// 一次 `conflict_resolve` 的请求（领域侧）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictResolution {
+    /// 目标文件。
+    pub path: String,
+    /// 取哪一侧。写 `content` 时忽略。
+    pub side: ConflictSide,
+    /// 自定义全文：`Some` 时整份覆盖写盘，写完按「是否还有标记」决定要不要 `git add`。
+    pub content: Option<String>,
+    /// 调用方看到的冲突块数量；与实际不符即 [`crate::GitError::ConflictChanged`]。
+    pub expect_blocks: Option<u32>,
+    /// 调用方看到的第一个冲突块起始行；与实际不符即 [`crate::GitError::ConflictChanged`]。
+    pub expect_start_line: Option<u32>,
+}
+
+/// 一次 `conflict_resolve` 的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitConflictOutcome {
+    /// 被解决的文件。
+    pub path: String,
+    /// 冲突类型。
+    pub kind: ConflictKind,
+    /// 文件是否已离开未合并状态（即确实 `git add` 成功）。
+    pub resolved: bool,
+    /// 写盘后是否仍带冲突标记（此时**没有** `git add`，索引保持未合并）。
+    pub still_conflicted: bool,
+    /// 本次替换掉的冲突块数量。
+    pub resolved_blocks: u32,
+    /// 解决后仓库里剩下的冲突文件（排序后，供外壳直接重新渲染）。
+    pub remaining: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
