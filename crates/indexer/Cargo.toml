@@ -10,6 +10,8 @@ license.workspace = true
 ai-ide-protocol = { workspace = true }
 # 复用工作区的忽略规则，避免「树里看不见、搜索却搜得到」这类漂移。
 ai-ide-workspace = { workspace = true }
+# 语法树层：TS / TSX / Python 的符号表来自 tree-sitter，其余语言仍走本 crate 的文本抽取。
+ai-ide-parser = { workspace = true }
 
 thiserror = { workspace = true }
 tracing = { workspace = true }

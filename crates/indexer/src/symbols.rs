@@ -156,7 +156,14 @@ fn match_score(name: &str, query: &str) -> Option<u8> {
 }
 
 /// 从一段源码抽符号。`rel` 只用来决定语言与回填 `path`。
+///
+/// TS / TSX / Python 走 [`ai_ide_parser`] 的 tree-sitter 语法树（判定点是节点种类，
+/// 不会把字符串里的 `function` 当成声明）；其余语言仍走本模块的文本抽取。
+/// 语法树抽取只对「支持的后缀」返回 `Some`，因此这里天然是「精确优先、文本兜底」。
 pub fn extract(rel: &str, text: &str) -> Vec<Symbol> {
+    if let Some(symbols) = ai_ide_parser::extract_symbols(rel, text) {
+        return symbols;
+    }
     match lang_of(rel) {
         Some(Lang::Python) => extract_python(rel, text),
         Some(lang) => extract_braced(lang, rel, text),
@@ -863,6 +870,49 @@ pub fn helper() {}
             put.range.end_line,
             impl_end
         );
+    }
+
+    #[test]
+    fn syntax_tree_beats_text_scanning_on_ts_and_python() {
+        // 文本抽取最容易翻车的两种形态：字符串里的伪声明、装饰器包裹的函数。
+        // 语法树按节点种类判定，这两类都不会误报 / 漏报。
+        let ts = r#"
+const help = "function fake() {}";
+const tpl = `class Fake {}`;
+
+export function real() {}
+
+export const Button = () => null;
+"#;
+        let symbols = extract("src/ui.tsx", ts);
+        assert!(symbols.iter().all(|s| s.name != "fake"));
+        assert!(symbols.iter().all(|s| s.name != "Fake"));
+        assert_eq!(find(&symbols, "real").kind, SymbolKind::Function);
+        assert_eq!(find(&symbols, "Button").kind, SymbolKind::Function);
+
+        let py = r#"
+DOC = """
+def fake():
+    pass
+"""
+
+
+@decorator
+def real():
+    return 1
+
+
+class Store:
+    def get(self):
+        return 1
+"#;
+        let symbols = extract("pkg/mod.py", py);
+        assert!(symbols.iter().all(|s| s.name != "fake"));
+        assert_eq!(find(&symbols, "real").kind, SymbolKind::Function);
+        assert_eq!(find(&symbols, "Store").kind, SymbolKind::Class);
+        assert_eq!(find(&symbols, "get").kind, SymbolKind::Method);
+        // 装饰器行也是声明的一部分（跳转会落到 `@decorator`，不是 `def real`）。
+        assert_eq!(find(&symbols, "real").range.start_line, 8);
     }
 
     #[test]

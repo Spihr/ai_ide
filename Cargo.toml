@@ -14,6 +14,8 @@ members = [
     "crates/plugin",
     # LSP 客户端基础层：分帧 stdio 传输、请求关联、通知广播、生命周期、文档同步。
     "crates/lsp",
+    # 语法解析层（tree-sitter）：增量解析与符号表，`search.symbols` 的精确来源。
+    "crates/parser",
     "crates/core",
 ]
 
@@ -102,8 +104,15 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
 ] }
 
+# 语法解析（tree-sitter）：符号表要的是「真实语法树」，不是正则猜出来的行首声明。
+# 语法库是 C 代码，随 crate 一起编译，因此不依赖用户机器上的工具链之外的东西。
+tree-sitter = "0.24"
+tree-sitter-typescript = "0.23"
+tree-sitter-python = "0.23"
+
 # 内部 crate
 ai-ide-protocol = { path = "crates/protocol" }
+ai-ide-parser = { path = "crates/parser" }
 ai-ide-workspace = { path = "crates/workspace" }
 ai-ide-indexer = { path = "crates/indexer" }
 ai-ide-llm = { path = "crates/llm" }

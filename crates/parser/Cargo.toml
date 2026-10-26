@@ -1,0 +1,14 @@
+[package]
+name = "ai-ide-parser"
+description = "AI IDE 语法解析内核：tree-sitter 增量解析与符号表（TS / TSX / Python 先行）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ai-ide-protocol = { workspace = true }
+
+tree-sitter = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+tree-sitter-python = { workspace = true }
