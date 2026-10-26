@@ -313,18 +313,24 @@ describe('checkRendererCall', () => {
       // 7006 脏工作区、7007 非快进、7008 认证、7009 无上游、7010 stash 冲突
       // 都带结构化 data，外壳会逐条渲染，不会静默吞掉；`drop` 与强推另有确认弹窗。
       'git.checkout',
+      // 缺口第四、五批：单 hunk 暂存与冲突按侧解决。放行理由与上面一致——错误码
+      // （7002 无此 hunk / 7013 文件已不在冲突态）都带结构化 data，外壳会逐条提示。
       'git.commit',
+      'git.conflict_read',
+      'git.conflict_resolve',
       'git.diff',
       'git.fetch',
       'git.pull',
       'git.push',
       'git.stage',
+      'git.stage_hunk',
       'git.stash',
       'git.stash_apply',
       'git.stash_drop',
       'git.stash_list',
       'git.stash_pop',
       'git.status',
+      'git.unstage_hunk',
       // 切片三：内联编辑只放行 `propose`——写盘仍是 `workspace.write_file`，
       // 内核不越权改文件，外壳也就没必要给它开一个新口子。
       'inline_edit.propose',

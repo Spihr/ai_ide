@@ -159,6 +159,22 @@ const RENDERER_ALLOWED = new Set<string>([
   Methods.git.stashApply,
   Methods.git.stashDrop,
 
+  // 缺口第四批 / 第五批：单 hunk 暂存与合并冲突解决（四条）。
+  //
+  // 这两组的作用面都比「整文件暂存」更窄，但都不是无害操作，放行理由逐条写清：
+  //   - `git.stage_hunk` / `git.unstage_hunk` 只动索引里的**一块**，定位靠 `index`
+  //     + 四个行号；文件在用户点击前又被改过就报 7011，不会把没选的内容塞进索引。
+  //     二进制文件直接 7012 拒绝，协议里没有「按块暂存二进制」这种可能。
+  //   - `git.conflict_read` 是只读（读工作区文件的三段内容），无副作用。
+  //   - `git.conflict_resolve` 会写工作区文件并 `git add`，但只对**当前确实处于未合并
+  //     状态**的文件生效（否则 7013 非冲突状态），落盘内容来自用户在冲突界面里选的
+  //     一侧或自己写的全文；`expect_blocks` / `expect_start_line` 是乐观锁，布局变了
+  //     即 7014，绝不按过期布局硬切。因此它不弱于已放行的 `git.stash_pop`。
+  Methods.git.stageHunk,
+  Methods.git.unstageHunk,
+  Methods.git.conflictRead,
+  Methods.git.conflictResolve,
+
   // M7：MCP。五条同样是「用户显式动作」的后果——打开 MCP 视图才 `servers` / `tools`、
   // 点某个 Server 的「连接 / 断开」才 `connect` / `disconnect`、在面板里手写一条参数
   // 并按「执行」才 `call`。

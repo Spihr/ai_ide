@@ -23,16 +23,20 @@ import {
   type GitBranchesResult,
   type GitCheckoutResult,
   type GitCommitResult,
+  type GitConflictReadResult,
+  type GitConflictResolveResult,
   type GitDiffResult,
   type GitFetchResult,
   type GitPullResult,
   type GitPushResult,
   type GitStageResult,
+  type GitStageHunkResult,
   type GitStashApplyResult,
   type GitStashDropResult,
   type GitStashListResult,
   type GitStashResult,
-  type GitStatusResult
+  type GitStatusResult,
+  type GitUnstageHunkResult
 } from '@ai-ide/shared-types'
 
 import { decodeRpcErrorPayload, stripRpcErrorPayload } from '../../shared/ipc'
@@ -110,6 +114,119 @@ export function parseUnifiedDiff(text: string): GitDiffLine[] {
   return lines
 }
 
+/**
+ * hunk 头（带行数）：`@@ -12,7 +12,9 @@ 上下文`。
+ *
+ * 与 `HUNK_HEADER` 的差别只在于**必须**拿到行数：`git.stage_hunk` 的定位是
+ * 「`index` + 四个行号」，行数缺省时按 unified diff 的老规矩补 1（不是 0），
+ * 少一个数字就会让内核的 7011 校验一直对不上。
+ */
+const HUNK_HEADER_FULL = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@ ?(.*)$/
+
+/**
+ * 一块可暂存的 hunk：内核要的定位四元组 + 它在 `parseUnifiedDiff` 结果里的区间。
+ *
+ * `from` / `to` 是**行数组下标**（含头行），面板据此把按钮挂在块的头上；`path`
+ * 来自该块所属文件的 `+++ b/...`，多文件 diff 里也能对得上 `git.stage_hunk` 的参数。
+ *
+ * `index` 是**文件内**序号（每遇一个 `diff --git` 归零）——内核按文件内序号解析，
+ * 跨文件累加会让第二份文件的第 0 块被当成第 N 块。
+ */
+export interface GitDiffHunk {
+  /** 文件内序号（0 起）。 */
+  index: number
+  /** 所属文件路径（相对仓库根，正斜杠）；取不到时为空串。 */
+  path: string
+  oldStart: number
+  oldLines: number
+  newStart: number
+  newLines: number
+  /** `@@` 之后的上下文（可能为空串）。 */
+  header: string
+  /** 在 `parseUnifiedDiff` 结果中的起始下标（头行）。 */
+  from: number
+  /** 在 `parseUnifiedDiff` 结果中的结束下标（末行，含）。 */
+  to: number
+}
+
+/**
+ * 从 `parseUnifiedDiff` 的行数组里切出 hunk 清单。
+ *
+ * 只做「切块 + 报四个行号」，不解释内容；真正的合法性仍由内核复核（7011）。之所以
+ * 前端也要算一遍：`git.diff` 只回原文，而按钮必须挂在块上，前端不切块就没有挂点。
+ */
+export function parseDiffHunks(lines: GitDiffLine[]): GitDiffHunk[] {
+  const hunks: GitDiffHunk[] = []
+  let path = ''
+  let fileIndex = 0
+  let open: GitDiffHunk | null = null
+
+  const close = (to: number): void => {
+    if (open === null) return
+    open.to = Math.max(open.from, to)
+    open = null
+  }
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i]
+    if (line === undefined) continue
+
+    if (line.kind === 'meta') {
+      // 多文件 diff：新文件的 `diff --git` 先把上一块的区间收口。
+      if (line.text.startsWith('diff --git ')) {
+        close(i - 1)
+        path = ''
+        fileIndex = 0
+        continue
+      }
+      const plus = /^\+\+\+ (.+)$/.exec(line.text)
+      if (plus !== null) {
+        const raw = (plus[1] ?? '').trim()
+        path = raw === '/dev/null' ? '' : raw.replace(/^b\//, '')
+      }
+      continue
+    }
+
+    if (line.kind !== 'hunk') continue
+    const matched = HUNK_HEADER_FULL.exec(line.text)
+    if (matched === null) continue
+
+    close(i - 1)
+    open = {
+      index: fileIndex,
+      path,
+      oldStart: Number(matched[1]),
+      // 缺省行数是 1（`@@ -5 +5 @@` 就是一行），不是 0。
+      oldLines: matched[2] === undefined ? 1 : Number(matched[2]),
+      newStart: Number(matched[3]),
+      newLines: matched[4] === undefined ? 1 : Number(matched[4]),
+      header: matched[5] ?? '',
+      from: i,
+      to: i
+    }
+    fileIndex += 1
+    hunks.push(open)
+  }
+
+  close(lines.length - 1)
+  return hunks
+}
+
+/** 冲突类型 → 中文短标签；未知类型原样返回。 */
+export function conflictKindLabel(kind: string): string {
+  const labels: Record<string, string> = {
+    both_modified: '双方都改',
+    both_added: '双方都新增',
+    both_deleted: '双方都删除',
+    deleted_by_us: '我们删除 / 对方修改',
+    deleted_by_them: '对方删除 / 我们修改',
+    added_by_us: '我们新增',
+    added_by_them: '对方新增',
+    other: '其它冲突'
+  }
+  return labels[kind] ?? kind
+}
+
 const GIT_ERROR_HINTS: Record<number, string> = {
   7001: '找不到可执行的 git：确认 git 已安装并在 PATH 里。',
   7002: '当前工作区不是 Git 仓库：请先 `git init` 或换一个仓库内的工作区。',
@@ -122,7 +239,14 @@ const GIT_ERROR_HINTS: Record<number, string> = {
   7007: '非快进：远端已有你本地没有的提交，先 pull（快进）再 push；强推请用「强制推送」并二次确认。',
   7008: '远端认证失败：检查凭据（HTTPS token / SSH key）或远端地址，重试不会解决。',
   7009: '当前分支没有上游分支：先设置 upstream（如 `git push -u origin <branch>`）再操作。',
-  7010: 'stash 取出时撞上冲突：条目**仍在**列表里（没有丢），解完冲突后再 pop / drop。'
+  7010: 'stash 取出时撞上冲突：条目**仍在**列表里（没有丢），解完冲突后再 pop / drop。',
+  // 7011~7014：缺口第四批 / 第五批（单 hunk 暂存与合并冲突）。这四条的共同点是
+  // 「内核拒绝了，因为外壳手里的布局已经过期」或「这个对象本来就不支持该操作」，
+  // 所以文案直接说该刷新 / 该换一种解决方式，而不是笼统的「操作失败」。
+  7011: '文件在你点击之后又变了，这块 hunk 的位置已经对不上：已拒绝暂存（没有误暂存别的内容），请刷新 diff 后重试。',
+  7012: '二进制文件没有 hunk，不能按块暂存：请改用「暂存整个文件」。',
+  7013: '该文件当前不在冲突状态（可能已被解决，或冲突来自 stash）：刷新后重新选择要解决的文件。',
+  7014: '冲突块布局已变化（文件被外部改写，或你之前已解决过一块）：已拒绝按旧布局硬切，请重新读取冲突内容。'
 }
 
 /** 错误码 → 人话；未知码返回空串，由调用方回落到原始 message。 */
@@ -366,5 +490,88 @@ export const gitApi = {
     window.aiide.request(Methods.git.stashDrop, {
       ...withWorkspace(input.workspaceId),
       ...(input.index === undefined ? {} : { index: input.index })
-    }) as Promise<GitStashDropResult>
+    }) as Promise<GitStashDropResult>,
+
+  // -------------------------------------------------------------------------
+  // 缺口第四批：单 hunk 暂存
+  // -------------------------------------------------------------------------
+
+  /**
+   * 只暂存一块。定位是 `index` + 四个行号，**不是**只给序号：文件在用户点击之前
+   * 又被改过时内核报 `7011`，宁可拒绝也不按序号猜着暂存。二进制文件报 `7012`。
+   */
+  stageHunk: (input: {
+    workspaceId: string | null
+    path: string
+    hunk: Pick<GitDiffHunk, 'index' | 'oldStart' | 'oldLines' | 'newStart' | 'newLines'>
+  }): Promise<GitStageHunkResult> =>
+    window.aiide.request(Methods.git.stageHunk, {
+      ...withWorkspace(input.workspaceId),
+      path: input.path,
+      index: input.hunk.index,
+      old_start: input.hunk.oldStart,
+      old_lines: input.hunk.oldLines,
+      new_start: input.hunk.newStart,
+      new_lines: input.hunk.newLines
+    }) as Promise<GitStageHunkResult>,
+
+  /** 只从索引里撤出一块（`git apply --cached --reverse`）；失败语义同 `stageHunk`。 */
+  unstageHunk: (input: {
+    workspaceId: string | null
+    path: string
+    hunk: Pick<GitDiffHunk, 'index' | 'oldStart' | 'oldLines' | 'newStart' | 'newLines'>
+  }): Promise<GitUnstageHunkResult> =>
+    window.aiide.request(Methods.git.unstageHunk, {
+      ...withWorkspace(input.workspaceId),
+      path: input.path,
+      index: input.hunk.index,
+      old_start: input.hunk.oldStart,
+      old_lines: input.hunk.oldLines,
+      new_start: input.hunk.newStart,
+      new_lines: input.hunk.newLines
+    }) as Promise<GitUnstageHunkResult>,
+
+  // -------------------------------------------------------------------------
+  // 缺口第五批：合并冲突
+  // -------------------------------------------------------------------------
+
+  /**
+   * 读一个冲突文件的三段内容。
+   *
+   * `blocks` 为空**不代表没冲突**：二进制冲突、一侧被删（`DU` / `UD`）都属于
+   * 「有冲突但没有标记可解析」，面板必须据 `kind` / `present` 换一套按钮。
+   */
+  conflictRead: (input: {
+    workspaceId: string | null
+    path: string
+  }): Promise<GitConflictReadResult> =>
+    window.aiide.request(Methods.git.conflictRead, {
+      ...withWorkspace(input.workspaceId),
+      path: input.path
+    }) as Promise<GitConflictReadResult>,
+
+  /**
+   * 解决一个冲突文件。
+   *
+   * 优先级：`content` > `side`。`expectBlocks` / `expectStartLine` 是乐观锁——
+   * 与现状不符即 `7014`，不会拿过期布局硬切。非冲突文件报 `7013`。
+   */
+  conflictResolve: (input: {
+    workspaceId: string | null
+    path: string
+    side?: 'ours' | 'theirs' | 'both'
+    theirsFirst?: boolean
+    content?: string
+    expectBlocks?: number
+    expectStartLine?: number
+  }): Promise<GitConflictResolveResult> =>
+    window.aiide.request(Methods.git.conflictResolve, {
+      ...withWorkspace(input.workspaceId),
+      path: input.path,
+      ...(input.side === undefined ? {} : { side: input.side }),
+      theirs_first: input.theirsFirst ?? false,
+      ...(input.content === undefined ? {} : { content: input.content }),
+      ...(input.expectBlocks === undefined ? {} : { expect_blocks: input.expectBlocks }),
+      ...(input.expectStartLine === undefined ? {} : { expect_start_line: input.expectStartLine })
+    }) as Promise<GitConflictResolveResult>
 }

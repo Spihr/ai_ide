@@ -1342,6 +1342,62 @@ button {
   color: #6b737f;
 }
 
+/* 带按块暂存按钮的 hunk 头：多一列按钮，且按钮不许被长头撑歪 */
+.git-diff__line--actionable {
+  grid-template-columns: 34px 34px 1fr auto;
+  align-items: center;
+}
+
+.git-diff__hunk {
+  white-space: nowrap;
+}
+
+/*
+ * 冲突面板：刻意不用 diff 的配色——冲突块是「要你做选择」的区域，不是差异展示。
+ * 三段各给一条左边框（我的蓝、基准灰、他们的橙），一眼能分清哪段是谁的。
+ */
+.git-conflict {
+  margin-top: 8px;
+  border: 1px solid #2a3038;
+  border-radius: 6px;
+  padding: 6px 8px;
+  background: #101419;
+}
+
+.git-conflict__block {
+  margin: 6px 0;
+  padding: 6px;
+  border-radius: 4px;
+  background: rgba(200, 160, 60, 0.08);
+}
+
+.git-conflict__side {
+  margin: 4px 0 4px 6px;
+  padding-left: 6px;
+  border-left: 2px solid #2f3742;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+}
+
+.git-conflict__side:nth-of-type(1) {
+  border-left-color: #3d7fd0;
+}
+
+.git-conflict__side:nth-of-type(3) {
+  border-left-color: #c98a3a;
+}
+
+.git-conflict__label {
+  display: block;
+  color: #8a93a0;
+  font-size: 11px;
+  user-select: none;
+}
+
+.git-conflict__line {
+  white-space: pre;
+}
+
 /*
  * M7：MCP 面板。
  *

@@ -296,6 +296,11 @@ describe('协议常量', () => {
       'git.stash_pop',
       'git.stash_apply',
       'git.stash_drop',
+      // 缺口第四、五批：单 hunk 暂存两项 + 冲突按侧解决四项里剩下的两项。
+      'git.stage_hunk',
+      'git.unstage_hunk',
+      'git.conflict_read',
+      'git.conflict_resolve',
       'mcp.servers',
       'mcp.connect',
       'mcp.disconnect',
@@ -330,8 +335,9 @@ describe('协议常量', () => {
     // IMPLEMENTED：声明表恢复为空才是常态。若这里非空，说明有人加了协议方法却忘了接线。
     expect([...DECLARED_NOT_IMPLEMENTED_METHODS]).toEqual([])
     // 能力数 74 → 79：lsp 五项进清单；79 → 80：P5 切片八补 plugin.load_many；
-    // 80 → 89：缺口第二批补 Git 深化（checkout / fetch / pull / push / stash 五项）。
-    expect(IMPLEMENTED_METHODS).toHaveLength(89)
+    // 80 → 89：缺口第二批补 Git 深化（checkout / fetch / pull / push / stash 五项）；
+    // 89 → 93：缺口第四、五批补单 hunk 暂存两项与冲突按侧解决两项。
+    expect(IMPLEMENTED_METHODS).toHaveLength(93)
     for (const method of DECLARED_NOT_IMPLEMENTED_METHODS) {
       // 虚报能力会让外壳照单调进一片 -32601，互斥关系必须钉死。
       expect(IMPLEMENTED_METHODS as readonly string[]).not.toContain(method)

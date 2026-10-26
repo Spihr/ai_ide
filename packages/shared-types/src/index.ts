@@ -537,6 +537,14 @@ export const Methods = {
     stashPop: "git.stash_pop",
     stashApply: "git.stash_apply",
     stashDrop: "git.stash_drop",
+    // 缺口第四批：单 hunk 暂存。定位靠 `index` + 四个行号（不是只按序号），
+    // 文件在用户点之前又被改过时内核报 7011，绝不按序号猜着暂存。
+    stageHunk: "git.stage_hunk",
+    unstageHunk: "git.unstage_hunk",
+    // 缺口第五批：合并冲突。读侧给三段（ours / base / theirs）与行号区间，
+    // 解决侧支持按侧整份、按比例拼接或自定义全文，并回报剩余冲突文件。
+    conflictRead: "git.conflict_read",
+    conflictResolve: "git.conflict_resolve",
   },
   mcp: {
     servers: "mcp.servers",
@@ -682,6 +690,11 @@ export const IMPLEMENTED_METHODS = [
   Methods.git.stashPop,
   Methods.git.stashApply,
   Methods.git.stashDrop,
+  // 缺口第四批 / 第五批：单 hunk 暂存与合并冲突。
+  Methods.git.stageHunk,
+  Methods.git.unstageHunk,
+  Methods.git.conflictRead,
+  Methods.git.conflictResolve,
   Methods.mcp.servers,
   Methods.mcp.connect,
   Methods.mcp.disconnect,

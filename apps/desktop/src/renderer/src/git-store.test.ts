@@ -21,14 +21,20 @@ import {
   Methods,
   type GitBranchesResult,
   type GitCommitResult,
+  type GitConflictReadResult,
+  type GitConflictResolveResult,
   type GitDiffResult,
+  type GitHunk,
+  type GitStageHunkResult,
   type GitStageResult,
   type GitStatusEntry,
   type GitStatusResult,
+  type GitUnstageHunkResult,
   type WorkspaceChangedEvent
 } from '@ai-ide/shared-types'
 
 import type { AiIdeApi } from '../../shared/ipc'
+import type { GitDiffHunk } from './git-api'
 import {
   GIT_REFRESH_DELAY_MS,
   changeCount,
@@ -39,15 +45,20 @@ import {
   getGitState,
   groupEntries,
   initGit,
+  loadConflict,
   refreshGit,
+  reloadConflict,
   resetGitState,
+  resolveConflict,
   selectGitEntry,
   setCommitMessage,
   stageAll,
   stageEntry,
+  stageHunk,
   stagedCount,
   unstageAll,
-  unstageEntry
+  unstageEntry,
+  unstageHunk
 } from './git-store'
 import { closeTab, closeWorkspace, getEditorState, openWorkspace } from './store'
 
@@ -70,6 +81,8 @@ interface Harness {
   deferDiff: () => { release: (diff: GitDiffResult) => void }
   /** 模拟内核推进一条 `workspace.changed`。 */
   pushWorkspaceChanged: (workspaceId: string) => void
+  /** 让下一次 `git.conflict_resolve` 回执带上「还剩这些冲突文件」。 */
+  setRemaining: (paths: string[]) => void
   /** `initGit` 之后才会被赋值。 */
   hasWorkspaceListener: () => boolean
 }
@@ -110,6 +123,8 @@ function installHarness(): Harness {
   let deferNextDiff = false
   let pendingDiff: { resolve: (diff: GitDiffResult) => void } | null = null
   let workspaceListener: ((event: WorkspaceChangedEvent) => void) | null = null
+  /** 下一次 `git.conflict_resolve` 回执里「还剩哪些冲突文件」。 */
+  let remaining: string[] = []
 
   const api: AiIdeApi = {
     getCoreStatus: async () => {
@@ -184,6 +199,57 @@ function installHarness(): Harness {
           }
           return result
         }
+        // 单 hunk 与冲突两组：回显就用请求里的四个行号，外壳不该自己再算一遍。
+        case Methods.git.stageHunk:
+        case Methods.git.unstageHunk: {
+          const hunk: GitHunk = {
+            path: String(typed?.path ?? ''),
+            index: Number(typed?.index ?? 0),
+            old_start: Number(typed?.old_start ?? 1),
+            old_lines: Number(typed?.old_lines ?? 1),
+            new_start: Number(typed?.new_start ?? 1),
+            new_lines: Number(typed?.new_lines ?? 1),
+            header: '',
+            lines: []
+          }
+          if (method === Methods.git.stageHunk) {
+            const staged: GitStageHunkResult = { hunk, staged_total: 3 }
+            return staged
+          }
+          const unstaged: GitUnstageHunkResult = { hunk, staged_total: 2 }
+          return unstaged
+        }
+        case Methods.git.conflictRead: {
+          const read: GitConflictReadResult = {
+            path: String(typed?.path ?? ''),
+            kind: 'both_modified',
+            xy: 'UU',
+            present: true,
+            blocks: [
+              {
+                index: 0,
+                start_line: 3,
+                end_line: 7,
+                ours_label: 'HEAD',
+                theirs_label: 'feature',
+                ours: ['ours'],
+                theirs: ['theirs']
+              }
+            ]
+          }
+          return read
+        }
+        case Methods.git.conflictResolve: {
+          const resolved: GitConflictResolveResult = {
+            path: String(typed?.path ?? ''),
+            kind: 'both_modified',
+            resolved: true,
+            still_conflicted: false,
+            resolved_blocks: 1,
+            remaining
+          }
+          return resolved
+        }
         case Methods.git.commit: {
           const result: GitCommitResult = {
             oid: 'c'.repeat(40),
@@ -256,6 +322,9 @@ function installHarness(): Harness {
     },
     pushWorkspaceChanged: (workspaceId) => {
       workspaceListener?.({ workspace_id: workspaceId, changes: [] })
+    },
+    setRemaining: (paths) => {
+      remaining = paths
     },
     hasWorkspaceListener: () => workspaceListener !== null
   }
@@ -660,5 +729,204 @@ describe('initGit（workspace.changed 去抖刷新）', () => {
 
     expect(callsOf(Methods.git.status)).toHaveLength(before)
     expect(h.hasWorkspaceListener()).toBe(false)
+  })
+})
+
+describe('单 hunk 暂存', () => {
+  const HUNK: GitDiffHunk = {
+    index: 0,
+    path: 'a.ts',
+    oldStart: 10,
+    oldLines: 2,
+    newStart: 10,
+    newLines: 3,
+    header: '',
+    from: 1,
+    to: 4
+  }
+
+  async function selectChanged(): Promise<void> {
+    await openWorkspace(ROOT)
+    h.setEntries([entry({ path: 'a.ts', worktree: 'M', kind: 'changed' })])
+    await refreshGit()
+    await selectGitEntry(entry({ path: 'a.ts', worktree: 'M', kind: 'changed' }), false)
+  }
+
+  it('暂存一块：发的是序号 + 四个行号，不是只发序号', async () => {
+    await selectChanged()
+
+    const ok = await stageHunk(HUNK)
+
+    expect(ok).toBe(true)
+    expect(callsOf(Methods.git.stageHunk)[0]?.params).toEqual({
+      workspace_id: 'ws-1',
+      path: 'a.ts',
+      index: 0,
+      old_start: 10,
+      old_lines: 2,
+      new_start: 10,
+      new_lines: 3
+    })
+    const state = getGitState()
+    expect(state.hunkBusy).toBeNull()
+    expect(state.hint).toContain('第 1 块')
+  })
+
+  it('成功之后重拉状态与 diff（不然按钮落在了已经变过的块上）', async () => {
+    await selectChanged()
+    const statusBefore = callsOf(Methods.git.status).length
+    const diffBefore = callsOf(Methods.git.diff).length
+
+    await stageHunk(HUNK)
+
+    expect(callsOf(Methods.git.status).length).toBe(statusBefore + 1)
+    expect(callsOf(Methods.git.diff).length).toBe(diffBefore + 1)
+  })
+
+  it('撤出一块走 unstage_hunk，参数同构', async () => {
+    await openWorkspace(ROOT)
+    h.setEntries([entry({ path: 'a.ts', index: 'M', kind: 'changed' })])
+    await refreshGit()
+    await selectGitEntry(entry({ path: 'a.ts', index: 'M', kind: 'changed' }), true)
+
+    const ok = await unstageHunk(HUNK)
+
+    expect(ok).toBe(true)
+    expect(callsOf(Methods.git.unstageHunk)[0]?.params).toMatchObject({
+      path: 'a.ts',
+      index: 0,
+      old_start: 10,
+      new_lines: 3
+    })
+    expect(getGitState().hunkBusy).toBeNull()
+  })
+
+  it('内核报 7011（块已变化）：不留锁、把错误码原样交给 UI', async () => {
+    await selectChanged()
+
+    const request = vi
+      .spyOn(window.aiide, 'request')
+      .mockRejectedValueOnce(new Error('git.stage_hunk 失败 [7011]: hunk 与当前文件不符'))
+    const ok = await stageHunk(HUNK)
+
+    expect(ok).toBe(false)
+    const state = getGitState()
+    expect(state.hunkBusy).toBeNull()
+    expect(state.errorCode).toBe(7011)
+    request.mockRestore()
+  })
+
+  it('没选中文件时本地拦掉，不发请求', async () => {
+    await openWorkspace(ROOT)
+
+    const ok = await stageHunk(HUNK)
+
+    expect(ok).toBe(false)
+    expect(callsOf(Methods.git.stageHunk)).toHaveLength(0)
+    expect(getGitState().hint).toContain('文件')
+  })
+})
+
+describe('合并冲突', () => {
+  const CONFLICT = entry({ path: 'c.ts', index: 'U', worktree: 'U', kind: 'unmerged' })
+
+  async function selectConflict(): Promise<void> {
+    await openWorkspace(ROOT)
+    h.setEntries([CONFLICT])
+    await refreshGit()
+    await selectGitEntry(CONFLICT, false)
+  }
+
+  it('选中未合并文件时自动读冲突块（用户不用再点一次）', async () => {
+    await selectConflict()
+
+    expect(callsOf(Methods.git.conflictRead)).toHaveLength(1)
+    const state = getGitState()
+    expect(state.conflict?.path).toBe('c.ts')
+    expect(state.conflict?.blocks).toHaveLength(1)
+    expect(state.conflictLoading).toBe(false)
+  })
+
+  it('解决：带上乐观锁，成功后清空面板并留回执', async () => {
+    await selectConflict()
+
+    const ok = await resolveConflict({ side: 'ours' })
+
+    expect(ok).toBe(true)
+    expect(callsOf(Methods.git.conflictResolve)[0]?.params).toEqual({
+      workspace_id: 'ws-1',
+      path: 'c.ts',
+      side: 'ours',
+      theirs_first: false,
+      expect_blocks: 1,
+      expect_start_line: 3
+    })
+    const state = getGitState()
+    expect(state.conflict).toBeNull()
+    expect(state.conflictBusy).toBe(false)
+    expect(state.lastConflictResolve?.remaining).toEqual([])
+    expect(state.hint).toContain('c.ts')
+  })
+
+  it('还有别的冲突文件时自动切到下一个', async () => {
+    h.setRemaining(['d.ts'])
+    await selectConflict()
+
+    await resolveConflict({ side: 'both', theirsFirst: true })
+
+    expect(callsOf(Methods.git.conflictResolve)[0]?.params).toMatchObject({
+      side: 'both',
+      theirs_first: true
+    })
+    expect(callsOf(Methods.git.conflictRead).map((call) => call.params?.path)).toEqual([
+      'c.ts',
+      'd.ts'
+    ])
+    expect(getGitState().conflict?.path).toBe('d.ts')
+  })
+
+  it('内核报 7014（布局已变）：保留面板让用户重读，而不是硬切', async () => {
+    await selectConflict()
+
+    const request = vi
+      .spyOn(window.aiide, 'request')
+      .mockRejectedValueOnce(new Error('git.conflict_resolve 失败 [7014]: 冲突块已变化'))
+    const ok = await resolveConflict({ side: 'ours' })
+
+    expect(ok).toBe(false)
+    const state = getGitState()
+    expect(state.conflictBusy).toBe(false)
+    expect(state.errorCode).toBe(7014)
+    expect(state.conflict?.path).toBe('c.ts')
+    request.mockRestore()
+  })
+
+  it('reloadConflict 用当前冲突路径重读', async () => {
+    await selectConflict()
+
+    await reloadConflict()
+
+    expect(callsOf(Methods.git.conflictRead).map((call) => call.params?.path)).toEqual([
+      'c.ts',
+      'c.ts'
+    ])
+  })
+
+  it('没有选中冲突文件时本地拦掉', async () => {
+    await openWorkspace(ROOT)
+
+    const ok = await resolveConflict({ side: 'ours' })
+
+    expect(ok).toBe(false)
+    expect(callsOf(Methods.git.conflictResolve)).toHaveLength(0)
+    expect(getGitState().hint).toContain('冲突')
+  })
+
+  it('清掉选中后冲突面板一起收口', async () => {
+    await selectConflict()
+
+    clearGitSelection()
+
+    expect(getGitState().conflict).toBeNull()
   })
 })

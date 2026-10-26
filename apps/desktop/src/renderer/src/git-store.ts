@@ -30,6 +30,8 @@ import { useSyncExternalStore } from 'react'
 import type {
   GitBranch,
   GitCommitResult,
+  GitConflictReadResult,
+  GitConflictResolveResult,
   GitDiffResult,
   GitPushResult,
   GitStashDropResult,
@@ -38,7 +40,7 @@ import type {
   GitStatusResult
 } from '@ai-ide/shared-types'
 
-import { describeGitError, describeGitFailure, gitApi } from './git-api'
+import { describeGitError, describeGitFailure, gitApi, type GitDiffHunk } from './git-api'
 import { getEditorState } from './store'
 
 /** `workspace.changed` 之后延迟多久重拉状态。watcher 一次保存会推多条，去抖省进程。 */
@@ -122,6 +124,21 @@ export interface GitState {
   confirm: GitConfirm | null
   /** 最后一次成功的推送回执（面板据此展示「推到了哪里」）。 */
   lastPush: GitPushResult | null
+  /**
+   * 正在进行的单 hunk 操作键（`stage:0` / `unstage:2`）；`null` 表示没有。
+   *
+   * 不用全局 `busy`：按块暂存时其它块的按钮不该一起变灰，否则用户会以为整份 diff
+   * 都动不了。键里带方向，是因为同一块的「暂存」与「取消暂存」在两个分组里各有一份。
+   */
+  hunkBusy: string | null
+  /** 当前冲突文件的解析结果（`blocks` 为空也可能有冲突，见 `kind`）。 */
+  conflict: GitConflictReadResult | null
+  /** 冲突内容加载中。 */
+  conflictLoading: boolean
+  /** 冲突解决请求进行中。 */
+  conflictBusy: boolean
+  /** 上一次解决冲突的回执（带剩余冲突文件，面板据此收口）。 */
+  lastConflictResolve: GitConflictResolveResult | null
 }
 
 function initialState(): GitState {
@@ -147,7 +164,12 @@ function initialState(): GitState {
     stashLoading: false,
     lastStashDrop: null,
     confirm: null,
-    lastPush: null
+    lastPush: null,
+    hunkBusy: null,
+    conflict: null,
+    conflictLoading: false,
+    conflictBusy: false,
+    lastConflictResolve: null
   }
 }
 
@@ -276,13 +298,20 @@ export async function refreshGit(): Promise<boolean> {
 
     const selected = state.selected
     const keep = selected !== null && stillSelected(status.entries, selected)
+    // 冲突面板只对「此刻仍是未合并」的文件有意义：解完冲突后条目会变成 `MM` 或直接从
+    // 清单里消失，这一步不主动收口就会留着一份已解决文件的冲突块，用户会以为还没解决。
+    const stillUnmerged =
+      keep &&
+      selected !== null &&
+      status.entries.some((item) => item.path === selected.path && item.kind === 'unmerged')
     setState({
       loading: false,
       status,
       branches: branches.branches,
       stashes: stashes.entries,
       selected: keep ? selected : null,
-      diff: keep ? state.diff : null
+      diff: keep ? state.diff : null,
+      conflict: stillUnmerged ? state.conflict : null
     })
     return true
   } catch (error) {
@@ -296,6 +325,8 @@ export async function refreshGit(): Promise<boolean> {
       stashes: [],
       selected: null,
       diff: null,
+      conflict: null,
+      conflictLoading: false,
       error: describeGitError(error),
       errorCode: failure.code,
       errorFiles: failure.files,
@@ -309,6 +340,9 @@ export async function refreshGit(): Promise<boolean> {
 /** diff 请求序号：连点两条变更时，先发的慢结果不许盖住后发的。 */
 let diffSeq = 0
 
+/** 冲突读取序号：同一道理，连点两个冲突文件时只认最后一次。 */
+let conflictSeq = 0
+
 /**
  * 选中一条变更并拉它的 diff。
  *
@@ -321,6 +355,8 @@ export async function selectGitEntry(entry: GitStatusEntry, staged: boolean): Pr
     selected: { path: entry.path, staged, kind: entry.kind, letter },
     diff: null,
     diffLoading: entry.kind !== 'untracked',
+    // 换文件时旧冲突块必须立刻消失，否则用户会以为新选的文件也冲突。
+    conflict: null,
     error: null
   })
   if (entry.kind === 'untracked') return true
@@ -331,6 +367,8 @@ export async function selectGitEntry(entry: GitStatusEntry, staged: boolean): Pr
     const diff = await gitApi.diff({ workspaceId, path: entry.path, staged, contextLines: 3 })
     if (seq !== diffSeq) return false
     setState({ diff, diffLoading: false })
+    // 冲突文件额外读一次三段内容：diff 里只有标记行，解决按钮要的是块级布局。
+    if (entry.kind === 'unmerged') await loadConflict(entry.path)
     return true
   } catch (error) {
     if (seq !== diffSeq) return false
@@ -341,7 +379,9 @@ export async function selectGitEntry(entry: GitStatusEntry, staged: boolean): Pr
 
 export function clearGitSelection(): void {
   diffSeq += 1
-  setState({ selected: null, diff: null, diffLoading: false })
+  // 冲突读取也要作废：否则清空选中后，慢回来的冲突结果会把面板又点亮。
+  conflictSeq += 1
+  setState({ selected: null, diff: null, diffLoading: false, conflict: null, conflictLoading: false })
 }
 
 export function setCommitMessage(message: string): void {
@@ -409,6 +449,89 @@ export function stageAll(): Promise<boolean> {
 /** 取消暂存全部。 */
 export function unstageAll(): Promise<boolean> {
   return stage({ all: true, unstage: true })
+}
+
+// ---------------------------------------------------------------------------
+// 单 hunk 暂存（缺口第四批）
+// ---------------------------------------------------------------------------
+
+/** 重拉当前选中的 diff：按块操作之后原文变了，不重拉按钮还挂在旧行号上。 */
+async function reloadDiff(): Promise<void> {
+  const selected = state.selected
+  const workspaceId = activeWorkspaceId()
+  if (selected === null || workspaceId === null) return
+
+  diffSeq += 1
+  const seq = diffSeq
+  try {
+    const diff = await gitApi.diff({
+      workspaceId,
+      path: selected.path,
+      staged: selected.staged,
+      contextLines: 3
+    })
+    if (seq !== diffSeq) return
+    setState({ diff, diffLoading: false })
+  } catch (error) {
+    if (seq !== diffSeq) return
+    setState({ diffLoading: false, error: describeGitError(error) })
+  }
+}
+
+/**
+ * 按块暂存 / 取消暂存。
+ *
+ * 只发 `index` + 四个行号，内核会拿**当前** diff 复核，对不上就 `7011` 并拒绝。
+ * 这里不做「失败后退化成整文件暂存」的补偿——那正是用户点「暂存这一块」时
+ * 明确不想发生的事。
+ */
+async function hunkAction(action: 'stage' | 'unstage', hunk: GitDiffHunk): Promise<boolean> {
+  const workspaceId = activeWorkspaceId()
+  const selected = state.selected
+  if (workspaceId === null) {
+    setState({ hint: 'Git 面板需要先打开工作区。' })
+    return false
+  }
+  // 没选中文件时块属于谁都不知道，不能瞎发。
+  if (selected === null) {
+    setState({ hint: '先选中一个文件，再按块暂存。' })
+    return false
+  }
+  // 同一时刻只放行一块：并发两次 `git apply --cached` 会争同一个 index.lock。
+  if (state.hunkBusy !== null) return false
+
+  setState({ hunkBusy: `${action}:${hunk.index}`, error: null, errorCode: null, errorFiles: [], hint: null })
+  try {
+    const result =
+      action === 'stage'
+        ? await gitApi.stageHunk({ workspaceId, path: selected.path, hunk })
+        : await gitApi.unstageHunk({ workspaceId, path: selected.path, hunk })
+    setState({
+      hunkBusy: null,
+      hint:
+        action === 'stage'
+          ? `已暂存 ${selected.path} 的第 ${result.hunk.index + 1} 块（暂存区共 ${result.staged_total}）`
+          : `已从暂存区撤出 ${selected.path} 的第 ${result.hunk.index + 1} 块（暂存区共 ${result.staged_total}）`
+    })
+    // 状态与 diff 都要重拉：块被搬去另一边之后，旧的分组与行号都不再成立。
+    await refreshGit()
+    await reloadDiff()
+    return true
+  } catch (error) {
+    setState({ hunkBusy: null })
+    failWith(error)
+    return false
+  }
+}
+
+/** 暂存某一块（未暂存侧的按钮）。 */
+export function stageHunk(hunk: GitDiffHunk): Promise<boolean> {
+  return hunkAction('stage', hunk)
+}
+
+/** 从索引撤出某一块（已暂存侧的按钮）。 */
+export function unstageHunk(hunk: GitDiffHunk): Promise<boolean> {
+  return hunkAction('unstage', hunk)
 }
 
 // ---------------------------------------------------------------------------
@@ -898,6 +1021,100 @@ export async function confirmGitAction(): Promise<boolean> {
 /** 取消挂起的不可逆动作：什么都不发。 */
 export function cancelGitAction(): void {
   if (state.confirm !== null) setState({ confirm: null })
+}
+
+// ---------------------------------------------------------------------------
+// 合并冲突（缺口第五批）
+// ---------------------------------------------------------------------------
+
+/**
+ * 读一个冲突文件的三段内容。
+ *
+ * `blocks` 为空**不等于没冲突**：二进制冲突、一侧被删（`DU` / `UD`）都属于
+ * 「有冲突但没有标记可解析」，面板要据 `kind` / `present` 换一套按钮。
+ */
+export async function loadConflict(path: string): Promise<boolean> {
+  const workspaceId = activeWorkspaceId()
+  if (workspaceId === null) {
+    setState({ hint: 'Git 面板需要先打开工作区。' })
+    return false
+  }
+
+  conflictSeq += 1
+  const seq = conflictSeq
+  setState({ conflictLoading: true })
+  try {
+    const conflict = await gitApi.conflictRead({ workspaceId, path })
+    if (seq !== conflictSeq) return false
+    setState({ conflict, conflictLoading: false })
+    return true
+  } catch (error) {
+    if (seq !== conflictSeq) return false
+    setState({ conflictLoading: false })
+    failWith(error)
+    return false
+  }
+}
+
+/** 重新读当前冲突文件：`7014` 之后用户要做的第一件事。 */
+export function reloadConflict(): Promise<boolean> {
+  const path = state.conflict?.path ?? state.selected?.path ?? ''
+  return path.length === 0 ? Promise.resolve(false) : loadConflict(path)
+}
+
+/**
+ * 解决冲突。
+ *
+ * `side` 走「整份取一侧 / 两侧都留」，`content` 走「用改好的全文覆盖」。
+ * `expectBlocks` / `expectStartLine` 取自**当前读到的布局**，内核拿它当乐观锁：
+ * 布局变了即 `7014`，绝不按过期布局硬切（那会把用户刚手改的内容切掉）。
+ */
+export async function resolveConflict(input: {
+  side?: 'ours' | 'theirs' | 'both'
+  theirsFirst?: boolean
+  content?: string
+}): Promise<boolean> {
+  const workspaceId = activeWorkspaceId()
+  const conflict = state.conflict
+  if (workspaceId === null || conflict === null) {
+    setState({ hint: '先选中一个冲突文件。' })
+    return false
+  }
+  if (state.conflictBusy) return false
+
+  const first = conflict.blocks[0]
+  setState({ conflictBusy: true, error: null, errorCode: null, errorFiles: [], hint: null })
+  try {
+    const result = await gitApi.conflictResolve({
+      workspaceId,
+      path: conflict.path,
+      ...(input.side === undefined ? {} : { side: input.side }),
+      theirsFirst: input.theirsFirst ?? false,
+      ...(input.content === undefined ? {} : { content: input.content }),
+      expectBlocks: conflict.blocks.length,
+      ...(first === undefined ? {} : { expectStartLine: first.start_line })
+    })
+    setState({
+      conflictBusy: false,
+      lastConflictResolve: result,
+      hint: result.still_conflicted
+        ? `${result.path} 仍带冲突标记（已替换 ${result.resolved_blocks} 块），索引保持未合并`
+        : `已解决 ${result.path}（${result.resolved_blocks} 块），还剩 ${result.remaining.length} 个冲突文件`
+    })
+    // 解完一个还有下一个时，直接把下一个读出来——否则面板会停在已解决的文件上。
+    await refreshGit()
+    const next = result.remaining[0]
+    if (result.remaining.length > 0 && next !== undefined) {
+      await loadConflict(next)
+    } else {
+      setState({ conflict: null })
+    }
+    return true
+  } catch (error) {
+    setState({ conflictBusy: false })
+    failWith(error)
+    return false
+  }
 }
 
 // ---------------------------------------------------------------------------

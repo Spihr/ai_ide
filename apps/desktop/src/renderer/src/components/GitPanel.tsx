@@ -24,7 +24,7 @@ import { useEffect, useMemo, useState } from 'react'
 
 import type { GitStatusEntry, GitStashEntry } from '@ai-ide/shared-types'
 
-import { parseUnifiedDiff } from '../git-api'
+import { conflictKindLabel, parseDiffHunks, parseUnifiedDiff, type GitDiffHunk } from '../git-api'
 import {
   applyStash,
   cancelGitAction,
@@ -43,16 +43,20 @@ import {
   pushRemote,
   pushWithUpstream,
   refreshGit,
+  reloadConflict,
   requestDropStash,
   requestForcePush,
+  resolveConflict,
   saveStash,
   selectGitEntry,
   setCommitMessage,
   stageAll,
   stageEntry,
+  stageHunk,
   stagedCount,
   unstageAll,
   unstageEntry,
+  unstageHunk,
   useGit
 } from '../git-store'
 
@@ -86,6 +90,8 @@ export function GitPanel(): React.JSX.Element {
   const [includeUntracked, setIncludeUntracked] = useState(false)
   const [amend, setAmend] = useState(false)
   const [allowEmpty, setAllowEmpty] = useState(false)
+  /** 「两边都留」时 theirs 是否排在前面；只影响 `side = both` 的拼接顺序。 */
+  const [theirsFirst, setTheirsFirst] = useState(false)
 
   // 每次切到本视图都重拉一次：文件可能在别的视图里被改过、被 Agent 改过。
   useEffect(() => {
@@ -100,6 +106,13 @@ export function GitPanel(): React.JSX.Element {
     () => (state.diff === null ? [] : parseUnifiedDiff(state.diff.diff)),
     [state.diff]
   )
+  // 按钮要挂在块的头上，所以先把行数组切成块；渲染主体仍是 `lines`。
+  const hunks = useMemo(() => parseDiffHunks(lines), [lines])
+  const hunkByStart = useMemo(() => {
+    const map = new Map<number, GitDiffHunk>()
+    for (const hunk of hunks) map.set(hunk.from, hunk)
+    return map
+  }, [hunks])
   const stagedTotal = stagedCount(state.status)
   const busy = state.busy
   const branchBusy = state.loading || busy
@@ -601,22 +614,181 @@ export function GitPanel(): React.JSX.Element {
             </div>
           ) : (
             <div className="git-diff__body" data-testid="git-diff-body">
-              {lines.map((line, index) => (
-                <div
-                  key={`${index}:${line.kind}`}
-                  className={`git-diff__line git-diff__line--${line.kind}`}
-                >
-                  <span className="git-diff__no">{line.oldLine ?? ''}</span>
-                  <span className="git-diff__no">{line.newLine ?? ''}</span>
-                  <span className="git-diff__text">{line.text}</span>
-                </div>
-              ))}
+              {lines.map((line, index) => {
+                const selected = state.selected
+                const hunk = line.kind === 'hunk' ? hunkByStart.get(index) : undefined
+                // 多文件 diff 里块自带 `+++ b/<path>`：对不上当前文件的块不给按钮，
+                // 免得点了去动另一个文件的索引。取不到路径时放行，由内核复核。
+                const hunkReady =
+                  hunk !== undefined &&
+                  selected !== null &&
+                  selected.kind !== 'untracked' &&
+                  (hunk.path === '' || hunk.path === selected.path)
+                const key = hunkReady ? (selected?.staged === true ? 'unstage' : 'stage') : 'stage'
+                const pending = hunkReady && state.hunkBusy === `${key}:${hunk.index}`
+                return (
+                  <div
+                    key={`${index}:${line.kind}`}
+                    className={`git-diff__line git-diff__line--${line.kind}${
+                      hunkReady ? ' git-diff__line--actionable' : ''
+                    }`}
+                  >
+                    <span className="git-diff__no">{line.oldLine ?? ''}</span>
+                    <span className="git-diff__no">{line.newLine ?? ''}</span>
+                    <span className="git-diff__text">{line.text}</span>
+                    {hunkReady ? (
+                      <button
+                        className="ai-button ai-button--tiny git-diff__hunk"
+                        type="button"
+                        data-testid="git-hunk-action"
+                        disabled={busy || state.hunkBusy !== null}
+                        title={
+                          selected?.staged === true
+                            ? `只把第 ${hunk.index + 1} 块从暂存区撤出（git apply --cached --reverse）`
+                            : `只把第 ${hunk.index + 1} 块加入暂存区（git apply --cached）`
+                        }
+                        onClick={() =>
+                          void (selected?.staged === true ? unstageHunk(hunk) : stageHunk(hunk))
+                        }
+                      >
+                        {pending ? '处理中…' : selected?.staged === true ? '撤出此块' : '暂存此块'}
+                      </button>
+                    ) : null}
+                  </div>
+                )
+              })}
             </div>
           )}
 
           {state.diff?.truncated === true ? (
             <div className="ai-note ai-note__warn" data-testid="git-diff-truncated">
               diff 超过 1 MiB，已截断尾部（头部完整）。
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
+      {state.conflict !== null ? (
+        <div className="git-conflict" data-testid="git-conflict">
+          <div className="git-diff__head">
+            <span className="git-diff__path" title={state.conflict.path}>
+              {state.conflict.path}
+            </span>
+            <span className="ai-note" data-testid="git-conflict-kind">
+              {conflictKindLabel(state.conflict.kind)}（{state.conflict.xy}）
+            </span>
+            <button
+              className="ai-button ai-button--tiny"
+              type="button"
+              data-testid="git-conflict-reload"
+              disabled={state.conflictLoading || busy}
+              title="重新读一遍磁盘上的冲突标记（7014 之后走这里）"
+              onClick={() => void reloadConflict()}
+            >
+              重新读取
+            </button>
+          </div>
+
+          {state.conflictLoading ? <div className="ai-note">正在读取冲突…</div> : null}
+
+          {state.conflict.blocks.length === 0 ? (
+            <div className="ai-note" data-testid="git-conflict-nomarkers">
+              这个文件没有可解析的冲突标记（二进制冲突，或一侧已被删除），只能整份取一侧。
+              {state.conflict.present ? '' : ' 工作区里当前没有这个文件。'}
+            </div>
+          ) : (
+            state.conflict.blocks.map((block) => (
+              <div
+                className="git-conflict__block"
+                key={block.index}
+                data-testid="git-conflict-block"
+              >
+                <div className="ai-note">
+                  第 {block.index + 1} 块 · 行 {block.start_line}–{block.end_line}
+                </div>
+                <div className="git-conflict__side">
+                  <span className="git-conflict__label">我的（{block.ours_label}）</span>
+                  {block.ours.length === 0 ? <div className="ai-note">（空）</div> : null}
+                  {block.ours.map((text, i) => (
+                    <div className="git-conflict__line" key={`o:${block.index}:${i}`}>
+                      {text === '' ? '\u00a0' : text}
+                    </div>
+                  ))}
+                </div>
+                {block.base === undefined ? null : (
+                  <div className="git-conflict__side">
+                    <span className="git-conflict__label">
+                      基准（{block.base_label ?? 'base'}）
+                    </span>
+                    {block.base.length === 0 ? <div className="ai-note">（空）</div> : null}
+                    {block.base.map((text, i) => (
+                      <div className="git-conflict__line" key={`b:${block.index}:${i}`}>
+                        {text === '' ? '\u00a0' : text}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <div className="git-conflict__side">
+                  <span className="git-conflict__label">他们的（{block.theirs_label}）</span>
+                  {block.theirs.length === 0 ? <div className="ai-note">（空）</div> : null}
+                  {block.theirs.map((text, i) => (
+                    <div className="git-conflict__line" key={`t:${block.index}:${i}`}>
+                      {text === '' ? '\u00a0' : text}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))
+          )}
+
+          <div className="ai-row" data-testid="git-conflict-actions">
+            <button
+              className="ai-button ai-button--tiny"
+              type="button"
+              data-testid="git-conflict-ours"
+              disabled={busy || state.conflictBusy}
+              title="每块只留我的那一段，然后 git add（side = ours）"
+              onClick={() => void resolveConflict({ side: 'ours' })}
+            >
+              全部用我的
+            </button>
+            <button
+              className="ai-button ai-button--tiny"
+              type="button"
+              data-testid="git-conflict-theirs"
+              disabled={busy || state.conflictBusy}
+              title="每块只留他们的那一段，然后 git add（side = theirs）"
+              onClick={() => void resolveConflict({ side: 'theirs' })}
+            >
+              全部用他们的
+            </button>
+            <button
+              className="ai-button ai-button--tiny"
+              type="button"
+              data-testid="git-conflict-both"
+              disabled={busy || state.conflictBusy}
+              title="每块把两侧都留下（side = both），顺序看右边的勾选"
+              onClick={() => void resolveConflict({ side: 'both', theirsFirst })}
+            >
+              两侧都保留
+            </button>
+            <label className="git-check">
+              <input
+                type="checkbox"
+                data-testid="git-conflict-theirs-first"
+                checked={theirsFirst}
+                onChange={(event) => setTheirsFirst(event.target.checked)}
+              />
+              他们的在前
+            </label>
+          </div>
+          <div className="ai-note">
+            也可以先在编辑器里改好内容，再点「重新读取」：仍有冲突标记的文件不会被 git add。
+          </div>
+          {state.lastConflictResolve !== null ? (
+            <div className="ai-note" data-testid="git-conflict-last">
+              {state.lastConflictResolve.path} · 替换 {state.lastConflictResolve.resolved_blocks}{' '}
+              块 · 剩余 {state.lastConflictResolve.remaining.length} 个冲突文件
             </div>
           ) : null}
         </div>
