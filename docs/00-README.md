@@ -64,7 +64,7 @@
 - `workspace.*`：`open` / `close` / `tree` / `read_file` / `write_file` / `create` / `rename` / `delete` / `reveal`
 - `search.*`：`files`（文件名模糊）、`content`（内容检索，支持正则）、`symbols`（符号抽取：Rust / TypeScript / TSX / JavaScript / Python / Go / Java 的函数、方法、结构体 / 类、枚举、接口、trait 与常量，回相对路径与起止行号，可按 `kinds` 过滤）
 - `terminal.*`：`create` / `write` / `resize` / `kill` / `list` 五方法 + `terminal.data` / `terminal.exit` 两事件（`crates/terminal`，`portable-pty`，退出含自行 `exit` 统一走事件并从列表摘除）
-- `git.*`：`status` / `diff` / `stage` / `commit` / `branches`（驱动系统 `git` 子进程，工作区作用域、路径越界拒绝，错误码 7001–7005）
+- `git.*`：`status` / `diff` / `stage` / `commit` / `branches`，以及缺口第二批补的九个——`checkout`（切换或 `-b` 新建，脏工作区拒绝并回 `7006` + 冲突文件）、`fetch`、`pull`（只走 `--ff-only`，分叉回 `7007`）、`push`（只走 `--force-with-lease`，协议无裸 `force` 字段）、`stash` / `stash_list` / `stash_pop` / `stash_apply` / `stash_drop`（pop 冲突回 `7010` + `data.files` + `stash_kept`，条目保留）。全部驱动系统 `git` 子进程，工作区作用域、路径越界拒绝，错误码 7001–7010 按「用户下一步该做什么」拆开（7006 先清理 / 入库、7007 先 pull、7008 查凭据、7009 设 upstream、7010 解冲突后可再 pop），不合并成 7003
 - `mcp.*`：`servers` / `connect` / `disconnect` / `tools` / `call`（stdio + HTTP(SSE) 双传输、`${ENV}` 展开，外部工具按 `mcp__<server>__<tool>` 注入 Agent 并复用同一权限闸门，错误码 8001–8007）
 - `plugin.*`：`list` / `status` / `install` / `uninstall` / `load` / `unload` / `reload` / `call` / `grant` / `revoke` / `command` 十一方法（子进程 NDJSON 宿主、四级闸门、错误码 6101–6109）
 - `lsp.*`：`start` / `stop` / `servers` / `request` / `sync` 五方法 + `lsp.diagnostics` 单向事件（`crates/lsp` 客户端底座，`crates/core/src/lsp_api.rs` 按 `workspace_id → server_id` 复用连接，查询方法限定为定义 / 引用 / 悬停 / 补全）
@@ -80,9 +80,9 @@
 
 ### 尚未实现（截至 2026-10-26）
 
-- 协议面：`IMPLEMENTED` 现为 **80** 项（P5 切片八补 `plugin.load_many` 后从 79 涨到 80，`DECLARED_NOT_IMPLEMENTED` 为空表；`terminal.*` / `git.*` / `mcp.*` / `plugin.*` / `lsp.*` / `search.symbols` / `inline_edit.propose` 均已进常量表并由 `crates/core` 接线，本文旧版把这几组写作「未进协议常量表」属倒挂，已订正）；`core.log` 已闭合成**双向**通道：内核 `CoreLogLayer` 主动推送 → 主进程映射 → 落盘 `core-shell-*.log` → 渲染端订阅 → 状态栏最近一行；`workspace.indexed` 已闭环（后台索引完成 emit，外壳订阅写回统计与就绪态，本批不新增方法，故能力表仍为 80）
+- 协议面：`IMPLEMENTED` 现为 **89** 项（P5 切片八补 `plugin.load_many` 后从 79 涨到 80；缺口第二批补 `git.checkout` / `fetch` / `pull` / `push` / `stash` / `stash_list` / `stash_pop` / `stash_apply` / `stash_drop` 九项后 80 → 89，`DECLARED_NOT_IMPLEMENTED` 为空表；`terminal.*` / `git.*` / `mcp.*` / `plugin.*` / `lsp.*` / `search.symbols` / `inline_edit.propose` 均已进常量表并由 `crates/core` 接线，本文旧版把这几组写作「未进协议常量表」属倒挂，已订正）；`core.log` 已闭合成**双向**通道：内核 `CoreLogLayer` 主动推送 → 主进程映射 → 落盘 `core-shell-*.log` → 渲染端订阅 → 状态栏最近一行；`workspace.indexed` 已闭环（后台索引完成 emit，外壳订阅写回统计与就绪态；能力表现以 89 为准）
 - 模块：`parser`（tree-sitter 符号表尚未引入，`search.symbols` 走的是自研文本抽取）
-- 界面：列表与审计分页加载、消息级分叉入口未开工；已接入渲染端的有 M2 Provider 配置 / 对话面板、M3 `@` 补全与引用 chip、M4 Agent 运行面板与审批卡片、M5 会话 / 检查点 / 权限面板、M6 终端与 Git 面板、M7 MCP 面板、符号浮层（`Ctrl+T`）、Inline Edit 浮层（`Ctrl+K`）、Tab 补全（`tab-completion.ts` + `CodeEditor.tsx`，索引符号与 LSP 两路候选，无候选不拦缩进）与 LSP 状态 / 重启命令
+- 界面：列表与审计分页加载、消息级分叉入口未开工；已接入渲染端的有 M2 Provider 配置 / 对话面板、M3 `@` 补全与引用 chip、M4 Agent 运行面板与审批卡片、M5 会话 / 检查点 / 权限面板、M6 终端与 Git 面板（变更分组 / diff / 暂存 / 提交，本地与远端分支列表 + 切换 + 新建、fetch / pull / push 与失败码引导、stash 保存 / 列表 / pop / apply / drop，drop 与强制推送二次确认）、M7 MCP 面板、符号浮层（`Ctrl+T`）、Inline Edit 浮层（`Ctrl+K`）、Tab 补全（`tab-completion.ts` + `CodeEditor.tsx`，索引符号与 LSP 两路候选，无候选不拦缩进）与 LSP 状态 / 重启命令
 - LSP 侧：语言服务器需本机自备（按 `crates/lsp/src/registry.rs` 探测并探测失败即降级为「不可用」，未内置下载 / 安装）；格式化、重命名、代码动作等未接 Monaco provider；多根工作区只起工作区根那一份连接
 
 ### 质量门禁实测（2026-10-22，M5 收尾 + P1 文档与 CI 收口）
@@ -92,6 +92,13 @@
 ### 质量门禁实测（2026-10-25，LSP 收口）
 
 前端门禁本轮实跑：`pnpm typecheck`（`tsc --noEmit`）退出码 0；`pnpm test` **27 文件 500 项全过**，其中 LSP 相关 `lsp-providers.test.ts` 16 项（坐标换算、四 provider 的返回翻译、重复注册幂等、卸载统一 dispose）、`lsp-store.test.ts` 23 项、`command-registry.test.ts` 25 项、`command-palette-store.test.ts` 15 项。内核侧本轮未改动 Rust 代码，`cargo test --workspace` 沿用插件 P5 收口时的 **1128 passed / 0 failed / 9 ignored**（LSP 流水线测试 `crates/core/tests/lsp_flow.rs` 在 `e03ed64` 中已通过，`crates/protocol` 的 `IMPLEMENTED.len() == 79` 断言同轮生效）。
+
+### 质量门禁实测（2026-10-26，缺口第三批：Git 面板外壳接线）
+
+- 前端门禁本轮实跑（`apps/desktop` 与 `packages/shared-types` 两个包）：`pnpm typecheck` 退出码 0；`pnpm test` **31 文件 565 项全过**（`1 failed / 6 failed` 为上一轮中断时的旧账：`git-panel-actions.test.ts` 里断言写的是 `stash@0`，实现输出的是 `stash@{0}（<message>），剩 N 条`——按「文案对用户可读则保留实现、修断言」处理，三条断言改成逐字 `toBe`，未用 `toContain('stash@')` 模糊化）；`pnpm lint`（`eslint .`）退出码 0。
+- 内核侧本轮未改 Rust：沿用缺口第二批收口时的 50 个测试目标、**1354 passed / 0 failed / 9 ignored**，其中 `crates/core/tests/git_flow.rs` 11 项真实仓库 + bare 远端用例，`crates/protocol` 的 `IMPLEMENTED.len() == 89` 断言同轮生效。
+- 契约一致性：`policy.ts` 白名单含全部十四条 `git.*`（前五条 + 本轮九条，附放行理由与「比终端弱在哪」的说明），`methods-contract.test.ts` 断言 `IMPLEMENTED_METHODS` 长度 89、`DECLARED_NOT_IMPLEMENTED_METHODS` 为空表。
+- 仓库根清理：`.test-out.txt` 与六个历史 `*.log` 临时文件已删除，根目录不再有临时 diff / txt。
 
 ### 质量门禁实测（2026-10-26，插件 P5 切片八：多插件并发装载 + 插件日志落盘）
 
