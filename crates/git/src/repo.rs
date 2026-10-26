@@ -2,7 +2,11 @@
 
 use crate::error::GitError;
 use crate::exec::{normalize_path, Runner};
-use crate::model::{GitBranches, GitCommitOutcome, GitDiff, GitStageOutcome, GitStatus};
+use crate::model::{
+    GitBranches, GitCheckoutOutcome, GitCommitOutcome, GitDiff, GitFetchOutcome, GitPullOutcome,
+    GitPushOutcome, GitRefUpdate, GitStageOutcome, GitStashApplyOutcome, GitStashDropOutcome,
+    GitStashEntry, GitStashOutcome, GitStatus, MAX_PULL_CHANGED_PATHS,
+};
 use crate::parse::{parse_branches, parse_status};
 use crate::{DIFF_LIMIT_BYTES, MAX_CONTEXT_LINES};
 use std::collections::HashMap;
@@ -287,8 +291,620 @@ impl GitRepo {
     }
 
     // -----------------------------------------------------------------------
+    // 分支切换
+    // -----------------------------------------------------------------------
+
+    /// 切换分支（`create` 为真时新建）。
+    ///
+    /// **脏工作区默认拒绝**：`allow_dirty=false` 时先看已跟踪文件有没有未提交改动，
+    /// 有就直接返回 [`GitError::DirtyWorkspace`]（带文件清单）。理由不是「git 做不到」，
+    /// 而是 git 能做到的部分最难解释——它会把这些改动带到新分支上，用户切过去看到
+    /// 「怎么新分支里也有这些改动」，再切回来又「怎么这边也没了」，于是不敢碰。
+    /// 明确拒绝 + 给出文件清单，用户至少知道该先 commit 还是先 stash。
+    ///
+    /// 未跟踪文件**不算脏**：`checkout` 从不删除未跟踪文件，把它们也算脏会让几乎所有
+    /// 真实仓库都切不了分支。真正会挡住 checkout 的是「未跟踪文件将被覆盖」，那种情况
+    /// git 会报错，这里把它的报错解析回 [`GitError::DirtyWorkspace`]，UI 的提示口径统一。
+    pub fn checkout(
+        &self,
+        branch: &str,
+        create: bool,
+        start_point: Option<&str>,
+        allow_dirty: bool,
+    ) -> Result<GitCheckoutOutcome, GitError> {
+        let branch = validate_ref_name(branch)?;
+        let start_point = match start_point {
+            Some(raw) => Some(validate_ref_name(raw)?),
+            None => None,
+        };
+        if !allow_dirty {
+            let dirty = self.tracked_changes()?;
+            if !dirty.is_empty() {
+                return Err(GitError::DirtyWorkspace { files: dirty });
+            }
+        }
+
+        let previous = self.symbolic_ref()?;
+        let mut args: Vec<String> = vec!["checkout".to_string()];
+        if create {
+            args.push("-b".to_string());
+        }
+        args.push(branch.clone());
+        if let Some(start) = &start_point {
+            args.push(start.clone());
+        }
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = self.runner().execute(&[], &borrowed, None)?;
+        if !output.success {
+            let stderr = output.stderr_trimmed();
+            let blocked = parse_blocked_files(&stderr);
+            if !blocked.is_empty() {
+                return Err(GitError::DirtyWorkspace { files: blocked });
+            }
+            return Err(GitError::Command {
+                args: args.join(" "),
+                stderr,
+                code: output.code,
+            });
+        }
+
+        let oid = self.head_oid()?;
+        let short_oid = oid.as_deref().map(short_of);
+        Ok(GitCheckoutOutcome {
+            branch: self.symbolic_ref()?.unwrap_or(branch),
+            previous,
+            created: create,
+            oid,
+            short_oid,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // 远端
+    // -----------------------------------------------------------------------
+
+    /// 抓取远端更新，返回**实际发生变化**的远端跟踪引用。
+    ///
+    /// `prune` 为 `true` 时才加 `--prune`（`git fetch --prune`）：删掉远端已经消失的
+    /// 跟踪引用是破坏性的，用户会看不出「我的 `origin/x` 怎么没了」，所以必须由外壳
+    /// 显式要，不能默认打开。
+    /// 比较「fetch 前 / 后」两轮 `refs/remotes` 而不是解析 fetch 的进度输出：后者是给
+    /// 人看的、随 git 版本变（`-> FETCH_HEAD` 写法改过好几版），前者是稳定契约。
+    pub fn fetch(&self, remote: Option<&str>, prune: bool) -> Result<GitFetchOutcome, GitError> {
+        let remote = match remote {
+            Some(raw) => validate_ref_name(raw)?,
+            None => String::new(),
+        };
+        let before = self.remote_refs()?;
+
+        let mut args: Vec<String> = vec!["fetch".to_string()];
+        if prune {
+            args.push("--prune".to_string());
+        }
+        if !remote.is_empty() {
+            args.push(remote.clone());
+        }
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = self.runner().execute(&[], &borrowed, None)?;
+        if !output.success {
+            return Err(crate::error::classify_remote_failure(
+                &args.join(" "),
+                &output.stderr_trimmed(),
+                output.code,
+                self.symbolic_ref()?.as_deref(),
+            ));
+        }
+
+        let after = self.remote_refs()?;
+        let mut updated = Vec::new();
+        for (name, (new_full, new_short)) in &after {
+            let old = before.get(name);
+            if old.map(|(full, _)| full) == Some(new_full) {
+                continue;
+            }
+            let (old_short, forced) = match old {
+                Some((old_full, old_short)) => (
+                    Some(old_short.clone()),
+                    !self.is_ancestor(old_full, new_full)?,
+                ),
+                None => (None, false),
+            };
+            updated.push(GitRefUpdate {
+                name: name.clone(),
+                old_short,
+                new_short: new_short.clone(),
+                forced,
+            });
+        }
+        updated.sort_by(|a, b| a.name.cmp(&b.name));
+
+        Ok(GitFetchOutcome {
+            remote: if remote.is_empty() {
+                match self.symbolic_ref()? {
+                    Some(current) => self
+                        .upstream_remote_of(&current)?
+                        .unwrap_or_else(|| "origin".to_string()),
+                    None => "origin".to_string(),
+                }
+            } else {
+                remote
+            },
+            updated,
+        })
+    }
+
+    /// `pull --ff-only`：只接受快进，**不**生成合并提交、**不**rebase。
+    ///
+    /// 分叉时宁可失败（[`GitError::NotFastForward`]）也不替用户决定「合并还是变基」：
+    /// 这两条路对历史形状的影响完全不同，是用户的选择题，不是 IDE 的默认值。
+    pub fn pull(
+        &self,
+        remote: Option<&str>,
+        branch: Option<&str>,
+    ) -> Result<GitPullOutcome, GitError> {
+        let current = self.symbolic_ref()?.ok_or_else(|| {
+            GitError::Invalid("分离头指针状态下没有上游分支，请先切到某个分支".to_string())
+        })?;
+        let upstream = self.upstream_of(&current)?;
+        // 缺省的 remote / branch 一律从上游推出；上游不存在时**不猜** `origin/<当前分支>`，
+        // 而是报 [`GitError::NoUpstream`]（7009）。猜错的后果是「静默拉到另一个分支」或
+        // 「弹出与真实原因无关的远端错误」，两者都比直接说「这个分支没有上游」更难查。
+        let (remote, branch) = match (remote, branch) {
+            (Some(remote), Some(branch)) => {
+                (validate_ref_name(remote)?, validate_ref_name(branch)?)
+            }
+            (Some(remote), None) => {
+                let remote = validate_ref_name(remote)?;
+                let branch = upstream
+                    .as_deref()
+                    .and_then(|name| name.rsplit_once('/'))
+                    .map(|(_, branch)| branch.to_string())
+                    .ok_or_else(|| GitError::NoUpstream {
+                        branch: current.clone(),
+                    })?;
+                (remote, branch)
+            }
+            (None, Some(branch)) => {
+                let branch = validate_ref_name(branch)?;
+                let remote = upstream
+                    .as_deref()
+                    .and_then(|name| name.rsplit_once('/'))
+                    .map(|(remote, _)| remote.to_string())
+                    .ok_or_else(|| GitError::NoUpstream {
+                        branch: current.clone(),
+                    })?;
+                (remote, branch)
+            }
+            (None, None) => {
+                let upstream = upstream.clone().ok_or_else(|| GitError::NoUpstream {
+                    branch: current.clone(),
+                })?;
+                match upstream.rsplit_once('/') {
+                    Some((remote, branch)) => (remote.to_string(), branch.to_string()),
+                    // 上游只写了分支名（`branch.main.merge` 配了、`remote` 是 `.`）：
+                    // 这种配置下 git 自己会报错，这里退回 origin 只为拼一句可读的上游名。
+                    None => ("origin".to_string(), upstream),
+                }
+            }
+        };
+        let upstream_name = upstream.unwrap_or_else(|| format!("{remote}/{branch}"));
+
+        let previous_oid = self
+            .head_oid()?
+            .ok_or_else(|| GitError::Invalid("当前分支还没有任何提交，无从拉取".to_string()))?;
+
+        let mut args: Vec<String> = vec![
+            "pull".to_string(),
+            "--ff-only".to_string(),
+            "--no-edit".to_string(),
+        ];
+        args.push(remote.clone());
+        args.push(branch.clone());
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = self.runner().execute(&[], &borrowed, None)?;
+        if !output.success {
+            let stderr = output.stderr_trimmed();
+            let blocked = parse_blocked_files(&stderr);
+            if !blocked.is_empty() {
+                return Err(GitError::DirtyWorkspace { files: blocked });
+            }
+            return Err(crate::error::classify_remote_failure(
+                &args.join(" "),
+                &stderr,
+                output.code,
+                Some(&current),
+            ));
+        }
+
+        let oid = self
+            .head_oid()?
+            .ok_or_else(|| GitError::Io("pull 之后读不到 HEAD".to_string()))?;
+        let short_oid = short_of(&oid);
+        let up_to_date = oid == previous_oid;
+        let range = format!("{previous_oid}..{oid}");
+        let commits = if up_to_date {
+            0
+        } else {
+            self.rev_count(&range)?
+        };
+        let changed_paths = if up_to_date {
+            Vec::new()
+        } else {
+            self.diff_name_list(&range)?
+        };
+
+        Ok(GitPullOutcome {
+            branch: current,
+            upstream: upstream_name,
+            previous_oid,
+            oid,
+            short_oid,
+            commits,
+            changed_paths,
+            up_to_date,
+        })
+    }
+
+    /// 推送当前分支。
+    ///
+    /// `force` 走 `--force-with-lease` 而不是 `--force`：租约检查会在「远端已被别人
+    /// 推过」时失败，正好挡住最痛的那种事故（把同事的提交推平）。裸 `--force` 在本
+    /// crate 里**没有任何**调用路径。是否允许 `force` 由外壳的二次确认决定，内核只
+    /// 如实执行并回报 `forced`。
+    pub fn push(
+        &self,
+        remote: Option<&str>,
+        branch: Option<&str>,
+        force: bool,
+        set_upstream: bool,
+    ) -> Result<GitPushOutcome, GitError> {
+        let current = self.symbolic_ref()?.ok_or_else(|| {
+            GitError::Invalid("分离头指针状态下无法推送，请先切到某个分支".to_string())
+        })?;
+        let branch = match branch {
+            Some(raw) => validate_ref_name(raw)?,
+            None => current,
+        };
+        let remote = match remote {
+            Some(raw) => validate_ref_name(raw)?,
+            // 没指定远端、分支也还没有上游时：`set_upstream` 说明用户就是要给 origin
+            // 建一条上游，可以推；否则报 7009 交回外壳去问「要以 origin 为上游推上去吗」。
+            // 替用户默认 origin 看着无害，实际会留下「推成功了，但下次拉取仍然不知道
+            // 拉哪」的半截状态。
+            None => match self.upstream_remote_of(&branch)? {
+                Some(name) => name,
+                None if set_upstream => "origin".to_string(),
+                None => {
+                    return Err(GitError::NoUpstream {
+                        branch: branch.clone(),
+                    })
+                }
+            },
+        };
+        let remote_branch = self
+            .upstream_of(&branch)?
+            .and_then(|name| name.rsplit_once('/').map(|(_, branch)| branch.to_string()))
+            .unwrap_or_else(|| branch.clone());
+
+        let mut args: Vec<String> = vec!["push".to_string(), "--porcelain".to_string()];
+        if force {
+            args.push("--force-with-lease".to_string());
+        }
+        if set_upstream {
+            args.push("--set-upstream".to_string());
+        }
+        args.push(remote.clone());
+        args.push(format!("{branch}:{remote_branch}"));
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = self.runner().execute(&[], &borrowed, None)?;
+        if !output.success {
+            return Err(crate::error::classify_remote_failure(
+                &args.join(" "),
+                &output.stderr_trimmed(),
+                output.code,
+                Some(&branch),
+            ));
+        }
+
+        // `--porcelain` 的每个**引用**一行 `<flag>\t<from>:<to>\t<summary>`，`=` 表示
+        // 远端已经一致（没有要推的提交）。但同一份 stdout 里还夹着 `To <url>` / `Done`
+        // 这类不带 TAB 的横幅行，直接对全部行 `starts_with('=')` 会把它们算成「有更新」，
+        // 于是「再推一次」被误报成推了新东西。只认带第二个字段的行。
+        let up_to_date = output
+            .stdout_trimmed()
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split('\t');
+                let flag = fields.next()?;
+                fields.next()?;
+                flag.chars().next()
+            })
+            .all(|flag| flag == '=');
+
+        let oid = self
+            .head_oid()?
+            .ok_or_else(|| GitError::Invalid("当前分支还没有提交可推送".to_string()))?;
+        Ok(GitPushOutcome {
+            branch,
+            remote,
+            remote_branch,
+            forced: force,
+            up_to_date,
+            short_oid: short_of(&oid),
+            oid,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // stash
+    // -----------------------------------------------------------------------
+
+    /// 保存当前改动到栈顶。
+    ///
+    /// `include_untracked` 对应 `-u`：默认**不**带上未跟踪文件（git 的默认），因为用户
+    /// 常常是想「把这几个改动收起来」，而不是「把刚生成的一堆产物也塞进 stash」。
+    pub fn stash_push(
+        &self,
+        message: Option<&str>,
+        include_untracked: bool,
+        paths: &[String],
+    ) -> Result<GitStashOutcome, GitError> {
+        if let Some(text) = message {
+            if text.trim().is_empty() {
+                return Err(GitError::Invalid("stash 说明不能是空白".to_string()));
+            }
+        }
+        let normalized = normalize_all(paths)?;
+
+        let mut args: Vec<String> = vec!["stash".to_string(), "push".to_string()];
+        if include_untracked {
+            args.push("--include-untracked".to_string());
+        }
+        if let Some(text) = message {
+            args.push("-m".to_string());
+            args.push(text.trim().to_string());
+        }
+        if !normalized.is_empty() {
+            args.push("--".to_string());
+            args.extend(normalized);
+        }
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = self.runner().execute(&[], &borrowed, None)?;
+        if !output.success {
+            return Err(GitError::Command {
+                args: args.join(" "),
+                stderr: crate::error::summarize_stderr(&output.stderr_trimmed()),
+                code: output.code,
+            });
+        }
+
+        let list = self.stash_list()?;
+        // 「没有改动可保存」时 git 打印 `No local changes to save` 且**什么都不新建**：
+        // 不能因为成功退出就报一条不存在的记录给 UI。
+        let saved = !output
+            .stdout_trimmed()
+            .to_ascii_lowercase()
+            .contains("no local changes to save");
+        Ok(GitStashOutcome {
+            entry: if saved { list.first().cloned() } else { None },
+            total: list.len() as u32,
+        })
+    }
+
+    /// stash 列表（栈顶在最前）。
+    pub fn stash_list(&self) -> Result<Vec<GitStashEntry>, GitError> {
+        let raw = self
+            .runner()
+            .text(&["stash", "list", "--format=%gd%x1f%H%x1f%h%x1f%gs"])?;
+        let mut entries = Vec::new();
+        for line in raw.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let mut parts = line.split('\u{1f}');
+            let reference = parts.next().unwrap_or_default();
+            let oid = parts.next().unwrap_or_default().to_string();
+            let short_oid = parts.next().unwrap_or_default().to_string();
+            // `%gs` 里可能含 `\x1f` 之外的一切字符，含分隔符就重新拼回去，别把说明吃掉。
+            let message = parts.collect::<Vec<_>>().join("\u{1f}");
+            let Some(index) = parse_stash_index(reference) else {
+                continue;
+            };
+            entries.push(GitStashEntry {
+                index,
+                oid,
+                short_oid,
+                message,
+            });
+        }
+        Ok(entries)
+    }
+
+    /// `stash apply` / `stash pop`。
+    ///
+    /// 冲突时**不丢弃** stash：`git stash pop` 在遇到冲突时本来就不会删除记录，本层
+    /// 据此把 git 的约束显式化——冲突时返回 [`GitError::StashConflict`]（带冲突文件），
+    /// 用户解决完冲突可以再 `drop`，或者 `reset` 掉重来。
+    pub fn stash_apply(
+        &self,
+        index: u32,
+        drop_after: bool,
+    ) -> Result<GitStashApplyOutcome, GitError> {
+        let before = self.stash_list()?;
+        if !before.iter().any(|entry| entry.index == index) {
+            return Err(GitError::Invalid(format!("stash@{{{index}}} 不存在")));
+        }
+        let reference = format!("stash@{{{index}}}");
+        let command = if drop_after { "pop" } else { "apply" };
+        let args = ["stash", command, reference.as_str()];
+        let output = self.runner().execute(&[], &args, None)?;
+        if !output.success {
+            // `git stash apply/pop` 的三方合并日志（`Auto-merging` / `CONFLICT`）走的是
+            // **stdout**，只有「工作区有改动挡住落盘」那类提示才走 stderr。只看 stderr
+            // 会把冲突降级成 7003，用户于是既看不到冲突文件、也拿不到「记录还在」的承诺。
+            let merged = format!("{}\n{}", output.stdout_trimmed(), output.stderr_trimmed());
+            let conflicts = parse_conflict_files(&merged);
+            if !conflicts.is_empty() {
+                return Err(GitError::StashConflict { files: conflicts });
+            }
+            let blocked = parse_blocked_files(&merged);
+            if !blocked.is_empty() {
+                // 工作区现有改动挡住了 stash 的落盘：stash 原样保留，让用户先处理。
+                return Err(GitError::DirtyWorkspace { files: blocked });
+            }
+            return Err(GitError::Command {
+                args: args.join(" "),
+                stderr: crate::error::summarize_stderr(&merged),
+                code: output.code,
+            });
+        }
+
+        let total = self.stash_list()?.len() as u32;
+        Ok(GitStashApplyOutcome {
+            index,
+            dropped: drop_after,
+            total,
+        })
+    }
+
+    /// 丢弃一条 stash 记录（**不可逆**，是否已二次确认由外壳负责）。
+    pub fn stash_drop(&self, index: u32) -> Result<GitStashDropOutcome, GitError> {
+        let list = self.stash_list()?;
+        let entry = list
+            .iter()
+            .find(|entry| entry.index == index)
+            .cloned()
+            .ok_or_else(|| GitError::Invalid(format!("stash@{{{index}}} 不存在")))?;
+
+        let reference = format!("stash@{{{index}}}");
+        let args = ["stash", "drop", reference.as_str()];
+        let output = self.runner().execute(&[], &args, None)?;
+        if !output.success {
+            return Err(GitError::Command {
+                args: args.join(" "),
+                stderr: crate::error::summarize_stderr(&output.stderr_trimmed()),
+                code: output.code,
+            });
+        }
+        Ok(GitStashDropOutcome {
+            index,
+            oid: entry.oid,
+            message: entry.message,
+            total: self.stash_list()?.len() as u32,
+        })
+    }
+
+    // -----------------------------------------------------------------------
     // 内部
     // -----------------------------------------------------------------------
+
+    /// HEAD 指向的提交（空仓库为 `None`）。
+    fn head_oid(&self) -> Result<Option<String>, GitError> {
+        let value =
+            self.runner()
+                .text_allow_failure(&["rev-parse", "--verify", "--quiet", "HEAD"])?;
+        Ok(value.filter(|oid| !oid.is_empty()))
+    }
+
+    /// 已跟踪文件的未提交改动（未跟踪 / 忽略的不算，理由见 [`Self::checkout`]）。
+    fn tracked_changes(&self) -> Result<Vec<String>, GitError> {
+        Ok(self
+            .status()?
+            .entries
+            .iter()
+            .filter(|entry| {
+                !matches!(
+                    entry.kind,
+                    crate::EntryKind::Untracked | crate::EntryKind::Ignored
+                )
+            })
+            .map(|entry| entry.path.clone())
+            .collect())
+    }
+
+    /// 所有远端跟踪引用：`名字 → (完整 SHA, 短 SHA)`。
+    fn remote_refs(&self) -> Result<HashMap<String, (String, String)>, GitError> {
+        // 必须一起取 `%(symref)`：`refs/remotes/origin/HEAD` 是**符号引用**，它的
+        // `%(refname:short)` 会被 shorten 成 `origin`（而不是 `origin/HEAD`），只按
+        // `ends_with("/HEAD")` 过滤根本拦不住它，于是 fetch 会多报出一条名为 `origin`
+        // 的幽灵「远端分支」，并在首次 fetch 时把 `up_to_date` 误判成 false。
+        let raw = self.runner().text(&[
+            "for-each-ref",
+            "--format=%(refname:short)%00%(objectname)%00%(objectname:short)%00%(symref)",
+            "refs/remotes",
+        ])?;
+        let mut map = HashMap::new();
+        for line in raw.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let mut parts = line.split('\0');
+            let name = parts.next().unwrap_or_default();
+            let full = parts.next().unwrap_or_default();
+            let short = parts.next().unwrap_or_default();
+            let symref = parts.next().unwrap_or_default();
+            if name.is_empty() || !symref.is_empty() || name.ends_with("/HEAD") {
+                continue;
+            }
+            map.insert(name.to_string(), (full.to_string(), short.to_string()));
+        }
+        Ok(map)
+    }
+
+    /// `branch.<name>.remote`（没配置时为 `None`）。
+    fn upstream_remote_of(&self, branch: &str) -> Result<Option<String>, GitError> {
+        let key = format!("branch.{branch}.remote");
+        Ok(self.config_value(&key)?.filter(|name| name != "."))
+    }
+
+    /// 分支的上游全名（`origin/main` 形式）。
+    fn upstream_of(&self, branch: &str) -> Result<Option<String>, GitError> {
+        let key = format!("branch.{branch}.merge");
+        let merge = self.config_value(&key)?;
+        let remote = self.config_value(&format!("branch.{branch}.remote"))?;
+        Ok(match (remote, merge) {
+            (Some(remote), Some(merge)) => {
+                let short = merge.strip_prefix("refs/heads/").unwrap_or(&merge);
+                if remote == "." {
+                    // 本地跟踪分支（`branch.x.remote = .`）：没有远端可拉。
+                    Some(short.to_string())
+                } else {
+                    Some(format!("{remote}/{short}"))
+                }
+            }
+            _ => None,
+        })
+    }
+
+    /// `is_ancestor`：`old` 是否是 `new` 的祖先（判断这次更新是不是快进）。
+    fn is_ancestor(&self, old: &str, new: &str) -> Result<bool, GitError> {
+        let output =
+            self.runner()
+                .execute(&[], &["merge-base", "--is-ancestor", old, new], None)?;
+        Ok(output.success)
+    }
+
+    /// `rev-list --count <range>`。
+    fn rev_count(&self, range: &str) -> Result<u64, GitError> {
+        let text = self.runner().text(&["rev-list", "--count", range])?;
+        Ok(text.trim().parse::<u64>().unwrap_or(0))
+    }
+
+    /// 区间内变更文件路径（按路径升序，最多 [`MAX_PULL_CHANGED_PATHS`] 条）。
+    ///
+    /// `-z` 保证中文路径不被转义、不被引号包住；排序放在 Rust 侧做，因为
+    /// `git diff --name-only` 的顺序既不保证字典序也不保证稳定。
+    fn diff_name_list(&self, range: &str) -> Result<Vec<String>, GitError> {
+        let raw = self.runner().bytes(&["diff", "--name-only", "-z", range])?;
+        let mut paths: Vec<String> = String::from_utf8_lossy(&raw)
+            .split('\0')
+            .filter(|piece| !piece.trim().is_empty())
+            .map(str::to_string)
+            .collect();
+        paths.sort();
+        paths.truncate(MAX_PULL_CHANGED_PATHS);
+        Ok(paths)
+    }
 
     fn runner(&self) -> Runner {
         Runner::new(self.root.clone())
@@ -395,6 +1011,106 @@ impl GitService {
 
 fn normalize_all(paths: &[String]) -> Result<Vec<String>, GitError> {
     paths.iter().map(|path| normalize_path(path)).collect()
+}
+
+/// 校验分支名 / 远端名 / 起点引用。
+///
+/// 这里挡的是**两类**问题：一是命令行注入（`-f`、`--orphan` 这类以 `-` 开头的名字会
+/// 被 git 当成选项），二是明显不合法的引用（`..`、`~`、`^`、`:`、空格……）。
+/// 完整的合法性判定仍交给 git——它认 `check-ref-format`，本层只做「不安全的先拦掉」。
+fn validate_ref_name(raw: &str) -> Result<String, GitError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(GitError::Invalid("分支名不能为空".to_string()));
+    }
+    if trimmed.starts_with('-') {
+        return Err(GitError::Invalid(format!(
+            "引用名不能以 - 开头（会被当成命令选项）：{raw}"
+        )));
+    }
+    if trimmed
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch.is_control())
+    {
+        return Err(GitError::Invalid(format!("引用名不得含空白字符：{raw}")));
+    }
+    const FORBIDDEN: [&str; 8] = ["..", "~", "^", ":", "?", "*", "[", "\\"];
+    if FORBIDDEN.iter().any(|needle| trimmed.contains(needle))
+        || trimmed.starts_with('/')
+        || trimmed.ends_with('/')
+        || trimmed.contains("//")
+        || trimmed.ends_with(".lock")
+        || trimmed == "@"
+    {
+        return Err(GitError::Invalid(format!("不是合法的引用名：{raw}")));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// 完整 SHA 的短形式（7 位，与 git 的默认长度一致）。
+fn short_of(oid: &str) -> String {
+    oid.chars().take(7).collect()
+}
+
+/// 从 `stash@{3}` 里取 `3`。
+fn parse_stash_index(reference: &str) -> Option<u32> {
+    let inside = reference.strip_prefix("stash@{")?.strip_suffix('}')?;
+    inside.parse::<u32>().ok()
+}
+
+/// 解析 git 报出的「这些文件会被覆盖 / 会被删除」清单。
+///
+/// 三种场景的文案都长这样（列表每行以制表符缩进）：
+/// 切分支时 `Your local changes to the following files would be overwritten by checkout`、
+/// 拉取时 `... by merge`、以及未跟踪文件 `The following untracked working tree files
+/// would be overwritten by checkout`。解析成路径清单后统一映射到 7006，UI 的提示口径
+/// 就与「本层自己判定的脏工作区」一致。
+fn parse_blocked_files(stderr: &str) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    let mut in_list = false;
+    for line in stderr.lines() {
+        let without_break = line.trim_end();
+        if without_break.starts_with('\t') || without_break.starts_with("    ") {
+            let path = without_break.trim();
+            if in_list && !path.is_empty() && !files.iter().any(|seen| seen == path) {
+                files.push(path.to_string());
+            }
+            continue;
+        }
+        let lowered = without_break.to_ascii_lowercase();
+        in_list = lowered.contains("would be overwritten")
+            || lowered.contains("would be removed")
+            || lowered.contains("untracked working tree files");
+    }
+    files
+}
+
+/// 解析 stash / pull 冲突的 `CONFLICT` 行。
+///
+/// 两种形态都要覆盖：
+/// - `CONFLICT (content): Merge conflict in src/a.rs`
+/// - `CONFLICT (modify/delete): src/a.rs deleted in HEAD and modified in stash ...`
+fn parse_conflict_files(stderr: &str) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    for line in stderr.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("CONFLICT") else {
+            continue;
+        };
+        let path = if let Some((_, after)) = rest.split_once("Merge conflict in ") {
+            Some(after.trim().to_string())
+        } else if let Some((_, after)) = rest.split_once("): ") {
+            after.split_whitespace().next().map(str::to_string)
+        } else {
+            None
+        };
+        if let Some(path) = path {
+            if !path.is_empty() && !files.iter().any(|seen| seen == &path) {
+                files.push(path);
+            }
+        }
+    }
+    files
 }
 
 /// 把仓库根相对的条目收敛到工作区子树，并去掉前缀。

@@ -155,6 +155,136 @@ pub struct GitBranches {
 /// 用于 `GitService` 缓存的键：仓库工作树根。
 pub type RepoKey = PathBuf;
 
+/// 一次分支切换的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitCheckoutOutcome {
+    /// 切换后的分支名。
+    pub branch: String,
+    /// 切换前的分支名（原先是分离头指针时 `None`）。
+    pub previous: Option<String>,
+    /// 是否本次新建了分支。
+    pub created: bool,
+    /// 切换后 HEAD 指向的提交（空仓库新建分支时为 `None`）。
+    pub oid: Option<String>,
+    /// 短 SHA。
+    pub short_oid: Option<String>,
+}
+
+/// `fetch` 里一个被更新的引用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitRefUpdate {
+    /// 引用短名（如 `origin/main`）。
+    pub name: String,
+    /// 更新前短 SHA（新建引用时为 `None`）。
+    pub old_short: Option<String>,
+    /// 更新后短 SHA。
+    pub new_short: String,
+    /// 是否是强制更新（远端被改写过）。
+    pub forced: bool,
+}
+
+/// 一次 `fetch` 的结果。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitFetchOutcome {
+    /// 远端名。
+    pub remote: String,
+    /// 实际发生变化的引用（无变化时为空）。
+    pub updated: Vec<GitRefUpdate>,
+}
+
+/// `pull` 回带的变更路径上限。
+///
+/// 上限存在的理由与 `diff` 的截断一致：一次快进可能带进上万个文件，把整张表塞进
+/// 一条 JSON-RPC 响应只会把外壳的列表控件撑死。200 条足够回答「这次拉进来改了什么」，
+/// 真正的全景用户会去看提交历史。
+pub const MAX_PULL_CHANGED_PATHS: usize = 200;
+
+/// 一次 `pull` 的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitPullOutcome {
+    /// 当前分支名。
+    pub branch: String,
+    /// 上游分支名（如 `origin/main`）。
+    pub upstream: String,
+    /// 拉取前 HEAD。
+    pub previous_oid: String,
+    /// 拉取后 HEAD。
+    pub oid: String,
+    /// 短 SHA。
+    pub short_oid: String,
+    /// 本次并入的提交数（已是最新时为 0）。
+    pub commits: u64,
+    /// 本次并入的变更文件路径（按路径升序，最多 [`MAX_PULL_CHANGED_PATHS`] 条）。
+    pub changed_paths: Vec<String>,
+    /// 是否本来就已是最新。
+    pub up_to_date: bool,
+}
+
+/// 一次 `push` 的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitPushOutcome {
+    /// 推送的本地分支名。
+    pub branch: String,
+    /// 远端名。
+    pub remote: String,
+    /// 远端分支名。
+    pub remote_branch: String,
+    /// 是否强制推送（调用方必须已显式确认）。
+    pub forced: bool,
+    /// 是否本来就没有需要推的提交。
+    pub up_to_date: bool,
+    /// 推送后远端分支指向的提交。
+    pub oid: String,
+    /// 短 SHA。
+    pub short_oid: String,
+}
+
+/// 一条 stash 记录。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitStashEntry {
+    /// `stash@{N}` 里的 N（0 是最近一条）。
+    pub index: u32,
+    /// 完整 SHA。
+    pub oid: String,
+    /// 短 SHA。
+    pub short_oid: String,
+    /// 用户给的说明（`git stash push -m` 的内容），没有时是 git 生成的默认描述。
+    pub message: String,
+}
+
+/// 一次 `stash push` 的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitStashOutcome {
+    /// 新生成的记录；工作区本来就干净时为 `None`（git 不会新建记录）。
+    pub entry: Option<GitStashEntry>,
+    /// 保存后栈中总条数。
+    pub total: u32,
+}
+
+/// 一次 `stash apply` / `pop` 的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitStashApplyOutcome {
+    /// 被应用的记录序号（应用前）。
+    pub index: u32,
+    /// 是否从栈里删掉了该记录（`pop` 为 `true`，`apply` 为 `false`）。
+    pub dropped: bool,
+    /// 应用后栈中剩余条数。
+    pub total: u32,
+}
+
+/// 一次 `stash drop` 的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitStashDropOutcome {
+    /// 被丢弃的记录序号。
+    pub index: u32,
+    /// 被丢弃记录的 SHA（丢完就查不到了，必须在这里回传给 UI 以便事后追溯）。
+    pub oid: String,
+    /// 被丢弃记录的说明。
+    pub message: String,
+    /// 丢弃后栈中剩余条数。
+    pub total: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

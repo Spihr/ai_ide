@@ -37,6 +37,19 @@
 //!   `rev-parse`；
 //! - 本 crate 不认识协议 DTO：`crates/core/src/git_api.rs` 负责把这里的领域结构
 //!   翻成 `crates/protocol` 的 `Git*` 结构并发错误码。
+//!
+//! ## 写操作的安全姿态（分支切换 / stash / 远端）
+//!
+//! 这一层的写操作**默认不替用户做决定**：
+//!
+//! - `checkout` 遇到脏工作区直接拒绝（[`GitError::DirtyWorkspace`]，带脏文件清单），
+//!   不替用户 stash、也不替用户丢弃改动——git 自己会尝试「带改动切分支」，
+//!   而那种半成功状态最难让用户理解到底丢没丢东西；
+//! - `pull` 只走 `--ff-only`：需要真正 merge 的场景交给用户，IDE 不生成合并提交；
+//! - `push` 只有显式传 `force` 才带 `--force-with-lease`，绝不裸 `--force`——
+//!   `--force-with-lease` 在远端已被别人推过时会失败，正好挡住「把同事的提交推平」；
+//! - `stash pop` 冲突时**不** `drop`：stash 记录留着，用户解决冲突后可以再 `drop`，
+//!   或者干脆 `reset` 重来。
 
 mod exec;
 mod parse;
@@ -47,7 +60,9 @@ pub mod repo;
 
 pub use error::GitError;
 pub use model::{
-    EntryKind, GitBranchInfo, GitBranches, GitCommitOutcome, GitDiff, GitStageOutcome, GitStatus,
+    EntryKind, GitBranchInfo, GitBranches, GitCheckoutOutcome, GitCommitOutcome, GitDiff,
+    GitFetchOutcome, GitPullOutcome, GitPushOutcome, GitRefUpdate, GitStageOutcome,
+    GitStashApplyOutcome, GitStashDropOutcome, GitStashEntry, GitStashOutcome, GitStatus,
     GitStatusEntry,
 };
 pub use repo::{GitRepo, GitService};

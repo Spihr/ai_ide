@@ -2564,6 +2564,337 @@ pub struct GitBranchesResult {
 }
 
 // ---------------------------------------------------------------------------
+// Git 深化（缺口第二批：分支切换 / 远端 / stash）
+// ---------------------------------------------------------------------------
+//
+// 这一组 DTO 与上面 `git.*` 五点同域，但**每一个都带着「可能丢数据或触网」的语义**，
+// 所以字段设计上刻意多写一件事：把「接下来会发生什么」提前放进请求、把「实际发生了
+// 什么」完整放进响应。外壳据此决定要不要二次确认，而不是靠猜。
+
+/// `git.checkout` 请求参数。
+///
+/// 脏工作区时内核**拒绝切换**并报 `7006`：`git checkout` 在两边都有改动时会直接失败，
+/// 但在「改动可被静默带过去」的场景下它会真的把改动搬走——那种「成功」最危险，
+/// 因为用户看不见分支边界上发生了什么。这里选择显式拒绝，把决定权交回用户
+/// （先提交、先 `git.stash`，或明确要求带改动切换）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitCheckoutParams {
+    /// 工作区 id；缺省作用于活动工作区。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub workspace_id: Option<String>,
+    /// 目标分支名。`create` 为真时是**新分支名**，为假时必须是已存在的本地或远端分支。
+    pub branch: String,
+    /// 是否新建分支（等价 `git checkout -b <branch> <start_point>`）。
+    #[serde(default)]
+    pub create: bool,
+    /// 新建分支的起点（分支名 / 提交哈希）；仅 `create` 为真时生效，缺省为当前 HEAD。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub start_point: Option<String>,
+}
+
+/// `git.checkout` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitCheckoutResult {
+    /// 工作区 id。
+    pub workspace_id: String,
+    /// 切换后的分支名（新建时为新分支名）。
+    pub branch: String,
+    /// 切换前的分支名；原先是分离头指针时为 `null`。
+    pub previous: Option<String>,
+    /// 是否为本次新建的分支。
+    pub created: bool,
+    /// 切换后 HEAD 指向的完整哈希。
+    pub oid: String,
+    /// 短哈希。
+    pub short_oid: String,
+}
+
+/// `git.fetch` 请求参数。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitFetchParams {
+    /// 工作区 id；缺省作用于活动工作区。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub workspace_id: Option<String>,
+    /// 远端名；缺省用当前分支的上游远端，再缺省用 `origin`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub remote: Option<String>,
+    /// 是否顺带清理远端已删除的跟踪分支（`--prune`）。
+    #[serde(default)]
+    pub prune: bool,
+}
+
+/// 一次远端引用更新。
+///
+/// `old_short` 为空表示「新建引用」；`forced` 为真表示远端历史被改写（强推过）。
+/// 这三种情形在 UI 上语气完全不同，所以内核拆开报，不让外壳从字符串里猜。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitRefUpdate {
+    /// 引用名，如 `origin/main` 或 `refs/tags/v1`。
+    pub ref_name: String,
+    /// 更新前的短哈希；新建引用时为 `null`。
+    pub old_short: Option<String>,
+    /// 更新后的短哈希。
+    pub new_short: String,
+    /// 是否为强制更新（远端历史被改写）。
+    pub forced: bool,
+}
+
+/// `git.fetch` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitFetchResult {
+    /// 工作区 id。
+    pub workspace_id: String,
+    /// 实际使用的远端名。
+    pub remote: String,
+    /// 本次被更新的引用；没有更新时为空表（`up_to_date` 为真）。
+    pub updated: Vec<GitRefUpdate>,
+    /// 是否没有任何引用变化。
+    pub up_to_date: bool,
+}
+
+/// `git.pull` 请求参数。
+///
+/// 只做**快进**（`--ff-only`）。内核不提供 `--rebase` / 合并式 pull：合并会在工作区
+/// 制造一个用户没要求的 merge commit，冲突则把仓库留在半途状态——这两件事都该在
+/// 用户知道自己在做什么时做，而不是被一个「拉一下」按钮顺手做掉。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitPullParams {
+    /// 工作区 id；缺省作用于活动工作区。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub workspace_id: Option<String>,
+    /// 远端名；缺省用当前分支的上游远端。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub remote: Option<String>,
+    /// 远端分支名；缺省用当前分支的上游分支名。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub branch: Option<String>,
+}
+
+/// `git.pull` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitPullResult {
+    /// 工作区 id。
+    pub workspace_id: String,
+    /// 当前分支名。
+    pub branch: String,
+    /// 上游分支名（`origin/main` 形式）。
+    pub upstream: String,
+    /// 拉取前的 HEAD 哈希。
+    pub previous_oid: String,
+    /// 拉取后的 HEAD 哈希。
+    pub oid: String,
+    /// 短哈希。
+    pub short_oid: String,
+    /// 是否真的前进了（已是最新时为 `false`）。
+    pub updated: bool,
+    /// 本次带入的提交数；未更新时为 0。
+    #[ts(type = "number")]
+    pub commits: u64,
+    /// 本次变更的文件数；未更新时为 0。
+    #[ts(type = "number")]
+    pub files: u64,
+    /// 变更文件清单（最多 200 条，按路径升序），供外壳展示「拉进来改了什么」。
+    pub changed_paths: Vec<String>,
+}
+
+/// `git.push` 请求参数。
+///
+/// **没有** `force` 字段：强制推送只允许 `force_with_lease`，即「我确认远端仍停在
+/// 我看到的位置」。裸 `--force` 会覆盖别人刚推上去的提交，且无法撤销——这种能力
+/// 不该被一个布尔字段顺手打开。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitPushParams {
+    /// 工作区 id；缺省作用于活动工作区。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub workspace_id: Option<String>,
+    /// 远端名；缺省用当前分支的上游远端，再缺省用 `origin`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub remote: Option<String>,
+    /// 远端分支名；缺省与本地分支同名。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub branch: Option<String>,
+    /// 是否顺手把上游设为本次推送的远端分支（`-u`）。
+    #[serde(default)]
+    pub set_upstream: bool,
+    /// 是否用 `--force-with-lease` 强推。外壳必须先二次确认。
+    #[serde(default)]
+    pub force_with_lease: bool,
+}
+
+/// `git.push` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitPushResult {
+    /// 工作区 id。
+    pub workspace_id: String,
+    /// 推送的本地分支名。
+    pub branch: String,
+    /// 远端名。
+    pub remote: String,
+    /// 远端分支名。
+    pub remote_branch: String,
+    /// 是否使用了 `--force-with-lease`。
+    pub forced: bool,
+    /// 是否本来就同步（`Everything up-to-date`）。
+    pub up_to_date: bool,
+    /// 推送后本地 HEAD 的完整哈希。
+    pub oid: String,
+    /// 短哈希。
+    pub short_oid: String,
+}
+
+/// 一条 stash（`stash@{index}`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitStashEntry {
+    /// 序号，对应 `stash@{n}` 里的 `n`；`0` 是最新一条。
+    pub index: u32,
+    /// 完整哈希。
+    pub oid: String,
+    /// 短哈希。
+    pub short_oid: String,
+    /// stash 信息（`git stash save -m` 写入的 message，或默认的 `WIP on <branch>`）。
+    pub message: String,
+}
+
+/// `git.stash` 请求参数。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitStashParams {
+    /// 工作区 id；缺省作用于活动工作区。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub workspace_id: Option<String>,
+    /// 说明文字；缺省由 git 生成 `WIP on <branch>: <short> <subject>`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub message: Option<String>,
+    /// 是否连未跟踪文件一起收进 stash（`--include-untracked`）。
+    #[serde(default)]
+    pub include_untracked: bool,
+}
+
+/// `git.stash` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitStashResult {
+    /// 工作区 id。
+    pub workspace_id: String,
+    /// 是否真的产生了一条 stash（工作区本来就干净时为 `false`）。
+    pub stashed: bool,
+    /// 新产生的 stash；`stashed` 为假时为 `null`。
+    pub entry: Option<GitStashEntry>,
+    /// 操作后 stash 总数。
+    pub total: u32,
+}
+
+/// `git.stash_list` 请求参数。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitStashListParams {
+    /// 工作区 id；缺省作用于活动工作区。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub workspace_id: Option<String>,
+}
+
+/// `git.stash_list` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitStashListResult {
+    /// 工作区 id。
+    pub workspace_id: String,
+    /// 按序号升序（`0` 最新）。
+    pub entries: Vec<GitStashEntry>,
+}
+
+/// `git.stash_pop` / `git.stash_apply` 请求参数。
+///
+/// 两个方法共用一套参数与结果：差别只在「成功之后删不删这条 stash」。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitStashApplyParams {
+    /// 工作区 id；缺省作用于活动工作区。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub workspace_id: Option<String>,
+    /// 目标 stash 序号（`stash@{index}`）；缺省 `0`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub index: Option<u32>,
+}
+
+/// `git.stash_pop` / `git.stash_apply` 响应结果。
+///
+/// 冲突**不走**这条结果：冲突一律是 `7010`（`data.files` 带冲突文件、`data.stash_kept`
+/// 恒真）。这样「取出成功」与「取出但撞冲突」在外壳上是两套不同的话术，不会混。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitStashApplyResult {
+    /// 工作区 id。
+    pub workspace_id: String,
+    /// 动作名：`pop` 或 `apply`。
+    pub action: String,
+    /// 被取出的 stash 序号。
+    pub index: u32,
+    /// 该 stash 是否已被删除（`pop` 成功为真，`apply` 恒为假）。
+    pub dropped: bool,
+    /// 操作后剩余的 stash 数。
+    pub total: u32,
+}
+
+/// `git.stash_drop` 请求参数。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitStashDropParams {
+    /// 工作区 id；缺省作用于活动工作区。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub workspace_id: Option<String>,
+    /// 目标 stash 序号；缺省 `0`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub index: Option<u32>,
+}
+
+/// `git.stash_drop` 响应结果。
+///
+/// 回带被删条目的 `oid` / `message`：这是用户**唯一**能事后确认「到底删了哪一条」的
+/// 证据（已删的 stash 不在 `stash_list` 里，界面上会直接消失）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitStashDropResult {
+    /// 工作区 id。
+    pub workspace_id: String,
+    /// 被删除的 stash 序号。
+    pub index: u32,
+    /// 被删除条目的完整哈希。
+    pub oid: String,
+    /// 被删除条目的说明。
+    pub message: String,
+    /// 操作后剩余的 stash 数。
+    pub total: u32,
+}
+
+// ---------------------------------------------------------------------------
 // MCP（M7 切片二：`mcp.*`）
 // ---------------------------------------------------------------------------
 

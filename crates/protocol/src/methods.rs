@@ -166,6 +166,10 @@ pub mod terminal {
 ///
 /// 五个方法都以「工作区根」为操作对象，路径参数一律相对工作区根；
 /// 事件侧不新增通知——状态变化由客户端在写操作后自行重查，避免内核猜测外部改动。
+///
+/// 缺口第二批（Git 深化）在同一命名空间下补齐**会改仓库状态或触碰远端**的九个方法：
+/// 分支切换 / 新建、`fetch` / `pull` / `push`、`stash` 增删查取。它们与上面五个的
+/// 分野是「是否可能丢数据或触网」——所以每个都带独立的失败码，不退化成一个 7003。
 pub mod git {
     /// 工作区变更清单与分支头信息。
     pub const STATUS: &str = "git.status";
@@ -177,6 +181,24 @@ pub mod git {
     pub const COMMIT: &str = "git.commit";
     /// 当前分支与分支列表。
     pub const BRANCHES: &str = "git.branches";
+    /// 切换分支或新建分支（脏工作区拒绝，不静默丢改动）。
+    pub const CHECKOUT: &str = "git.checkout";
+    /// 拉取远端引用（不改工作区）。
+    pub const FETCH: &str = "git.fetch";
+    /// 快进式拉取（非快进拒绝并报 7007）。
+    pub const PULL: &str = "git.pull";
+    /// 推送当前分支（强制推送只走 `--force-with-lease`）。
+    pub const PUSH: &str = "git.push";
+    /// 保存 stash（含 message）。
+    pub const STASH: &str = "git.stash";
+    /// stash 列表。
+    pub const STASH_LIST: &str = "git.stash_list";
+    /// 取出 stash 并删除该条目；冲突时保留条目并报 7010。
+    pub const STASH_POP: &str = "git.stash_pop";
+    /// 应用 stash 但保留条目。
+    pub const STASH_APPLY: &str = "git.stash_apply";
+    /// 丢弃一条 stash（外壳必须二次确认）。
+    pub const STASH_DROP: &str = "git.stash_drop";
 }
 
 /// MCP 连接与工具（M7 切片二）。
@@ -397,6 +419,18 @@ pub const IMPLEMENTED: &[&str] = &[
     git::STAGE,
     git::COMMIT,
     git::BRANCHES,
+    // 缺口第二批：Git 深化（分支切换 / 远端 / stash）。能力数 80 → 89。
+    // 九个方法都在 `crates/git/src/repo.rs` 有真实实现、在 `git_api.rs` 有真实
+    // 处理器：不是「名字先占位」，所以进 `IMPLEMENTED` 而不是 `DECLARED_NOT_IMPLEMENTED`。
+    git::CHECKOUT,
+    git::FETCH,
+    git::PULL,
+    git::PUSH,
+    git::STASH,
+    git::STASH_LIST,
+    git::STASH_POP,
+    git::STASH_APPLY,
+    git::STASH_DROP,
     // M7 切片二：MCP 连接与工具（实现在 `crates/mcp`，dispatch 已接线）。
     mcp::SERVERS,
     mcp::CONNECT,
@@ -445,7 +479,7 @@ mod tests {
 
     #[test]
     fn implemented_list_covers_core_m1_m2_agent_domains() {
-        assert_eq!(IMPLEMENTED.len(), 80);
+        assert_eq!(IMPLEMENTED.len(), 89);
         assert!(IMPLEMENTED.contains(&"core.ping"));
         assert!(IMPLEMENTED.contains(&"$/cancelRequest"));
         assert!(IMPLEMENTED.contains(&"workspace.read_file"));
@@ -601,13 +635,52 @@ mod tests {
         all.sort_unstable();
         all.dedup();
         assert_eq!(all.len(), total, "两张表不得有重叠");
-        // LSP 五个接线后已接线 79；P5 切片八补 `plugin.load_many` 后为 80、待接线 0。
-        assert_eq!(IMPLEMENTED.len(), 80, "P5 切片八后应为 80 个已接线方法");
+        // LSP 五个接线后 79；P5 切片八补 `plugin.load_many` 后 80；
+        // 缺口第二批 Git 深化补九个（checkout / fetch / pull / push / stash 系列）后 89，
+        // 待接线仍为 0。
+        assert_eq!(IMPLEMENTED.len(), 89, "缺口第二批后应为 89 个已接线方法");
         assert_eq!(DECLARED_NOT_IMPLEMENTED.len(), 0);
         assert_eq!(
-            total, 80,
-            "应恰好覆盖协议里定义的全部 80 个请求方法（含 LSP 五个与 plugin.load_many）"
+            total, 89,
+            "应恰好覆盖协议里定义的全部 89 个请求方法（含 LSP 五个、plugin.load_many 与 Git 深化九个）"
         );
+    }
+
+    /// 缺口第二批：Git 深化的九个方法必须同时满足「名字固定」与「在能力清单里」。
+    ///
+    /// 这里逐个断言字面量而不是只数个数：方法名是协议对外的承诺，改名等于破坏
+    /// 兼容；只数 `len()` 的话，删掉 `stash_drop` 再加一个别的域方法也能凑够 89，
+    /// 而 Main 会在真正调用时拿到 `-32601`。
+    #[test]
+    fn git_deepening_methods_are_named_and_wired() {
+        for (constant, expected) in [
+            (git::CHECKOUT, "git.checkout"),
+            (git::FETCH, "git.fetch"),
+            (git::PULL, "git.pull"),
+            (git::PUSH, "git.push"),
+            (git::STASH, "git.stash"),
+            (git::STASH_LIST, "git.stash_list"),
+            (git::STASH_POP, "git.stash_pop"),
+            (git::STASH_APPLY, "git.stash_apply"),
+            (git::STASH_DROP, "git.stash_drop"),
+        ] {
+            assert_eq!(constant, expected, "Git 深化方法名不得漂移");
+            assert!(
+                IMPLEMENTED.contains(&constant),
+                "{constant} 必须进能力清单：dispatch 已有真实分支"
+            );
+        }
+        // git 域恰好 14 个方法（5 个 M6 切片三 + 9 个缺口第二批），不多不少。
+        let git_methods = IMPLEMENTED
+            .iter()
+            .filter(|name| name.starts_with("git."))
+            .count();
+        assert_eq!(git_methods, 14, "git 域应恰好 14 个已接线方法");
+        // 危险动作必须留在协议里可寻址，但**不能**出现在待接线表里——
+        // 「声明了却没实现」比「没声明」更糟：Main 会调它。
+        for name in [git::PUSH, git::STASH_DROP] {
+            assert!(!DECLARED_NOT_IMPLEMENTED.contains(&name));
+        }
     }
 
     #[test]

@@ -129,6 +129,26 @@ impl ErrorCode {
     pub const GIT_INVALID_PARAMS: Self = Self(7004);
     /// 没有可提交的变更（暂存区为空且未 `--allow-empty`）。
     pub const GIT_NOTHING_TO_COMMIT: Self = Self(7005);
+    /// 工作区有未提交改动，切换分支会丢改动：先提交或 `git stash`。
+    ///
+    /// 单独立一个码而不是复用 `7003`（git 命令失败），是因为外壳的反应不同：
+    /// `7003` 只能把 stderr 摆给用户看，`7006` 能直接给出「先提交 / 先 stash」的
+    /// 出路，并把脏文件清单渲染成可点击列表。
+    pub const GIT_WORKSPACE_DIRTY: Self = Self(7006);
+    /// 非快进：远端有本地没有的提交，`pull --ff-only` 与 `push` 都被拒。
+    ///
+    /// 与 `7008` 分开的理由同上一类：一个是「去 pull」，一个是「去登录」，混成一个
+    /// 码就只能给一句两头不靠的「操作失败」。
+    pub const GIT_NOT_FAST_FORWARD: Self = Self(7007);
+    /// 远端认证失败：凭据缺失或被拒、SSH 公钥不被接受。
+    pub const GIT_AUTH_FAILED: Self = Self(7008);
+    /// 当前分支没有上游分支，无从 `pull` / `push`。
+    pub const GIT_NO_UPSTREAM: Self = Self(7009);
+    /// `stash pop` / `apply` 撞冲突：改动已落到工作区但冲突未解决，**stash 未被丢弃**。
+    ///
+    /// `data.files` 带冲突文件清单，`data.stash_kept` 恒为 `true`——这条码的语义就是
+    /// 「数据还在，去解决冲突」，外壳不该提示用户「操作失败、请重试」。
+    pub const GIT_STASH_CONFLICT: Self = Self(7010);
 
     // ---------- 8xxx MCP ----------
     /// Server 名不在 `mcp.json` 里：写错了名字，或配置文件根本没装载。
@@ -458,5 +478,40 @@ mod tests {
             ErrorCode::LSP_SERVER_UNKNOWN.as_i32(),
             ErrorCode::INVALID_PARAMS.as_i32()
         );
+    }
+
+    /// Git 深化（分支切换 / 远端 / stash）把 7xxx 段从 7005 扩到 7010。
+    ///
+    /// 这几个码的**唯一**存在理由就是「外壳要按码给不同的下一步」：脏工作区→去提交、
+    /// 非快进→去拉取、认证失败→去登录、无上游→去设上游、stash 冲突→去解冲突。
+    /// 一旦谁把它们合并进 7003，UI 就只能退化成贴 stderr，用户拿不到出路。
+    #[test]
+    fn git_error_codes_stay_in_the_7xxx_band_and_stay_distinct() {
+        let codes = [
+            ErrorCode::GIT_UNAVAILABLE,
+            ErrorCode::GIT_NOT_A_REPOSITORY,
+            ErrorCode::GIT_COMMAND_FAILED,
+            ErrorCode::GIT_INVALID_PARAMS,
+            ErrorCode::GIT_NOTHING_TO_COMMIT,
+            ErrorCode::GIT_WORKSPACE_DIRTY,
+            ErrorCode::GIT_NOT_FAST_FORWARD,
+            ErrorCode::GIT_AUTH_FAILED,
+            ErrorCode::GIT_NO_UPSTREAM,
+            ErrorCode::GIT_STASH_CONFLICT,
+        ];
+        for (index, code) in codes.iter().enumerate() {
+            let raw = code.as_i32();
+            assert!((7001..=7099).contains(&raw), "{raw} 不在 7xxx 段");
+            assert!(!code.is_standard(), "{raw} 不该被当成标准码");
+            assert!(
+                !codes[..index].contains(code),
+                "{raw} 重复定义，同段内码值必须唯一"
+            );
+        }
+        assert_eq!(ErrorCode::GIT_WORKSPACE_DIRTY.as_i32(), 7006);
+        assert_eq!(ErrorCode::GIT_STASH_CONFLICT.as_i32(), 7010);
+        // 相邻段（终端 6xxx / MCP 8xxx）不能被挤占。
+        assert!(!(6001..=6099).contains(&ErrorCode::GIT_UNAVAILABLE.as_i32()));
+        assert!(!(8001..=8099).contains(&ErrorCode::GIT_STASH_CONFLICT.as_i32()));
     }
 }
