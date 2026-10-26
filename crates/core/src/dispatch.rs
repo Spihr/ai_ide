@@ -153,6 +153,18 @@ async fn handle_request(peer: &Peer, state: &AppState, req: Request) {
         methods::git::COMMIT => git_api::commit(peer, state, &req).await,
         methods::git::BRANCHES => git_api::branches(peer, state, &req).await,
 
+        // 缺口第二批 Git 深化：会改仓库状态或触碰远端的九个方法。
+        // 每个都路由到真实处理器，失败码独立（7006~7010），不统统折成 7003。
+        methods::git::CHECKOUT => git_api::checkout(peer, state, &req).await,
+        methods::git::FETCH => git_api::fetch(peer, state, &req).await,
+        methods::git::PULL => git_api::pull(peer, state, &req).await,
+        methods::git::PUSH => git_api::push(peer, state, &req).await,
+        methods::git::STASH => git_api::stash(peer, state, &req).await,
+        methods::git::STASH_LIST => git_api::stash_list(peer, state, &req).await,
+        methods::git::STASH_POP => git_api::stash_pop(peer, state, &req).await,
+        methods::git::STASH_APPLY => git_api::stash_apply(peer, state, &req).await,
+        methods::git::STASH_DROP => git_api::stash_drop(peer, state, &req).await,
+
         // MCP（M7 切片二）：连接由 core state 的管理器统一持有，每次调用现查活连接，
         // 因此「断连后工具自动下架」不需要额外清理逻辑——查不到就是不存在。
         methods::mcp::SERVERS => mcp_api::servers(peer, state, &req).await,

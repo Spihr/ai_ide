@@ -43,6 +43,9 @@ impl TempRepo {
         self.git(&["config", "user.name", "AI IDE Test"]);
         // 全局开了 gpgsign 的机器上，--amend 之类的用例会卡在签名上。
         self.git(&["config", "commit.gpgsign", "false"]);
+        // 全局开了 `core.autocrlf=true` 的机器上，checkout 会把 `\n` 改写成 `\r\n`，
+        // 断言「取回的内容与写入一致」就会莫名其妙地失败。仓库级关掉它。
+        self.git(&["config", "core.autocrlf", "false"]);
     }
 
     fn git(&self, args: &[&str]) {
@@ -69,6 +72,78 @@ impl TempRepo {
 
     fn read(&self, name: &str) -> String {
         std::fs::read_to_string(self.root.join(name)).unwrap_or_default()
+    }
+
+    /// 建成裸仓库（当远端用）。
+    ///
+    /// 远端必须是**真的** git 仓库：`git push` / `fetch` / `pull --ff-only` 的判定全在
+    /// 远端一侧（引用是否前进、是否分叉），进程内替身根本没法产生那些回答。
+    fn init_bare(&self) {
+        self.git(&["init", "--bare", "-q"]);
+    }
+
+    /// 裸仓库的本地路径——git 认本地路径当远端地址，不必起服务。
+    fn url(&self) -> String {
+        self.root.display().to_string()
+    }
+
+    /// 从远端克隆到本对象已建好的空目录。
+    fn clone_from(&self, url: &str) {
+        let output = Command::new("git")
+            // 必须在 clone 时就关掉换行转换：等到 clone 完再 `git config` 已经晚了，
+            // 工作区已被按 `core.autocrlf` 检出成 CRLF，随后 `add -A` 会把整份换行
+            // 改动当成内容提交（用例里会表现为「另一个克隆莫名改了 a.txt」）。
+            .args(["-c", "core.autocrlf=false", "clone", "-q", url])
+            .arg(&self.root)
+            .output()
+            .expect("git 应当可用");
+        assert!(
+            output.status.success(),
+            "clone 失败：{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        self.git(&["config", "user.email", "test@example.com"]);
+        self.git(&["config", "user.name", "AI IDE Test"]);
+        self.git(&["config", "commit.gpgsign", "false"]);
+        self.git(&["config", "core.autocrlf", "false"]);
+    }
+
+    /// 当前分支名（不硬编码 `main` / `master`：取决于机器的 `init.defaultBranch`）。
+    fn current_branch(&self) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .output()
+            .expect("git 应当可用");
+        assert!(output.status.success(), "读取当前分支失败");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// 不 panic 的 git：给「预期会失败」的断言用（例如确认某分支真的不存在）。
+    fn try_git(&self, args: &[&str]) -> (bool, String) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(args)
+            .output()
+            .expect("git 应当可用");
+        let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        (output.status.success(), text)
+    }
+
+    /// 提交全部改动（测试自己造历史，不经过内核，避免用例之间互相牵连）。
+    fn commit_all(&self, message: &str) {
+        self.git(&["add", "-A"]);
+        self.git(&["commit", "-q", "-m", message]);
+    }
+
+    /// HEAD 的完整哈希。
+    fn head(&self) -> String {
+        let (ok, text) = self.try_git(&["rev-parse", "HEAD"]);
+        assert!(ok, "读 HEAD 失败：{text}");
+        text.trim().to_string()
     }
 }
 
@@ -120,6 +195,23 @@ fn find_entry<'a>(status: &'a Value, path: &str) -> Option<&'a Value> {
         .find(|entry| entry["path"] == json!(path))
 }
 
+/// 取完整的错误对象（不只是码）。
+///
+/// 7006 / 7010 的价值有一半在 `data` 里：`files` 是外壳渲染「哪些文件挡住了」的清单，
+/// `stash_kept` 决定「取出失败」要不要提示用户「记录还在」。只断言码会让这些字段
+/// 悄悄消失而无人发现。
+fn error_body(core: &mut Core, method: &str, params: Value) -> (i64, Value) {
+    let response = core.call(method, params);
+    let err = response
+        .get("error")
+        .unwrap_or_else(|| panic!("{method} 期望报错，实际返回：{response}"))
+        .clone();
+    let code = err["code"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("{method} 的错误没有 code：{err}"));
+    (code, err)
+}
+
 // ---------------------------------------------------------------------------
 // 用例
 // ---------------------------------------------------------------------------
@@ -134,6 +226,17 @@ fn capabilities_include_git_methods() {
         "git.stage",
         "git.commit",
         "git.branches",
+        // 缺口第二批 Git 深化：九个方法都必须在能力清单里，且下面各有真实调用用例，
+        // 所以它们进的是 `IMPLEMENTED`（dispatch 能路由）而不是「仅声明」。
+        "git.checkout",
+        "git.fetch",
+        "git.pull",
+        "git.push",
+        "git.stash",
+        "git.stash_list",
+        "git.stash_pop",
+        "git.stash_apply",
+        "git.stash_drop",
     ] {
         assert!(
             capabilities.iter().any(|item| item == method),
@@ -408,4 +511,372 @@ fn amend_rewrites_head_and_allow_empty_creates_commit() {
         .output()
         .expect("rev-list");
     assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "2");
+}
+
+// ---------------------------------------------------------------------------
+// 缺口第二批：分支切换 / 远端 / stash
+// ---------------------------------------------------------------------------
+
+#[test]
+fn checkout_refuses_dirty_workspace_then_switches() {
+    let (mut core, _data) = boot("git-checkout");
+    let repo = TempRepo::new("checkout");
+    repo.init();
+    repo.write("a.txt", "base\n");
+    repo.commit_all("base");
+    let base = repo.current_branch();
+    let workspace_id = open_workspace(&mut core, &repo.root);
+
+    // 脏工作区切换：7006，`data.files` 必须点名到底是谁挡住了。
+    repo.write("a.txt", "dirty\n");
+    let (code, err) = error_body(
+        &mut core,
+        "git.checkout",
+        json!({ "workspace_id": workspace_id, "branch": "feature", "create": true }),
+    );
+    assert_eq!(code, 7006, "脏工作区切换必须是 7006：{err}");
+    let files = err["data"]["files"]
+        .as_array()
+        .expect("7006 必须带 files 清单");
+    assert!(files.iter().any(|item| item == "a.txt"), "{err}");
+
+    // 被拒之后必须什么都没发生：分支没切、新分支也没建出来。
+    assert_eq!(repo.current_branch(), base);
+    let (exists, text) = repo.try_git(&["rev-parse", "--verify", "feature"]);
+    assert!(!exists, "feature 不该被建出来：{text}");
+
+    // 恢复干净后新建并切过去：created / previous 都是真值。
+    repo.git(&["checkout", "--", "a.txt"]);
+    let created = core.ok(
+        "git.checkout",
+        json!({ "workspace_id": workspace_id, "branch": "feature", "create": true }),
+    );
+    assert_eq!(created["created"], json!(true));
+    assert_eq!(created["branch"], json!("feature"));
+    assert_eq!(created["previous"], json!(base));
+    assert_eq!(created["oid"].as_str().unwrap().len(), 40);
+    assert_eq!(created["short_oid"].as_str().unwrap().len(), 7);
+    assert_eq!(repo.current_branch(), "feature");
+
+    // 切回已有分支：created=false，previous 是刚才那条。
+    let back = core.ok(
+        "git.checkout",
+        json!({ "workspace_id": workspace_id, "branch": base }),
+    );
+    assert_eq!(back["created"], json!(false));
+    assert_eq!(back["previous"], json!("feature"));
+    assert_eq!(back["branch"], json!(base));
+    assert_eq!(repo.current_branch(), base);
+}
+
+#[test]
+fn push_needs_upstream_then_tracks_remote() {
+    let (mut core, _data) = boot("git-push");
+    let remote = TempRepo::new("push-remote");
+    remote.init_bare();
+    let repo = TempRepo::new("push-local");
+    repo.init();
+    repo.write("a.txt", "base\n");
+    repo.commit_all("base");
+    let branch = repo.current_branch();
+    repo.git(&["remote", "add", "origin", &remote.url()]);
+    let workspace_id = open_workspace(&mut core, &repo.root);
+
+    // 没有上游：7009，而不是 7003（用户该做的是「设上游」，不是「重试」）。
+    let (code, err) = error_body(
+        &mut core,
+        "git.push",
+        json!({ "workspace_id": workspace_id }),
+    );
+    assert_eq!(code, 7009, "无上游推送必须是 7009：{err}");
+    assert_eq!(err["data"]["branch"], json!(branch));
+
+    // 带 `set_upstream`：真的推到裸仓库，远端分支与本地 HEAD 同指一个提交。
+    let pushed = core.ok(
+        "git.push",
+        json!({ "workspace_id": workspace_id, "set_upstream": true }),
+    );
+    let head = repo.head();
+    assert_eq!(pushed["branch"], json!(branch));
+    assert_eq!(pushed["remote"], json!("origin"));
+    assert_eq!(pushed["remote_branch"], json!(branch));
+    assert_eq!(pushed["forced"], json!(false));
+    assert_eq!(pushed["up_to_date"], json!(false));
+    assert_eq!(pushed["oid"], json!(head));
+    assert_eq!(pushed["short_oid"], json!(&head[..7]));
+    let (ok, text) = remote.try_git(&["rev-parse", &format!("refs/heads/{branch}")]);
+    assert!(ok, "裸仓库里应当有这条分支：{text}");
+    assert_eq!(text.trim(), head, "远端必须指向同一条提交");
+
+    // `push -u` 已经顺手建好 `refs/remotes/origin/<branch>`，所以紧接着的 fetch 不该
+    // 把它当「新更新」再报一次——内核按「哈希是否变化」判，而不是「fetch 跑过就算」。
+    let target = format!("origin/{branch}");
+    let synced = core.ok(
+        "git.fetch",
+        json!({ "workspace_id": workspace_id, "prune": true }),
+    );
+    assert_eq!(synced["remote"], json!("origin"));
+    assert_eq!(
+        synced["up_to_date"],
+        json!(true),
+        "跟踪引用已同步时 fetch 应报同步：{synced}"
+    );
+    assert!(
+        synced["updated"].as_array().unwrap().is_empty(),
+        "不该把 `origin/HEAD` 这类符号引用当成远端分支上报：{synced}"
+    );
+    // 再推一次也是同步。
+    let noop = core.ok("git.push", json!({ "workspace_id": workspace_id }));
+    assert_eq!(noop["up_to_date"], json!(true));
+
+    // 另一个克隆推一条上来：fetch 看得见引用前进。
+    let other = TempRepo::new("push-other");
+    other.clone_from(&remote.url());
+    other.write("other.txt", "from other\n");
+    other.commit_all("other");
+    other.git(&["push", "-q", "origin", &format!("HEAD:refs/heads/{branch}")]);
+    let advanced = core.ok("git.fetch", json!({ "workspace_id": workspace_id }));
+    assert_eq!(advanced["up_to_date"], json!(false));
+    let item = advanced["updated"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["ref_name"] == json!(target))
+        .unwrap_or_else(|| panic!("fetch 应报出 {target} 的更新：{advanced}"))
+        .clone();
+    assert_eq!(item["old_short"], json!(&head[..7]));
+    assert_eq!(item["new_short"], json!(&other.head()[..7]));
+}
+
+#[test]
+fn pull_fast_forwards_and_rejects_divergence() {
+    let (mut core, _data) = boot("git-pull");
+    let remote = TempRepo::new("pull-remote");
+    remote.init_bare();
+    let repo = TempRepo::new("pull-local");
+    repo.init();
+    repo.write("a.txt", "base\n");
+    repo.commit_all("base");
+    let branch = repo.current_branch();
+    repo.git(&["remote", "add", "origin", &remote.url()]);
+    let workspace_id = open_workspace(&mut core, &repo.root);
+
+    // 先推基线并设上游：pull 的远端/分支缺省值全靠上游。
+    core.ok(
+        "git.push",
+        json!({ "workspace_id": workspace_id, "set_upstream": true }),
+    );
+    let before = repo.head();
+
+    // 另一个克隆往前推一条：pull 应当快进，并回带带进来的文件。
+    let other = TempRepo::new("pull-other");
+    other.clone_from(&remote.url());
+    other.write("other.txt", "from other\n");
+    other.commit_all("other");
+    other.git(&["push", "-q", "origin", &format!("HEAD:refs/heads/{branch}")]);
+    let other_head = other.head();
+
+    let pulled = core.ok("git.pull", json!({ "workspace_id": workspace_id }));
+    assert_eq!(pulled["branch"], json!(branch));
+    assert_eq!(pulled["upstream"], json!(format!("origin/{branch}")));
+    assert_eq!(pulled["updated"], json!(true));
+    assert_eq!(pulled["previous_oid"], json!(before));
+    assert_eq!(pulled["oid"], json!(other_head));
+    assert_eq!(pulled["short_oid"], json!(&other_head[..7]));
+    assert_eq!(pulled["commits"], json!(1));
+    assert_eq!(pulled["files"], json!(1));
+    assert_eq!(pulled["changed_paths"], json!(["other.txt"]));
+    assert_eq!(repo.read("other.txt"), "from other\n", "快进必须真的落盘");
+
+    // 已是最新：updated=false、commits=0、清单空。
+    let noop = core.ok("git.pull", json!({ "workspace_id": workspace_id }));
+    assert_eq!(noop["updated"], json!(false));
+    assert_eq!(noop["commits"], json!(0));
+    assert_eq!(noop["files"], json!(0));
+    assert!(
+        noop["changed_paths"].as_array().unwrap().is_empty(),
+        "{noop}"
+    );
+
+    // 分叉：本地一条、远端一条，`--ff-only` 必须拒绝（7007），且 HEAD 一动不动。
+    repo.write("local.txt", "local\n");
+    repo.commit_all("local");
+    other.write("other.txt", "from other v2\n");
+    other.commit_all("other v2");
+    other.git(&["push", "-q", "origin", &format!("HEAD:refs/heads/{branch}")]);
+    let local_head = repo.head();
+
+    let (code, err) = error_body(
+        &mut core,
+        "git.pull",
+        json!({ "workspace_id": workspace_id }),
+    );
+    assert_eq!(code, 7007, "分叉时 pull 必须是 7007：{err}");
+    assert!(
+        err["data"]["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("fast-forward")
+            || err["data"]["detail"].is_string(),
+        "7007 应带 git 原文摘要：{err}"
+    );
+    assert_eq!(repo.head(), local_head, "非快进被拒后 HEAD 不能动");
+    assert_eq!(repo.read("other.txt"), "from other\n", "工作区不能被改写");
+}
+
+#[test]
+fn stash_round_trip_applies_pops_and_drops() {
+    let (mut core, _data) = boot("git-stash");
+    let repo = TempRepo::new("stash");
+    repo.init();
+    repo.write("a.txt", "base\n");
+    repo.commit_all("base");
+    let workspace_id = open_workspace(&mut core, &repo.root);
+
+    // 干净工作区：git 什么都不存，不能虚报一条记录给外壳。
+    let none = core.ok("git.stash", json!({ "workspace_id": workspace_id }));
+    assert_eq!(none["stashed"], json!(false));
+    assert_eq!(none["entry"], Value::Null);
+    assert_eq!(none["total"], json!(0));
+
+    // 改动 + 未跟踪文件一起收：条目带回 message / oid / short_oid。
+    repo.write("a.txt", "base\nwip\n");
+    repo.write("scratch.txt", "tmp\n");
+    let stashed = core.ok(
+        "git.stash",
+        json!({
+            "workspace_id": workspace_id,
+            "message": "wip-检查点",
+            "include_untracked": true,
+        }),
+    );
+    assert_eq!(stashed["stashed"], json!(true));
+    assert_eq!(stashed["total"], json!(1));
+    let entry = stashed["entry"].clone();
+    assert_eq!(entry["index"], json!(0));
+    assert!(
+        entry["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("wip-检查点"),
+        "message 应原样带回：{entry}"
+    );
+    assert_eq!(entry["oid"].as_str().unwrap().len(), 40);
+    assert_eq!(entry["short_oid"].as_str().unwrap().len(), 7);
+    assert_eq!(repo.read("a.txt"), "base\n", "改动必须真的离开工作区");
+    assert!(
+        !repo.root.join("scratch.txt").exists(),
+        "未跟踪文件也应收走"
+    );
+
+    let list = core.ok("git.stash_list", json!({ "workspace_id": workspace_id }));
+    let entries = list["entries"].as_array().expect("entries 是数组");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["oid"], entry["oid"]);
+
+    // apply：改动回来，条目保留（这是 pop 与 apply 的唯一差别）。
+    let applied = core.ok(
+        "git.stash_apply",
+        json!({ "workspace_id": workspace_id, "index": 0 }),
+    );
+    assert_eq!(applied["action"], json!("apply"));
+    assert_eq!(applied["index"], json!(0));
+    assert_eq!(applied["dropped"], json!(false));
+    assert_eq!(applied["total"], json!(1));
+    assert_eq!(repo.read("a.txt"), "base\nwip\n");
+
+    // 清回提交态再 pop：pop 成功后条目消失、栈清空。
+    repo.git(&["reset", "--hard", "-q", "HEAD"]);
+    let _ = std::fs::remove_file(repo.root.join("scratch.txt"));
+    let popped = core.ok("git.stash_pop", json!({ "workspace_id": workspace_id }));
+    assert_eq!(popped["action"], json!("pop"));
+    assert_eq!(popped["dropped"], json!(true));
+    assert_eq!(popped["total"], json!(0));
+    assert_eq!(repo.read("a.txt"), "base\nwip\n");
+    let emptied = core.ok("git.stash_list", json!({ "workspace_id": workspace_id }));
+    assert!(
+        emptied["entries"].as_array().unwrap().is_empty(),
+        "{emptied}"
+    );
+
+    // 再来一条并 drop：回带 oid / message 供事后追认「删的是哪一条」。
+    repo.write("a.txt", "base\nwip2\n");
+    let second = core.ok(
+        "git.stash",
+        json!({ "workspace_id": workspace_id, "message": "第二条" }),
+    );
+    let second_oid = second["entry"]["oid"].as_str().unwrap().to_string();
+    let dropped = core.ok(
+        "git.stash_drop",
+        json!({ "workspace_id": workspace_id, "index": 0 }),
+    );
+    assert_eq!(dropped["index"], json!(0));
+    assert_eq!(dropped["oid"], json!(second_oid));
+    assert!(
+        dropped["message"].as_str().unwrap_or("").contains("第二条"),
+        "{dropped}"
+    );
+    assert_eq!(dropped["total"], json!(0));
+
+    // 越界序号是参数问题（7004），不是「git 失败了」（7003）。
+    let code = core.error_code(
+        "git.stash_drop",
+        json!({ "workspace_id": workspace_id, "index": 7 }),
+    );
+    assert_eq!(code, 7004);
+    let code = core.error_code(
+        "git.stash_pop",
+        json!({ "workspace_id": workspace_id, "index": 7 }),
+    );
+    assert_eq!(code, 7004);
+}
+
+#[test]
+fn stash_pop_conflict_reports_7010_and_keeps_entry() {
+    let (mut core, _data) = boot("git-stash-conflict");
+    let repo = TempRepo::new("stash-conflict");
+    repo.init();
+    repo.write("a.txt", "base\n");
+    repo.commit_all("base");
+    let base_oid = repo.head();
+    let workspace_id = open_workspace(&mut core, &repo.root);
+
+    // 把「改成 stashed」收进 stash。
+    repo.write("a.txt", "stashed\n");
+    let stashed = core.ok(
+        "git.stash",
+        json!({ "workspace_id": workspace_id, "message": "冲突前" }),
+    );
+    assert_eq!(stashed["stashed"], json!(true));
+
+    // 同一个文件改成另一版并提交：再 pop 必然撞冲突。
+    repo.write("a.txt", "committed\n");
+    repo.commit_all("另一版");
+
+    let (code, err) = error_body(
+        &mut core,
+        "git.stash_pop",
+        json!({ "workspace_id": workspace_id }),
+    );
+    assert_eq!(code, 7010, "stash 冲突必须是 7010：{err}");
+    let files = err["data"]["files"]
+        .as_array()
+        .expect("7010 必须带冲突文件清单");
+    assert!(files.iter().any(|item| item == "a.txt"), "{err}");
+    assert_eq!(
+        err["data"]["stash_kept"],
+        json!(true),
+        "冲突时 stash 必须保留：{err}"
+    );
+
+    // `stash_kept` 不是文案承诺：去栈里数一遍。
+    let list = core.ok("git.stash_list", json!({ "workspace_id": workspace_id }));
+    assert_eq!(list["entries"].as_array().unwrap().len(), 1, "{list}");
+
+    // 冲突就地解决（回到 base 版本）后仍能再取：取出成功、条目删除。
+    repo.git(&["reset", "--hard", "-q", &base_oid]);
+    let popped = core.ok("git.stash_pop", json!({ "workspace_id": workspace_id }));
+    assert_eq!(popped["dropped"], json!(true));
+    assert_eq!(popped["total"], json!(0));
+    assert_eq!(repo.read("a.txt"), "stashed\n");
 }
