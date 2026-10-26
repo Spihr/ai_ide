@@ -149,6 +149,16 @@ impl ErrorCode {
     /// `data.files` 带冲突文件清单，`data.stash_kept` 恒为 `true`——这条码的语义就是
     /// 「数据还在，去解决冲突」，外壳不该提示用户「操作失败、请重试」。
     pub const GIT_STASH_CONFLICT: Self = Self(7010);
+    /// 单块暂存的定位已失效：文件被改过、行号漂移，`index` 指向的已不是用户当初选的那块。
+    ///
+    /// 这条码存在的意义是**拒绝**：按序号硬暂存会把用户没选的改动塞进索引，
+    /// 那是静默改坏数据。`data.expected` / `data.actual` 带两侧定位，外壳据此提示刷新。
+    pub const GIT_HUNK_DRIFTED: Self = Self(7011);
+    /// 二进制文件不能按 hunk 暂存（diff 里没有 hunk，只有一句 `Binary files differ`）。
+    ///
+    /// 与 `7011` 分开：这不是「定位失败、刷新再试」，而是「这个文件永远不能这么做」，
+    /// 外壳应当把该文件的逐块按钮直接置灰，并引导用户整文件暂存。
+    pub const GIT_BINARY_HUNK: Self = Self(7012);
 
     // ---------- 8xxx MCP ----------
     /// Server 名不在 `mcp.json` 里：写错了名字，或配置文件根本没装载。
@@ -498,6 +508,8 @@ mod tests {
             ErrorCode::GIT_AUTH_FAILED,
             ErrorCode::GIT_NO_UPSTREAM,
             ErrorCode::GIT_STASH_CONFLICT,
+            ErrorCode::GIT_HUNK_DRIFTED,
+            ErrorCode::GIT_BINARY_HUNK,
         ];
         for (index, code) in codes.iter().enumerate() {
             let raw = code.as_i32();
@@ -510,8 +522,10 @@ mod tests {
         }
         assert_eq!(ErrorCode::GIT_WORKSPACE_DIRTY.as_i32(), 7006);
         assert_eq!(ErrorCode::GIT_STASH_CONFLICT.as_i32(), 7010);
+        assert_eq!(ErrorCode::GIT_HUNK_DRIFTED.as_i32(), 7011);
+        assert_eq!(ErrorCode::GIT_BINARY_HUNK.as_i32(), 7012);
         // 相邻段（终端 6xxx / MCP 8xxx）不能被挤占。
         assert!(!(6001..=6099).contains(&ErrorCode::GIT_UNAVAILABLE.as_i32()));
-        assert!(!(8001..=8099).contains(&ErrorCode::GIT_STASH_CONFLICT.as_i32()));
+        assert!(!(8001..=8099).contains(&ErrorCode::GIT_BINARY_HUNK.as_i32()));
     }
 }

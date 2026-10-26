@@ -1,13 +1,14 @@
 //! 仓库句柄与工作区级服务。
 
-use crate::error::GitError;
+use crate::error::{classify_hunk_apply_failure, GitError};
 use crate::exec::{normalize_path, Runner};
 use crate::model::{
-    GitBranches, GitCheckoutOutcome, GitCommitOutcome, GitDiff, GitFetchOutcome, GitPullOutcome,
-    GitPushOutcome, GitRefUpdate, GitStageOutcome, GitStashApplyOutcome, GitStashDropOutcome,
-    GitStashEntry, GitStashOutcome, GitStatus, MAX_PULL_CHANGED_PATHS,
+    GitBranches, GitCheckoutOutcome, GitCommitOutcome, GitDiff, GitFetchOutcome, GitFileHunks,
+    GitHunkOutcome, GitPullOutcome, GitPushOutcome, GitRefUpdate, GitStageOutcome,
+    GitStashApplyOutcome, GitStashDropOutcome, GitStashEntry, GitStashOutcome, GitStatus,
+    HunkSelector, MAX_PULL_CHANGED_PATHS,
 };
-use crate::parse::{parse_branches, parse_status};
+use crate::parse::{hunk_patch, parse_branches, parse_diff, parse_status, ParsedDiffFile};
 use crate::{DIFF_LIMIT_BYTES, MAX_CONTEXT_LINES};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -104,12 +105,35 @@ impl GitRepo {
         staged: bool,
         context_lines: Option<u32>,
     ) -> Result<GitDiff, GitError> {
-        let context = context_lines.unwrap_or(3).min(MAX_CONTEXT_LINES);
         let normalized = match path {
             Some(raw) => Some(normalize_path(raw)?),
             None => None,
         };
 
+        let text = self.raw_diff(normalized.as_deref(), staged, context_lines)?;
+        let (diff, truncated) = truncate_on_boundary(text, DIFF_LIMIT_BYTES);
+        Ok(GitDiff {
+            path: normalized,
+            staged,
+            bytes: diff.len() as u64,
+            diff,
+            truncated,
+        })
+    }
+
+    /// 未截断的 diff 原文。
+    ///
+    /// 按块暂存**不能**吃 `diff()` 的结果：那个走的是 [`DIFF_LIMIT_BYTES`] 截断路径，
+    /// 大文件的后半段 hunk 会被砍掉，于是「第 7 块找不到」会被误报成定位失效。
+    /// 所以 hunk 解析另开一条不截断的通道，与 `diff()` 共用同一套调用参数，
+    /// 避免两边对「staged / context / 路径」的解释出现分歧。
+    fn raw_diff(
+        &self,
+        normalized: Option<&str>,
+        staged: bool,
+        context_lines: Option<u32>,
+    ) -> Result<String, GitError> {
+        let context = context_lines.unwrap_or(3).min(MAX_CONTEXT_LINES);
         let mut args: Vec<String> = vec![
             "diff".to_string(),
             "--no-color".to_string(),
@@ -120,21 +144,141 @@ impl GitRepo {
         if staged {
             args.push("--cached".to_string());
         }
-        if let Some(normalized) = &normalized {
+        if let Some(normalized) = normalized {
             args.push("--".to_string());
-            args.push(normalized.clone());
+            args.push(normalized.to_string());
         }
         let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
         let raw = self.runner().bytes(&borrowed)?;
-        let text = String::from_utf8_lossy(&raw).to_string();
+        Ok(String::from_utf8_lossy(&raw).to_string())
+    }
 
-        let (diff, truncated) = truncate_on_boundary(text, DIFF_LIMIT_BYTES);
-        Ok(GitDiff {
-            path: normalized,
-            staged,
-            bytes: diff.len() as u64,
-            diff,
-            truncated,
+    /// 某个文件的 hunk 清单（供外壳渲染「逐块暂存」的勾选粒度）。
+    ///
+    /// 不走 [`Self::diff`] 的截断：一块被砍一半的 hunk 比没有更糟——外壳会把它当成
+    /// 合法的第 N 块交给 `stage_hunk`，然后由 `git apply` 报「corrupt patch」。
+    pub fn hunks(
+        &self,
+        path: &str,
+        staged: bool,
+        context_lines: Option<u32>,
+    ) -> Result<GitFileHunks, GitError> {
+        let normalized = normalize_path(path)?;
+        match self.parsed_diff_file(&normalized, staged, context_lines)? {
+            Some(file) => Ok(file.to_model()),
+            // 没有 diff 不等于出错：文件可能已被暂存干净，或者根本没有改动。
+            None => Ok(GitFileHunks {
+                path: normalized,
+                binary: false,
+                hunks: Vec::new(),
+            }),
+        }
+    }
+
+    /// 解析单文件的 diff 片段。
+    ///
+    /// 先按新路径匹配，再退回旧路径：重命名后外壳可能还拿着改名前的名字。
+    fn parsed_diff_file(
+        &self,
+        path: &str,
+        staged: bool,
+        context_lines: Option<u32>,
+    ) -> Result<Option<ParsedDiffFile>, GitError> {
+        let text = self.raw_diff(Some(path), staged, context_lines)?;
+        let mut files = parse_diff(&text);
+        let position = files.iter().position(|file| file.path == path).or_else(|| {
+            files
+                .iter()
+                .position(|file| file.old_path.as_deref() == Some(path))
+        });
+        Ok(position.map(|index| files.swap_remove(index)))
+    }
+
+    /// 按块暂存 / 取消暂存（`git apply --cached [--reverse]`）。
+    ///
+    /// ## 为什么不是 `git add -p`
+    ///
+    /// `add -p` 是交互式命令，要靠一串 y / n / s 的应答驱动，且它的分块口径与
+    /// `git diff` 输出的 hunk 序号**不保证一致**（上下文合并规则不同）。外壳点的是
+    /// diff 里的第 N 块，就必须让 git 应用**同一份** diff 里的第 N 块——所以这里把
+    /// 那块原样拼成补丁喂给 `git apply --cached`，定位即证据。
+    ///
+    /// ## 定位失效为什么必须失败
+    ///
+    /// 只按序号找块是不够的：用户点完之后文件可能又被改过，此时「第 0 块」已经是
+    /// 另一处改动，照序号暂存就会把**用户没选的内容**塞进索引。所以定位是
+    /// 「序号 + 四个行号（+ 可选 header）」全等匹配，任何一项对不上都报
+    /// [`GitError::HunkDrifted`] 并带上期望与实际位置——宁可让用户刷新重选，
+    /// 也不替他猜。
+    ///
+    /// `staged` 的来源按方向区分：暂存看工作区 diff（`git diff`），取消暂存看索引
+    /// diff（`git diff --cached`）——`--reverse` 只负责把补丁反向打进索引。
+    pub fn stage_hunk(
+        &self,
+        selector: &HunkSelector,
+        unstage: bool,
+        context_lines: Option<u32>,
+    ) -> Result<GitHunkOutcome, GitError> {
+        let path = normalize_path(&selector.path)?;
+        let file = self
+            .parsed_diff_file(&path, unstage, context_lines)?
+            .ok_or_else(|| GitError::HunkDrifted {
+                path: path.clone(),
+                index: selector.index,
+                expected: selector.expected(),
+                actual: None,
+            })?;
+
+        if file.binary {
+            return Err(GitError::BinaryHunk { path });
+        }
+
+        let hunk = file
+            .hunks
+            .iter()
+            .find(|hunk| hunk.index == selector.index)
+            .ok_or_else(|| GitError::HunkDrifted {
+                path: path.clone(),
+                index: selector.index,
+                expected: selector.expected(),
+                actual: None,
+            })?;
+
+        if !selector.matches(hunk) {
+            return Err(GitError::HunkDrifted {
+                path: path.clone(),
+                index: selector.index,
+                expected: selector.expected(),
+                actual: Some(hunk.location()),
+            });
+        }
+
+        let patch = hunk_patch(&file, hunk);
+        let mut args: Vec<&str> = vec!["apply", "--cached"];
+        if unstage {
+            args.push("--reverse");
+        }
+        // `--whitespace=nowarn`：补丁里本来就带着原文件的空白，让 git 再警告一遍
+        // 没有意义；真正的冲突该由「patch does not apply」表达。
+        args.push("--whitespace=nowarn");
+
+        let output = self.runner().execute(&[], &args, Some(&patch))?;
+        if !output.success {
+            return Err(classify_hunk_apply_failure(
+                &path,
+                selector.index,
+                selector.expected(),
+                Some(hunk.location()),
+                &args.join(" "),
+                &output.stderr_trimmed(),
+                output.code,
+            ));
+        }
+
+        Ok(GitHunkOutcome {
+            hunk: hunk.clone(),
+            unstage,
+            staged_total: self.staged_count()?,
         })
     }
 

@@ -7,7 +7,7 @@
 //! 这里是纯函数，输入输出都是字节 / 字符串，因此可以拿固定样本做单测——不必为了
 //! 测「重命名怎么解析」去构造一个真仓库。
 
-use crate::model::{EntryKind, GitBranchInfo, GitStatus, GitStatusEntry};
+use crate::model::{EntryKind, GitBranchInfo, GitFileHunks, GitHunk, GitStatus, GitStatusEntry};
 
 /// 解析 `git status --porcelain=v2 --branch --untracked-files=all -z --relative`。
 ///
@@ -227,6 +227,294 @@ pub(crate) fn parse_branches(stdout: &str) -> Vec<GitBranchInfo> {
     remotes.sort_by(|a, b| a.name.cmp(&b.name));
     locals.extend(remotes);
     locals
+}
+
+// ---------------------------------------------------------------------------
+// unified diff → 可寻址的 hunk
+// ---------------------------------------------------------------------------
+
+/// 一个文件的 diff 片段：文件头行 + 若干 hunk。
+///
+/// `header_lines` 保留「`diff --git` 之后、第一个 `@@` 之前」的原始行（`index`、
+/// `new file mode`、`rename from` 等）。按块暂存时要靠它们让 `git apply` 知道这是
+/// 新增、改名还是纯内容改动——**不能**只回 `--- /+++` 两行。
+pub(crate) struct ParsedDiffFile {
+    /// 新侧路径（`b/` 侧）；删除文件时为旧侧路径。
+    pub path: String,
+    /// 旧侧路径（`a/` 侧）；新增文件时为 `None`。
+    pub old_path: Option<String>,
+    /// 旧侧是 `/dev/null`（新增文件）。
+    pub old_null: bool,
+    /// 新侧是 `/dev/null`（删除文件）。
+    pub new_null: bool,
+    /// 文件头行（原样）。
+    pub header_lines: Vec<String>,
+    /// 是否是二进制文件。
+    pub binary: bool,
+    /// 按出现顺序的 hunk，`index` 即下标。
+    pub hunks: Vec<GitHunk>,
+}
+
+impl ParsedDiffFile {
+    /// 翻成对外模型（不含二进制标记以外的元信息）。
+    pub(crate) fn to_model(&self) -> GitFileHunks {
+        GitFileHunks {
+            path: self.path.clone(),
+            binary: self.binary,
+            hunks: self.hunks.clone(),
+        }
+    }
+}
+
+/// 二进制文件的标记行。
+///
+/// 两种形态都要认：现代 git 输出 `Binary files a/x and b/x differ`；`--binary` 或
+/// 部分场景输出 `GIT binary patch` 后跟 base85 正文。无论哪种，都**没有** hunk。
+fn is_binary_marker(line: &str) -> bool {
+    line.starts_with("Binary files ") || line.starts_with("GIT binary patch")
+}
+
+/// 解析一段 unified diff（`git diff` 的原文）成按文件分组的 hunk。
+///
+/// 只认 git 自己输出的形态，因此可以放心依赖几条稳定事实：
+///
+/// - 文件之间以 `diff --git ` 开头；
+/// - hunk 以 `@@ -a,b +c,d @@[ 上下文]` 开头；
+/// - hunk 正文每行恰好一个前缀字符（` ` / `+` / `-`），
+///   外加一种特殊情况：`\ No newline at end of file`（`\` 开头）；
+/// - 二进制文件只给一句 `Binary files ... differ`，没有 hunk 正文。
+///
+/// 正文行用「前缀字符」判断而不是「按 hunk 头里的行数精确计数」：后者要在
+/// `\ No newline` 上做特例（这一行不计入任何一侧的行数），一旦算错就会把下一块
+/// hunk 的正文吞进上一块——前缀判断没有这个风险，且 git 的正文行永远带前缀。
+pub(crate) fn parse_diff(text: &str) -> Vec<ParsedDiffFile> {
+    let mut files: Vec<ParsedDiffFile> = Vec::new();
+    let mut current: Option<ParsedDiffFile> = None;
+    let mut in_body = false;
+
+    for raw in text.split('\n') {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            if let Some(file) = current.take() {
+                files.push(file);
+            }
+            current = Some(new_diff_file(rest));
+            in_body = false;
+            continue;
+        }
+
+        let Some(file) = current.as_mut() else {
+            // `diff --git` 之前的内容（例如 `warning:` 行）一律丢弃。
+            continue;
+        };
+
+        if is_binary_marker(line) {
+            file.binary = true;
+            in_body = false;
+            file.header_lines.push(line.to_string());
+            continue;
+        }
+
+        if line.starts_with("@@") {
+            in_body = false;
+            if let Some(hunk) = parse_hunk_header(line, &file.path, file.hunks.len() as u32) {
+                file.hunks.push(hunk);
+                in_body = true;
+            }
+            continue;
+        }
+
+        if in_body {
+            let is_body_line =
+                line.starts_with('\\') || matches!(line.chars().next(), Some(' ' | '+' | '-'));
+            if is_body_line {
+                if let Some(hunk) = file.hunks.last_mut() {
+                    hunk.lines.push(line.to_string());
+                }
+                continue;
+            }
+            // 正文结束（空行或新的文件头）——退回去当文件头处理。
+            in_body = false;
+        }
+
+        if let Some(rest) = line.strip_prefix("--- ") {
+            match side_path(rest) {
+                Some(path) => {
+                    file.old_null = false;
+                    file.old_path = Some(path);
+                }
+                None => {
+                    file.old_null = true;
+                    file.old_path = None;
+                }
+            }
+        } else if let Some(rest) = line.strip_prefix("+++ ") {
+            match side_path(rest) {
+                Some(path) => {
+                    file.new_null = false;
+                    file.path = path;
+                }
+                None => file.new_null = true,
+            }
+        }
+        file.header_lines.push(line.to_string());
+    }
+
+    if let Some(file) = current.take() {
+        files.push(file);
+    }
+    files
+}
+
+/// 从 `diff --git a/x b/y` 的剩余部分取两侧路径。
+fn new_diff_file(rest: &str) -> ParsedDiffFile {
+    let (old_path, path) = split_diff_header_paths(rest);
+    ParsedDiffFile {
+        path,
+        old_path,
+        old_null: false,
+        new_null: false,
+        header_lines: Vec::new(),
+        binary: false,
+        hunks: Vec::new(),
+    }
+}
+
+/// 切 `a/x b/y`。
+///
+/// 路径里可能含空格（`a/my notes.md b/my notes.md`），所以按**最后一个** ` b/`
+/// 切；切不出来时退回「按第一个空格切」。--- /+++ 行若出现会覆盖这里的结论。
+fn split_diff_header_paths(rest: &str) -> (Option<String>, String) {
+    let (a, b) = match rest.rfind(" b/") {
+        Some(pos) => (&rest[..pos], &rest[pos + 1..]),
+        None => match rest.split_once(' ') {
+            Some((a, b)) => (a, b),
+            None => return (None, unquote(rest)),
+        },
+    };
+    let old = a.strip_prefix("a/").unwrap_or(a);
+    let new = b.strip_prefix("b/").unwrap_or(b);
+    let old = unquote(old);
+    let new = unquote(new);
+    (if old.is_empty() { None } else { Some(old) }, new)
+}
+
+/// `--- a/x` / `+++ b/x` 的路径；`/dev/null` 返回 `None`（表示这一侧不存在）。
+fn side_path(rest: &str) -> Option<String> {
+    if rest.starts_with("/dev/null") {
+        return None;
+    }
+    let path = rest.strip_prefix("a/").or_else(|| rest.strip_prefix("b/"));
+    let path = unquote(path.unwrap_or(rest));
+    if path.is_empty() {
+        return None;
+    }
+    Some(path)
+}
+
+/// 去掉 git 给「含特殊字符的路径」加的双引号与转义。
+///
+/// 非 ASCII 路径默认**不加引号**（`core.quotePath` 只影响控制字符与反斜杠），
+/// 所以这里只需要处理最常见的 `\\` / `\"` / `\t` / `\n`。
+fn unquote(text: &str) -> String {
+    let text = text.trim();
+    let Some(inner) = text.strip_prefix('"').and_then(|t| t.strip_suffix('"')) else {
+        return text.to_string();
+    };
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// 解析 `@@ -old_start,old_lines +new_start,new_lines @@[ 上下文]`。
+fn parse_hunk_header(line: &str, path: &str, index: u32) -> Option<GitHunk> {
+    let rest = line.strip_prefix("@@ ")?;
+    let close = rest.find(" @@")?;
+    let ranges = &rest[..close];
+    // `@@` 之后原样保留（含 git 写入的前导空格），回喂补丁时逐字还原。
+    let header = rest[close + 3..].to_string();
+    let mut parts = ranges.split(' ');
+    let old = parts.next()?.strip_prefix('-')?;
+    let new = parts.next()?.strip_prefix('+')?;
+    let (old_start, old_lines) = parse_range(old)?;
+    let (new_start, new_lines) = parse_range(new)?;
+    Some(GitHunk {
+        path: path.to_string(),
+        index,
+        old_start,
+        old_lines,
+        new_start,
+        new_lines,
+        header,
+        lines: Vec::new(),
+    })
+}
+
+/// `5` → `(5, 1)`；`5,7` → `(5, 7)`。行数省略时 git 约定为 1。
+fn parse_range(text: &str) -> Option<(u32, u32)> {
+    match text.split_once(',') {
+        Some((start, lines)) => Some((start.parse().ok()?, lines.parse().ok()?)),
+        None => Some((text.parse().ok()?, 1)),
+    }
+}
+
+/// 把单块 hunk 拼成可以喂给 `git apply --cached` 的最小补丁。
+///
+/// 只带这块自己的 `@@` 头与正文，但保留文件头里**影响索引写入**的行（模式变化、
+/// 新增/删除标记、改名）。其余行（例如 `index` 之外的装饰）不带，避免让 `git apply`
+/// 去校验它不需要的前置条件。
+pub(crate) fn hunk_patch(file: &ParsedDiffFile, hunk: &GitHunk) -> String {
+    let old_name = file.old_path.clone().unwrap_or_else(|| file.path.clone());
+    let mut out = String::new();
+    out.push_str(&format!("diff --git a/{} b/{}\n", old_name, file.path));
+    for line in &file.header_lines {
+        let keep = line.starts_with("old mode ")
+            || line.starts_with("new mode ")
+            || line.starts_with("deleted file mode ")
+            || line.starts_with("new file mode ")
+            || line.starts_with("similarity index ")
+            || line.starts_with("rename from ")
+            || line.starts_with("rename to ");
+        if keep {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if file.old_null {
+        out.push_str("--- /dev/null\n");
+    } else {
+        out.push_str(&format!("--- a/{}\n", old_name));
+    }
+    if file.new_null {
+        out.push_str("+++ /dev/null\n");
+    } else {
+        out.push_str(&format!("+++ b/{}\n", file.path));
+    }
+    out.push_str(&format!(
+        "@@ -{},{} +{},{} @@{}\n",
+        hunk.old_start, hunk.old_lines, hunk.new_start, hunk.new_lines, hunk.header
+    ));
+    for line in &hunk.lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 #[cfg(test)]

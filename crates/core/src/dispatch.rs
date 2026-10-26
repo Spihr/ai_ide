@@ -164,6 +164,10 @@ async fn handle_request(peer: &Peer, state: &AppState, req: Request) {
         methods::git::STASH_POP => git_api::stash_pop(peer, state, &req).await,
         methods::git::STASH_APPLY => git_api::stash_apply(peer, state, &req).await,
         methods::git::STASH_DROP => git_api::stash_drop(peer, state, &req).await,
+        // 单 hunk 暂存（缺口第四批）：定位由路径 + 四个行号构成，定位失效直接报 7011，
+        // 二进制报 7012——两条都不是「重试」，所以单独走 handler，不复用 stage。
+        methods::git::STAGE_HUNK => git_api::stage_hunk(peer, state, &req).await,
+        methods::git::UNSTAGE_HUNK => git_api::unstage_hunk(peer, state, &req).await,
 
         // MCP（M7 切片二）：连接由 core state 的管理器统一持有，每次调用现查活连接，
         // 因此「断连后工具自动下架」不需要额外清理逻辑——查不到就是不存在。

@@ -40,22 +40,28 @@
 //! | 远端认证失败（`data.detail`） | 7008 |
 //! | 当前分支没有上游分支（`data.branch`） | 7009 |
 //! | stash pop/apply 冲突，stash 未被丢弃（`data.files` + `data.stash_kept`） | 7010 |
+//! | 单块暂存定位失效（文件被改、行号漂移；`data.expected` / `data.actual`） | 7011 |
+//! | 二进制文件不支持按 hunk 暂存（`data.path`） | 7012 |
 //!
 //! 7006~7010 是缺口第二批补的**专用**码。它们各自的用户下一步动作都不同（先提交 /
 //! 先 stash、先拉取、去登录、去设上游、去解冲突），所以不能退化成一个 7003——外壳
 //! 拿 7003 只能提示「git 命令失败了」，用户还得自己读 stderr。
+//!
+//! 7011 / 7012 是第四批（单 hunk 暂存）补的。`7011` 的动作是「刷新后重选」，
+//! `7012` 的动作是「这条路本来就不通，改走整文件暂存」——把两者并进 `7003`，
+//! 外壳就只能笼统地说「操作失败」，用户会反复点同一个按钮。
 
 use crate::dispatch::parse_params;
 use crate::peer::Peer;
 use crate::state::AppState;
-use ai_ide_git::{GitBranchInfo, GitError, GitRepo, GitStatus, GitStatusEntry};
+use ai_ide_git::{GitBranchInfo, GitError, GitRepo, GitStatus, GitStatusEntry, HunkSelector};
 use ai_ide_protocol::dto::{
     GitBranch, GitBranchesParams, GitBranchesResult, GitCheckoutParams, GitCheckoutResult,
     GitCommitParams, GitCommitResult, GitDiffParams, GitDiffResult, GitFetchParams, GitFetchResult,
-    GitPullParams, GitPullResult, GitPushParams, GitPushResult, GitStageParams, GitStageResult,
-    GitStashApplyParams, GitStashApplyResult, GitStashDropParams, GitStashDropResult,
-    GitStashListParams, GitStashListResult, GitStashParams, GitStashResult, GitStatusParams,
-    GitStatusResult,
+    GitPullParams, GitPullResult, GitPushParams, GitPushResult, GitStageHunkParams,
+    GitStageHunkResult, GitStageParams, GitStageResult, GitStashApplyParams, GitStashApplyResult,
+    GitStashDropParams, GitStashDropResult, GitStashListParams, GitStashListResult, GitStashParams,
+    GitStashResult, GitStatusParams, GitStatusResult, GitUnstageHunkParams, GitUnstageHunkResult,
 };
 use ai_ide_protocol::{ErrorCode, ErrorObject, Request};
 use std::sync::Arc;
@@ -111,6 +117,22 @@ fn error_of(err: &GitError) -> ErrorObject {
         GitError::StashConflict { files } => {
             ErrorObject::new(ErrorCode::GIT_STASH_CONFLICT, err.to_string())
                 .with_data(serde_json::json!({ "files": files, "stash_kept": true }))
+        }
+        // 7011：定位漂移。硬按序号暂存会把用户没选的改动塞进索引，所以这里必须是
+        // 硬失败。`expected` / `actual` 让外壳能画出「你要的 @@ -8,6 → 现在的 @@ -12,7」，
+        // 用户刷新重选即可，不必猜发生了什么。
+        GitError::HunkDrifted {
+            path,
+            index,
+            expected,
+            actual,
+        } => ErrorObject::new(ErrorCode::GIT_HUNK_DRIFTED, err.to_string()).with_data(
+            serde_json::json!({ "path": path, "index": index, "expected": expected, "actual": actual }),
+        ),
+        // 7012：二进制文件。与 7011 分开——这不是「刷新再试」，而是「压根没有 hunk」。
+        GitError::BinaryHunk { path } => {
+            ErrorObject::new(ErrorCode::GIT_BINARY_HUNK, err.to_string())
+                .with_data(serde_json::json!({ "path": path }))
         }
         GitError::Command { args, stderr, code } => {
             ErrorObject::new(ErrorCode::GIT_COMMAND_FAILED, err.to_string())
@@ -299,6 +321,96 @@ pub async fn stage(peer: &Peer, state: &AppState, req: &Request) {
             peer.respond(&req.id, &result).await
         }
         Err(err) => peer.respond_error(&req.id, &err).await,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// git.stage_hunk / git.unstage_hunk
+// ---------------------------------------------------------------------------
+
+fn hunk_of(hunk: ai_ide_git::GitHunk) -> ai_ide_protocol::dto::GitHunk {
+    ai_ide_protocol::dto::GitHunk {
+        path: hunk.path,
+        index: hunk.index,
+        old_start: hunk.old_start,
+        old_lines: hunk.old_lines,
+        new_start: hunk.new_start,
+        new_lines: hunk.new_lines,
+        header: hunk.header,
+        lines: hunk.lines,
+    }
+}
+
+/// 按块暂存：只把外壳选中的那一块写进索引。
+///
+/// `context_lines` 不对外暴露：hunk 的切分口径必须与外壳拿到 diff 时**完全一致**，
+/// 否则「用户在 `-U3` 的视图里点的第 2 块」与内核按另一个上下文行数解析出的第 2 块
+/// 就是不同的东西。固定用 `git diff` 的默认 3 行，两边对齐才有意义。
+pub async fn stage_hunk(peer: &Peer, state: &AppState, req: &Request) {
+    let params: GitStageHunkParams = match parse_params(req.params.as_ref()) {
+        Ok(params) => params,
+        Err(err) => return peer.respond_error(&req.id, &err).await,
+    };
+
+    let selector = HunkSelector {
+        path: params.path.clone(),
+        index: params.index,
+        old_start: params.old_start,
+        old_lines: params.old_lines,
+        new_start: params.new_start,
+        new_lines: params.new_lines,
+        header: None,
+    };
+
+    let outcome = run(state, params.workspace_id.as_deref(), move |repo| {
+        repo.stage_hunk(&selector, false, None).map(hunk_outcome_of)
+    })
+    .await;
+
+    match outcome {
+        Ok((_, result)) => peer.respond(&req.id, &result).await,
+        Err(err) => peer.respond_error(&req.id, &err).await,
+    }
+}
+
+/// 按块取消暂存：把该块从索引里反向撤掉，工作区保持不动。
+pub async fn unstage_hunk(peer: &Peer, state: &AppState, req: &Request) {
+    let params: GitUnstageHunkParams = match parse_params(req.params.as_ref()) {
+        Ok(params) => params,
+        Err(err) => return peer.respond_error(&req.id, &err).await,
+    };
+
+    let selector = HunkSelector {
+        path: params.path.clone(),
+        index: params.index,
+        old_start: params.old_start,
+        old_lines: params.old_lines,
+        new_start: params.new_start,
+        new_lines: params.new_lines,
+        header: None,
+    };
+
+    let outcome = run(state, params.workspace_id.as_deref(), move |repo| {
+        repo.stage_hunk(&selector, true, None).map(|outcome| {
+            let result = hunk_outcome_of(outcome);
+            GitUnstageHunkResult {
+                hunk: result.hunk,
+                staged_total: result.staged_total,
+            }
+        })
+    })
+    .await;
+
+    match outcome {
+        Ok((_, result)) => peer.respond(&req.id, &result).await,
+        Err(err) => peer.respond_error(&req.id, &err).await,
+    }
+}
+
+fn hunk_outcome_of(outcome: ai_ide_git::GitHunkOutcome) -> GitStageHunkResult {
+    GitStageHunkResult {
+        hunk: hunk_of(outcome.hunk),
+        staged_total: outcome.staged_total,
     }
 }
 

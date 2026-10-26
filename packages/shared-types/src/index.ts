@@ -293,6 +293,21 @@ export type { GitStashApplyParams } from "./generated/GitStashApplyParams";
 export type { GitStashApplyResult } from "./generated/GitStashApplyResult";
 export type { GitStashDropParams } from "./generated/GitStashDropParams";
 export type { GitStashDropResult } from "./generated/GitStashDropResult";
+
+// ---- git.* 单 hunk 暂存（缺口第四批：stage_hunk / unstage_hunk）----
+//
+// `GitHunk` 是内核解析 unified diff 后的结构（`\ No newline at end of file`
+// 这类标记保留在 `lines` 里，不做二次加工）；`GitFileHunks` 把一个文件的全部
+// 块连同 `binary` 一起端出来——二进制文件没有 hunk 可选，内核以 `7012` 拒绝。
+// 两个 `*Params` 的定位字段（`path` / `hunk_index` / `expected_header`）语义完全
+// 一致：`expected_header` 用于核对「用户看到的那块」与「当前磁盘上的那块」是否
+// 还是同一块，漂移即 `7011` 安全失败，绝不猜着暂存。
+export type { GitHunk } from "./generated/GitHunk";
+export type { GitFileHunks } from "./generated/GitFileHunks";
+export type { GitStageHunkParams } from "./generated/GitStageHunkParams";
+export type { GitStageHunkResult } from "./generated/GitStageHunkResult";
+export type { GitUnstageHunkParams } from "./generated/GitUnstageHunkParams";
+export type { GitUnstageHunkResult } from "./generated/GitUnstageHunkResult";
 export type { McpServerInfo } from "./generated/McpServerInfo";
 export type { McpServersParams } from "./generated/McpServersParams";
 export type { McpServersResult } from "./generated/McpServersResult";

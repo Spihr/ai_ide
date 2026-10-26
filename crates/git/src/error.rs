@@ -63,6 +63,33 @@ pub enum GitError {
         files: Vec<String>,
     },
 
+    /// 二进制文件没有可寻址的 hunk：`git diff` 只给出 `Binary files ... differ`。
+    ///
+    /// 为什么是拒绝而不是「当成整文件那块」：二进制没有「第几块」这回事，把整文件
+    /// 塞进索引会让调用方以为自己只挑了一片改动，实际整份文件进了暂存区——
+    /// 这正是「按块暂存」最不能出的错。
+    #[error("二进制文件不支持按 hunk 暂存：{path}")]
+    BinaryHunk {
+        /// 相对工作区根的路径。
+        path: String,
+    },
+
+    /// hunk 定位失效：文件已被改、行号漂移，或该序号在当前 diff 里已不存在。
+    ///
+    /// 带 `expected` / `actual` 两段可读描述：用户看到的不是「失败了」，而是
+    /// 「你要的那块在 A，现在在 B」——刷新后重选即可，不用猜。
+    #[error("hunk 定位失效：{path} 第 {index} 块（期望 {expected}）")]
+    HunkDrifted {
+        /// 相对工作区根的路径。
+        path: String,
+        /// 调用方给的序号。
+        index: u32,
+        /// 调用方期望的位置。
+        expected: String,
+        /// 当前同序号 hunk 的**实际**位置；该序号已不存在时为 `None`。
+        actual: Option<String>,
+    },
+
     /// git 命令非零退出。`args` 是去掉全局参数后的子命令与实参，`stderr` 是原文。
     #[error("git {args} 失败（退出码 {code:?}）：{stderr}")]
     Command {
@@ -186,6 +213,47 @@ pub(crate) fn summarize_stderr(stderr: &str) -> String {
         cut -= 1;
     }
     format!("{}…", &line[..cut])
+}
+
+/// `git apply --cached` 失败的判别式。
+///
+/// 与 [`classify_remote_failure`] 同一条理由：`apply` 的非零退出里绝大多数是
+/// **定位失效**（补丁与当前索引对不上），少数是补丁本身坏了或环境问题。前者用户
+/// 的动作是「刷新后重选那一块」，后者是「报 bug / 查环境」——不能混成一句 7003。
+///
+/// 判别只看 git 固定的英文短语（`LC_ALL=C` 保证稳定），命中即判定位失效；
+/// 未命中的一律退回 [`GitError::Command`]，不猜。
+pub(crate) fn classify_hunk_apply_failure(
+    path: &str,
+    index: u32,
+    expected: String,
+    actual: Option<String>,
+    args: &str,
+    stderr: &str,
+    code: Option<i32>,
+) -> GitError {
+    const DRIFT: [&str; 6] = [
+        "patch does not apply",
+        "does not match index",
+        "patch failed",
+        "while searching for",
+        "corrupt patch",
+        "unrecognized input",
+    ];
+    let lowered = stderr.to_ascii_lowercase();
+    if DRIFT.iter().any(|needle| lowered.contains(needle)) {
+        return GitError::HunkDrifted {
+            path: path.to_string(),
+            index,
+            expected,
+            actual,
+        };
+    }
+    GitError::Command {
+        args: args.to_string(),
+        stderr: stderr.trim().to_string(),
+        code,
+    }
 }
 
 #[cfg(test)]

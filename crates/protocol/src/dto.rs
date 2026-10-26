@@ -2480,6 +2480,131 @@ pub struct GitStageResult {
     pub staged_total: u64,
 }
 
+/// 一块可寻址的 hunk。
+///
+/// 定位靠**四个行号 + `index`**，不靠 hunk 序号单独说话：文件在用户点之前又被改过时，
+/// 「第 0 块」可能已经漂到别的位置，只按序号暂存会把没选的内容塞进索引。
+/// `header` 是 `@@` 之后那截上下文（git 写在 `@@` 后的函数名 / 类名），便于 UI 展示。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitHunk {
+    /// 文件路径（相对工作区根，正斜杠）。
+    pub path: String,
+    /// 该 hunk 在文件内的序号（0 起，按 diff 输出顺序）。
+    #[ts(type = "number")]
+    pub index: u32,
+    /// 旧侧起始行（1 起；纯新增的块为 0）。
+    #[ts(type = "number")]
+    pub old_start: u32,
+    /// 旧侧行数。
+    #[ts(type = "number")]
+    pub old_lines: u32,
+    /// 新侧起始行（1 起）。
+    #[ts(type = "number")]
+    pub new_start: u32,
+    /// 新侧行数。
+    #[ts(type = "number")]
+    pub new_lines: u32,
+    /// `@@` 之后的上下文（原样，含前导空格；无上下文时为空串）。
+    pub header: String,
+    /// 正文行，每行带 git 的前缀字符（` ` / `+` / `-`）。
+    ///
+    /// 末行可能是一条 `\ No newline at end of file`——它不是内容，而是「上一行没有
+    /// 换行符结尾」的标记，外壳展示时应单独渲染，不要当成文本内容。
+    pub lines: Vec<String>,
+}
+
+/// 单个文件的 hunk 清单。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitFileHunks {
+    /// 文件路径（相对工作区根，正斜杠）。
+    pub path: String,
+    /// 是否是二进制文件。二进制没有 hunk，`git.stage_hunk` 会以 7012 明确拒绝。
+    pub binary: bool,
+    /// hunk 清单；无改动时为空表。
+    pub hunks: Vec<GitHunk>,
+}
+
+/// `git.stage_hunk` 请求参数。
+///
+/// `old_start` / `old_lines` / `new_start` / `new_lines` 四项与 `index` 一起构成定位：
+/// 只要有一项与当前 diff 不符，就报 7011 让外壳刷新，**绝不**按序号猜着暂存。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitStageHunkParams {
+    /// 工作区 id；缺省作用于活动工作区。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub workspace_id: Option<String>,
+    /// 文件路径（相对工作区根）。
+    pub path: String,
+    /// hunk 序号（0 起）。
+    #[ts(type = "number")]
+    pub index: u32,
+    /// 旧侧起始行。
+    #[ts(type = "number")]
+    pub old_start: u32,
+    /// 旧侧行数。
+    #[ts(type = "number")]
+    pub old_lines: u32,
+    /// 新侧起始行。
+    #[ts(type = "number")]
+    pub new_start: u32,
+    /// 新侧行数。
+    #[ts(type = "number")]
+    pub new_lines: u32,
+}
+
+/// `git.stage_hunk` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitStageHunkResult {
+    /// 实际暂存的那块（回显解析出的完整结构，便于外壳直接标成已暂存）。
+    pub hunk: GitHunk,
+    /// 操作后仍在暂存区的条目数。
+    #[ts(type = "number")]
+    pub staged_total: u64,
+}
+
+/// `git.unstage_hunk` 请求参数。定位字段语义同 [`GitStageHunkParams`]。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitUnstageHunkParams {
+    /// 工作区 id；缺省作用于活动工作区。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub workspace_id: Option<String>,
+    /// 文件路径（相对工作区根）。
+    pub path: String,
+    /// hunk 序号（0 起）。
+    #[ts(type = "number")]
+    pub index: u32,
+    /// 旧侧起始行。
+    #[ts(type = "number")]
+    pub old_start: u32,
+    /// 旧侧行数。
+    #[ts(type = "number")]
+    pub old_lines: u32,
+    /// 新侧起始行。
+    #[ts(type = "number")]
+    pub new_start: u32,
+    /// 新侧行数。
+    #[ts(type = "number")]
+    pub new_lines: u32,
+}
+
+/// `git.unstage_hunk` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitUnstageHunkResult {
+    /// 实际取消暂存的那块。
+    pub hunk: GitHunk,
+    /// 操作后仍在暂存区的条目数。
+    #[ts(type = "number")]
+    pub staged_total: u64,
+}
+
 /// `git.commit` 请求参数。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]

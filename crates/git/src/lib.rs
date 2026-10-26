@@ -61,9 +61,9 @@ pub mod repo;
 pub use error::GitError;
 pub use model::{
     EntryKind, GitBranchInfo, GitBranches, GitCheckoutOutcome, GitCommitOutcome, GitDiff,
-    GitFetchOutcome, GitPullOutcome, GitPushOutcome, GitRefUpdate, GitStageOutcome,
-    GitStashApplyOutcome, GitStashDropOutcome, GitStashEntry, GitStashOutcome, GitStatus,
-    GitStatusEntry,
+    GitFetchOutcome, GitFileHunks, GitHunk, GitHunkOutcome, GitPullOutcome, GitPushOutcome,
+    GitRefUpdate, GitStageOutcome, GitStashApplyOutcome, GitStashDropOutcome, GitStashEntry,
+    GitStashOutcome, GitStatus, GitStatusEntry, HunkSelector,
 };
 pub use repo::{GitRepo, GitService};
 

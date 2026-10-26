@@ -163,10 +163,12 @@ fn capabilities_advertise_all_five_lsp_methods() {
     // 79 → 80：P5 切片八补 `plugin.load_many`（批量并发装载）；
     // 80 → 89：缺口第二批 Git 深化补九个（checkout / fetch / pull / push / stash 系列），
     // 九个都在 `crates/git/src/repo.rs` 有真实实现、在 `git_api.rs` 接了处理器。
+    // 89 → 91：缺口第四批补 `git.stage_hunk` / `git.unstage_hunk`（单块暂存），
+    // 同样是真实实现 + 真实 dispatch 分支，不是名字占位。
     assert_eq!(
         capabilities.len(),
-        89,
-        "能力总数应为 89（74 + lsp 五项 + plugin.load_many + Git 深化九项），实际 {}",
+        91,
+        "能力总数应为 91（74 + lsp 五项 + plugin.load_many + Git 深化九项 + 单 hunk 暂存两项），实际 {}",
         capabilities.len()
     );
 }
