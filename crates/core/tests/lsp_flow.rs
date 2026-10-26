@@ -7,7 +7,7 @@
 //!
 //! 这组测试要钉住四件事：
 //!
-//! 1. **能力表如实**：`core.hello` 报出 `lsp.*` 五项，总数 79（74 → 79）；
+//! 1. **能力表如实**：`core.hello` 报出 `lsp.*` 五项，总数 80（74 → 79 → 80）；
 //! 2. **`lsp.start` → `lsp.request` 能真查到东西**：跳转位置带着 1-based 坐标回来，
 //!    服务器给的坏条目（缺 `range`）被丢掉而不是编一个 `0:0`；
 //! 3. **诊断是推送**：`publishDiagnostics` 不是任何请求的返回值，必须变成
@@ -159,11 +159,12 @@ fn capabilities_advertise_all_five_lsp_methods() {
         ],
         "能力清单里的 lsp.* 五项对不上：{lsp_methods:?}"
     );
-    // 74 → 79：五个方法从「声明」挪进「已实现」，`core.hello` 只能在后者里报。
+    // 74 → 79：五个方法从「声明」挪进「已实现」，`core.hello` 只能在后者里报；
+    // 79 → 80：P5 切片八补 `plugin.load_many`（批量并发装载）。
     assert_eq!(
         capabilities.len(),
-        79,
-        "能力总数应为 79（74 + lsp 五项），实际 {}",
+        80,
+        "能力总数应为 80（74 + lsp 五项 + P5 切片八 plugin.load_many），实际 {}",
         capabilities.len()
     );
 }

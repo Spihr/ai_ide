@@ -194,7 +194,8 @@ describe('checkRendererCall', () => {
     const allowed = new Set(allowedRendererMethods())
     const pluginMethods = IMPLEMENTED_METHODS.filter((method) => method.startsWith('plugin.'))
 
-    expect(pluginMethods.length).toBe(11)
+    // 11 → 12：P5 切片八补 `plugin.load_many`（`plugin.load` 的批量形式）。
+    expect(pluginMethods.length).toBe(12)
     for (const method of pluginMethods) {
       expect(allowed.has(method), `${method} 已在内核实现，应被放行`).toBe(true)
     }
@@ -333,6 +334,7 @@ describe('checkRendererCall', () => {
       'plugin.install',
       'plugin.list',
       'plugin.load',
+      'plugin.load_many',
       'plugin.reload',
       'plugin.revoke',
       'plugin.status',

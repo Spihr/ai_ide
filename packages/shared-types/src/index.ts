@@ -297,6 +297,10 @@ export type { PluginUninstallParams } from "./generated/PluginUninstallParams";
 export type { PluginUninstallResult } from "./generated/PluginUninstallResult";
 export type { PluginLoadParams } from "./generated/PluginLoadParams";
 export type { PluginLoadResult } from "./generated/PluginLoadResult";
+export type { PluginLoadManyParams } from "./generated/PluginLoadManyParams";
+export type { PluginLoadManyResult } from "./generated/PluginLoadManyResult";
+export type { PluginLoadManyItem } from "./generated/PluginLoadManyItem";
+export type { PluginLoadFailure } from "./generated/PluginLoadFailure";
 export type { PluginUnloadParams } from "./generated/PluginUnloadParams";
 export type { PluginUnloadResult } from "./generated/PluginUnloadResult";
 export type { PluginReloadParams } from "./generated/PluginReloadParams";
@@ -484,6 +488,10 @@ export const Methods = {
     install: "plugin.install",
     uninstall: "plugin.uninstall",
     load: "plugin.load",
+    // P5 切片八：批量并发装载。Rust 源 `ai_ide_protocol::methods::plugin::LOAD_MANY`
+    // （crates/protocol/src/methods.rs）。语义是「一批插件的 load」，仍是本机账本内
+    // 已安装插件的装载动作，因此与 `plugin.load` 同一条放行策略。
+    loadMany: "plugin.load_many",
     unload: "plugin.unload",
     reload: "plugin.reload",
     call: "plugin.call",
@@ -536,7 +544,7 @@ export const Methods = {
  * 再加 M3 切片一的 `search.symbols`（符号检索内核面：七种语言的声明抽取，
  * 外壳入口留待下一片），以及 M3 切片三的 `inline_edit.propose`（选区改写内核面：
  * 一次补全 + 结构化 diff，内核不写盘），再加语言服务的 `lsp.*` 五项（启动 /
- * 关闭 / 清单 / 查询 / 同步，内核 `lsp_api.rs` 已接线），共 79 项，
+ * 关闭 / 清单 / 查询 / 同步，内核 `lsp_api.rs` 已接线），共 80 项，
  * 与 Rust `methods::IMPLEMENTED` 逐项对齐。
  */
 export const IMPLEMENTED_METHODS = [
@@ -619,6 +627,8 @@ export const IMPLEMENTED_METHODS = [
   Methods.lsp.servers,
   Methods.lsp.request,
   Methods.lsp.sync,
+  // P5 切片八：`plugin.load` 的批量形式（一次请求装载多个插件，结果按插件逐项回报）。
+  Methods.plugin.loadMany,
 ] as const;
 
 /**
@@ -632,6 +642,6 @@ export const IMPLEMENTED_METHODS = [
  *
  * `lsp.*` 五项曾在这里待过一片：协议面（DTO / 常量 / 错误码）先定，`crates/lsp`
  * 客户端与注册表随后落地，最后 `crates/core` 的 dispatch 接线。接线完成后整组挪进
- * `IMPLEMENTED_METHODS`（74 → 79），本表随之清空——这才是它该有的常态。
+ * `IMPLEMENTED_METHODS`（74 → 80），本表随之清空——这才是它该有的常态。
  */
 export const DECLARED_NOT_IMPLEMENTED_METHODS: readonly string[] = [];

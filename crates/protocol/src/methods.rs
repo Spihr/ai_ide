@@ -201,7 +201,7 @@ pub mod mcp {
 
 /// 插件宿主（P0 协议骨架）。
 ///
-/// 只有这 11 个方法属于**内核协议**：它们进 [`IMPLEMENTED`]、进 `core.hello`
+/// 只有这 12 个方法属于**内核协议**：它们进 [`IMPLEMENTED`]、进 `core.hello`
 /// 的能力清单、进外壳 `policy.ts` 白名单、由 ts-rs 导出类型。目录里的
 /// `plugin/*`（宿主 → 插件）与 `host/*`（插件 → 宿主）是插件包内部协议，
 /// **不进**这张表——混进来会让能力清单不再是「静态可审计」的（见 docs/14 §6.1）。
@@ -220,6 +220,13 @@ pub mod plugin {
     pub const UNINSTALL: &str = "plugin.uninstall";
     /// 授权齐备则起子进程并握手。
     pub const LOAD: &str = "plugin.load";
+    /// 批量并发装载（P5 切片八）：一次请求装多个插件，单个失败不影响其他。
+    ///
+    /// 与 [`LOAD`] 分开而不是让外壳循环调 `load`：并发上限、部分失败的结果归集、
+    /// 「同 id 只装一次」这三件事需要一个**可观测**的执行器来保证，散在渲染端
+    /// 循环里既测不到也说不清。单插件语义与 [`LOAD`] 完全一致（共用同一段装载
+    /// 实现），差别只在调度。
+    pub const LOAD_MANY: &str = "plugin.load_many";
     /// 停进程并把工具从 agent 注册表下架。
     pub const UNLOAD: &str = "plugin.unload";
     /// 停 + 起，用于开发调试。
@@ -403,6 +410,8 @@ pub const IMPLEMENTED: &[&str] = &[
     plugin::INSTALL,
     plugin::UNINSTALL,
     plugin::LOAD,
+    // P5 切片八：批量并发装载（调度器在 `crates/core/src/plugin_api.rs`，能力数 79 → 80）。
+    plugin::LOAD_MANY,
     plugin::UNLOAD,
     plugin::RELOAD,
     plugin::CALL,
@@ -436,7 +445,7 @@ mod tests {
 
     #[test]
     fn implemented_list_covers_core_m1_m2_agent_domains() {
-        assert_eq!(IMPLEMENTED.len(), 79);
+        assert_eq!(IMPLEMENTED.len(), 80);
         assert!(IMPLEMENTED.contains(&"core.ping"));
         assert!(IMPLEMENTED.contains(&"$/cancelRequest"));
         assert!(IMPLEMENTED.contains(&"workspace.read_file"));
@@ -515,12 +524,14 @@ mod tests {
         // P0 插件协议骨架：10 个方法进清单（dispatch 分支统一回 6101），
         // 而 `plugin/*` / `host/*` 这类插件包内部方法一律不进。
         // P5 切片二补第 11 个：`plugin.command`（命令网关，真实实现）。
+        // P5 切片八补第 12 个：`plugin.load_many`（批量并发装载）。
         for name in [
             plugin::LIST,
             plugin::STATUS,
             plugin::INSTALL,
             plugin::UNINSTALL,
             plugin::LOAD,
+            plugin::LOAD_MANY,
             plugin::UNLOAD,
             plugin::RELOAD,
             plugin::CALL,
@@ -533,6 +544,7 @@ mod tests {
         assert_eq!(plugin::LIST, "plugin.list");
         assert_eq!(plugin::CALL, "plugin.call");
         assert_eq!(plugin::COMMAND, "plugin.command");
+        assert_eq!(plugin::LOAD_MANY, "plugin.load_many");
         assert!(!IMPLEMENTED.iter().any(|name| name.starts_with("host/")));
         assert!(!IMPLEMENTED.iter().any(|name| name.starts_with("plugin/")));
     }
@@ -589,12 +601,12 @@ mod tests {
         all.sort_unstable();
         all.dedup();
         assert_eq!(all.len(), total, "两张表不得有重叠");
-        // LSP 五个接线后：已接线 79、待接线 0。
-        assert_eq!(IMPLEMENTED.len(), 79, "LSP 切片二后应为 79 个已接线方法");
+        // LSP 五个接线后已接线 79；P5 切片八补 `plugin.load_many` 后为 80、待接线 0。
+        assert_eq!(IMPLEMENTED.len(), 80, "P5 切片八后应为 80 个已接线方法");
         assert_eq!(DECLARED_NOT_IMPLEMENTED.len(), 0);
         assert_eq!(
-            total, 79,
-            "应恰好覆盖协议里定义的全部 79 个请求方法（含 LSP 五个）"
+            total, 80,
+            "应恰好覆盖协议里定义的全部 80 个请求方法（含 LSP 五个与 plugin.load_many）"
         );
     }
 

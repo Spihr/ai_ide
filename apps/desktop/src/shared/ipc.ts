@@ -129,9 +129,17 @@ export interface PingBenchmarkResult {
   samplesMs: number[]
 }
 
-/** 内核 stderr 日志片段。 */
+/**
+ * 内核日志片段。
+ *
+ * `stream` 区分来源：
+ * - `stderr`：内核子进程的 stderr 原始字节（进程还活着时唯一能拿到的东西）；
+ * - `event`：内核主动推的 `core.log` 通知（`{level,target,message}`），由主进程
+ *   格式化成一行后与 stderr 走同一条通道——渲染端不必区分两套接口，磁盘上也
+ *   不必维护两种格式。
+ */
 export interface CoreLogChunk {
-  stream: 'stderr'
+  stream: 'stderr' | 'event'
   text: string
 }
 

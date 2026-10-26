@@ -98,6 +98,7 @@ describe('协议常量', () => {
       pluginInstall: Methods.plugin.install,
       pluginUninstall: Methods.plugin.uninstall,
       pluginLoad: Methods.plugin.load,
+      pluginLoadMany: Methods.plugin.loadMany,
       pluginUnload: Methods.plugin.unload,
       pluginReload: Methods.plugin.reload,
       pluginCall: Methods.plugin.call,
@@ -193,6 +194,7 @@ describe('协议常量', () => {
       pluginInstall: 'plugin.install',
       pluginUninstall: 'plugin.uninstall',
       pluginLoad: 'plugin.load',
+      pluginLoadMany: 'plugin.load_many',
       pluginUnload: 'plugin.unload',
       pluginReload: 'plugin.reload',
       pluginCall: 'plugin.call',
@@ -308,7 +310,8 @@ describe('协议常量', () => {
       'lsp.stop',
       'lsp.servers',
       'lsp.request',
-      'lsp.sync'
+      'lsp.sync',
+      'plugin.load_many'
     ])
   })
 
@@ -316,8 +319,8 @@ describe('协议常量', () => {
     // `lsp.*` 曾在声明表里待过一片（协议先行、dispatch 后接），接线后整组挪进
     // IMPLEMENTED：声明表恢复为空才是常态。若这里非空，说明有人加了协议方法却忘了接线。
     expect([...DECLARED_NOT_IMPLEMENTED_METHODS]).toEqual([])
-    // 能力数 74 → 79：lsp 五项进清单。
-    expect(IMPLEMENTED_METHODS).toHaveLength(79)
+    // 能力数 74 → 79：lsp 五项进清单；79 → 80：P5 切片八补 plugin.load_many。
+    expect(IMPLEMENTED_METHODS).toHaveLength(80)
     for (const method of DECLARED_NOT_IMPLEMENTED_METHODS) {
       // 虚报能力会让外壳照单调进一片 -32601，互斥关系必须钉死。
       expect(IMPLEMENTED_METHODS as readonly string[]).not.toContain(method)

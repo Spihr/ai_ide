@@ -216,6 +216,9 @@ const RENDERER_ALLOWED = new Set<string>([
   Methods.plugin.status,
   Methods.plugin.uninstall,
   Methods.plugin.load,
+  // P5 切片八：`plugin.load_many` 是 `plugin.load` 的批量形式，作用域与副作用完全
+  // 一致（只对**本机账本里已安装**的插件起进程），因此与 `plugin.load` 同一条放行。
+  Methods.plugin.loadMany,
   Methods.plugin.unload,
   Methods.plugin.reload,
   //

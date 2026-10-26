@@ -2961,6 +2961,69 @@ pub struct PluginLoadResult {
     pub tools: Vec<PluginToolSummary>,
 }
 
+/// `plugin.load_many` 参数（P5 切片八：批量并发装载）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginLoadManyParams {
+    /// 要装载的插件 id 列表。
+    ///
+    /// 顺序即结果顺序；重复 id 只装一次（去重保留首次出现的位置）。空数组是
+    /// 合法输入，返回空 `items`——批量接口不该为空集合报错。
+    pub plugin_ids: Vec<String>,
+    /// 同时在装载的插件数上限；`None` 取 [`Self::DEFAULT_MAX_CONCURRENT`]。
+    ///
+    /// 传 `0` 也按默认值处理（不拒绝也不串行化），超过
+    /// [`Self::MAX_CONCURRENT_LIMIT`] 时按上限截断——上限存在的意义是别让
+    /// 外壳一次拉起几十个子进程把机器压死，而不是拿参数错误去折腾调用方。
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub max_concurrent: Option<u32>,
+}
+
+impl PluginLoadManyParams {
+    /// 缺省并发度：同时最多装载 4 个插件。
+    pub const DEFAULT_MAX_CONCURRENT: u32 = 4;
+    /// 并发度硬上限：再多也没意义（每个插件都要起一个子进程并等握手）。
+    pub const MAX_CONCURRENT_LIMIT: u32 = 16;
+    /// 单次批量装载的插件数上限，防止一次请求把队列塞爆。
+    pub const MAX_PLUGINS: usize = 32;
+}
+
+/// 批量装载中单个插件的结局。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginLoadManyItem {
+    /// 插件 id（与入参一致）。
+    pub plugin_id: String,
+    /// 装载成功时的结果；失败为 `None`。
+    pub result: Option<PluginLoadResult>,
+    /// 装载失败时的原因；成功为 `None`。
+    ///
+    /// 失败**不**让整个批量请求变成 JSON-RPC 错误：一次装 5 个挂掉 1 个，
+    /// 调用方要的是另外 4 个的结果 + 这 1 个的原因，而不是一片空白。
+    pub error: Option<PluginLoadFailure>,
+}
+
+/// 单个插件装载失败的原因（与 JSON-RPC 错误体同源，便于外壳统一呈现）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginLoadFailure {
+    /// 错误码（`ErrorCode` 的数值，如 6101 插件不存在）。
+    pub code: i32,
+    /// 错误说明。
+    pub message: String,
+}
+
+/// `plugin.load_many` 响应结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginLoadManyResult {
+    /// 每个插件的结局，顺序与入参一致（重复 id 只保留首次出现的一条）。
+    pub items: Vec<PluginLoadManyItem>,
+    /// 本次实际采用的并发度（已按 [`PluginLoadManyParams`] 的规则归一）。
+    pub max_concurrent: u32,
+}
+
 /// `plugin.unload` 参数。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export)]
