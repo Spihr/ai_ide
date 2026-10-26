@@ -75,14 +75,14 @@
 - 日志：`<data_dir>/logs/core-YYYY-MM-DD.jsonl`（一行一条 JSON，按天滚动 + 单文件 32 MiB 上限），出口复用 `ai_ide_store::redact` 的同一套脱敏规则；插件日志另起一族 `<data_dir>/logs/plugin-YYYY-MM-DD.jsonl`（`host/log` 的磁盘副本，同滚动 / 同脱敏，前缀 `plugin`）；外壳侧还有 `<userData>/logs/core-shell-YYYY-MM-DD.log`（内核 stderr 与 `core.log` 事件的原始文本，8 MiB 滚动）；`AI_IDE_LOG_JSONL` / `AI_IDE_LOG_REDACT` / `AI_IDE_LOG_DIR` / `AI_IDE_LOG_PROBE` / `AI_IDE_CORE_LOG_PUSH` 五个开关（最后一个只关 `core.log` 事件推送，不影响 stderr 与 JSONL 落盘）
 - `provider.*` / `model.*`：`upsert` / `list` / `delete`（provider 另有 `test`）；目录落盘 `AI_IDE_DATA_DIR/providers.json`，密钥经 `ai-ide-llm` 的 `secret` 模块加密后存储
 - `llm.*`：`chat_stream`（流式，支持 `context.refs` 注入为前置 `system` 消息）、`cancel`、`list_models`、`count_tokens`（按模型族分流 tiktoken 精确计数 / 估算回落，`messages[]` 与 `texts[]` 相加）；上游协议为 OpenAI Chat Completions 兼容
-- 事件：`workspace.changed`、`provider.changed`、`llm.started` / `delta` / `reasoning` / `tool_call` / `usage` / `finished` / `error`、`terminal.data` / `terminal.exit`、`lsp.diagnostics`、`plugin.*` 四类审计与进度事件
+- 事件：`workspace.changed`、`workspace.indexed`（后台索引建完推送 `stats` + `duration_ms` + `incremental`；`workspace.open` 首次打开不再阻塞建索引，直接回 `indexing: true` 的「索引中」快照，`search.files` / `search.symbols` 同名字段用于区分「空结果」与「还没扫完」）、`provider.changed`、`llm.started` / `delta` / `reasoning` / `tool_call` / `usage` / `finished` / `error`、`terminal.data` / `terminal.exit`、`lsp.diagnostics`、`plugin.*` 四类审计与进度事件
 - 外壳能力：主进程策略闸门、内核进程监管与优雅退出、preload 能力收窄、渲染端工作区/文件树/多标签/搜索状态机与 Monaco 集成；M5 会话面板、检查点面板（列表 / 手动快照 / 回滚确认 / 删除）与权限面板（列表 / 撤销）及落盘桥（导出落点只经系统保存对话框、白名单按方法逐个放行）
 
 ### 尚未实现（截至 2026-10-26）
 
-- 协议面：`workspace.indexed` 仍是主动推送缺口（`IMPLEMENTED` 现为 **80** 项——P5 切片八补 `plugin.load_many` 后从 79 涨到 80，`DECLARED_NOT_IMPLEMENTED` 为空表；`terminal.*` / `git.*` / `mcp.*` / `plugin.*` / `lsp.*` / `search.symbols` / `inline_edit.propose` 均已进常量表并由 `crates/core` 接线，本文旧版把这几组写作「未进协议常量表」属倒挂，已订正）；`core.log` 已闭合成**双向**通道：内核 `CoreLogLayer` 主动推送 → 主进程映射 → 落盘 `core-shell-*.log` → 渲染端订阅 → 状态栏最近一行
+- 协议面：`IMPLEMENTED` 现为 **80** 项（P5 切片八补 `plugin.load_many` 后从 79 涨到 80，`DECLARED_NOT_IMPLEMENTED` 为空表；`terminal.*` / `git.*` / `mcp.*` / `plugin.*` / `lsp.*` / `search.symbols` / `inline_edit.propose` 均已进常量表并由 `crates/core` 接线，本文旧版把这几组写作「未进协议常量表」属倒挂，已订正）；`core.log` 已闭合成**双向**通道：内核 `CoreLogLayer` 主动推送 → 主进程映射 → 落盘 `core-shell-*.log` → 渲染端订阅 → 状态栏最近一行；`workspace.indexed` 已闭环（后台索引完成 emit，外壳订阅写回统计与就绪态，本批不新增方法，故能力表仍为 80）
 - 模块：`parser`（tree-sitter 符号表尚未引入，`search.symbols` 走的是自研文本抽取）
-- 界面：Tab 补全、列表与审计分页加载、消息级分叉入口未开工；已接入渲染端的有 M2 Provider 配置 / 对话面板、M3 `@` 补全与引用 chip、M4 Agent 运行面板与审批卡片、M5 会话 / 检查点 / 权限面板、M6 终端与 Git 面板、M7 MCP 面板、符号浮层（`Ctrl+T`）、Inline Edit 浮层（`Ctrl+K`）与 LSP 状态 / 重启命令
+- 界面：列表与审计分页加载、消息级分叉入口未开工；已接入渲染端的有 M2 Provider 配置 / 对话面板、M3 `@` 补全与引用 chip、M4 Agent 运行面板与审批卡片、M5 会话 / 检查点 / 权限面板、M6 终端与 Git 面板、M7 MCP 面板、符号浮层（`Ctrl+T`）、Inline Edit 浮层（`Ctrl+K`）、Tab 补全（`tab-completion.ts` + `CodeEditor.tsx`，索引符号与 LSP 两路候选，无候选不拦缩进）与 LSP 状态 / 重启命令
 - LSP 侧：语言服务器需本机自备（按 `crates/lsp/src/registry.rs` 探测并探测失败即降级为「不可用」，未内置下载 / 安装）；格式化、重命名、代码动作等未接 Monaco provider；多根工作区只起工作区根那一份连接
 
 ### 质量门禁实测（2026-10-22，M5 收尾 + P1 文档与 CI 收口）
@@ -114,7 +114,18 @@
 
 本轮改动要点：内核新增 `crates/core/src/core_log.rs`（`CoreLogLayer` + 无界通道 + `pump`），在 `init_tracing` 挂 layer、在 `run()` 里拿到 `Peer` 后装落点并起泵，把 tracing 事件抬成 `core.log` 通知；防递归三层（线程本地重入闸门 `Pushing` / 本模块 `PUSH_TARGET` 前缀丢弃 / `crate::peer` 自身日志不上报），脱敏复用 `ai_ide_store::redact_text`、超长按 4 KiB 截断，`AI_IDE_CORE_LOG_PUSH=off` 可只留文件出口。渲染端新增「全部启用（N）」按钮（候选 = 已停用 + 已崩溃，按下前就显示会起几个进程），进度取内核广播的 `plugin.state_changed`，结果条逐行给失败插件、错误码与人话原因，支持单项重试，失败不牵连成功项。
 
-**未做**：`workspace.indexed` 主动推送仍是缺口；批量装载的并发上限沿用内核默认（4）/ 硬上限（16）/ 单批 32 个，渲染端暂不提供滑杆。
+**未做**：`workspace.indexed` 主动推送当时仍是缺口（已在本文件下一节的「缺口第一批」补上）；批量装载的并发上限沿用内核默认（4）/ 硬上限（16）/ 单批 32 个，渲染端暂不提供滑杆。
+
+### 质量门禁实测（2026-10-26，缺口第一批：索引异步化 + workspace.indexed + Tab 补全）
+
+- `cargo fmt --all -- --check`：退出码 0（首跑 `state.rs` / `workspace_flow.rs` 3 处 diff，`cargo fmt --all` 后复跑无 diff）。
+- `cargo clippy --workspace --all-targets -- -D warnings`：退出码 0（构建期仍是 ts-rs 的 `failed to parse serde attribute` 噪声，非本项目代码）。
+- `cargo test --workspace`：**50 个测试目标（38 个测试二进制 + 12 组 Doc-tests），1320 passed / 0 failed / 9 ignored**。其中 `crates/core/tests/workspace_flow.rs` 4 项，含本轮新增 `后台索引_打开不阻塞_完成推送workspace_indexed`（真实 stdio 报文：`workspace.open` 先回 `indexing: true` 的空统计，随后收到 `workspace.indexed` 通知，断言 `stats` 五项均为整数、`duration_ms` 为毫秒整数、`incremental` 为 `false`）。
+- `pnpm typecheck`（`tsc --noEmit`）：退出码 0。
+- `pnpm test`（vitest）：**30 文件 546 项全过**，其中本轮新增 `tab-completion.test.ts` 17 项（候选合并去重 / LSP 优先 / 同文件符号靠前 / 上限与截断 / 前缀下限 / `decideTabAction` 三分支 / 1-based↔0-based 区间换算 / 双路失败降级），`store.test.ts` 24 项（新增 5 项：`workspace.indexed` 写回统计与耗时、别的工区不串台、打开即标索引中、索引完成后检索标记归位并恢复正常结果），`symbol-picker-store.test.ts` 8 项。
+- `pnpm lint`（`eslint .`）：退出码 0，零告警输出。
+
+本轮改动要点：`crates/core/src/ws.rs` 把建索引从请求路径挪到 `spawn_index_build`（`tokio::spawn` + `spawn_blocking(FileIndex::build)`，完成后 emit `WorkspaceIndexedEvent { stats, duration_ms, incremental }`），`workspace.open` 与 `search.files` / `search.symbols` 在索引未就绪时回 `indexing: true` 的降级结果；`crates/core/src/state.rs` 的 `IndexRegistry` 增单飞登记（同工区不并发建两次、构建结束摘登记）；协议 `dto.rs` 三处加字段（`WorkspaceIndexedEvent.duration_ms` / `incremental`、`SearchFilesResult.indexing`、`SearchSymbolsResult.indexing`），ts-rs 生成物同步；外壳 `store.ts` 订阅 `workspace.indexed` 并维护 `workspace.indexing` / `search.indexing`，`StatusBar.tsx` 与 `SearchPanel.tsx` 显示索引中；Tab 补全由 `tab-completion.ts`（纯逻辑）+ `CodeEditor.tsx`（`addAction` 绑 Tab、`pass` 时 `trigger('tab')` 交回 Monaco）两层组成。本批**不新增协议方法**，`IMPLEMENTED` 仍为 80，故 `methods-contract.test.ts` / `policy.ts` 白名单无需改动。
 
 ## 建议阅读顺序
 
