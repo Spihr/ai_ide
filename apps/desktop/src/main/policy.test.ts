@@ -25,7 +25,8 @@ describe('checkRendererCall', () => {
       'workspace.write_file',
       'workspace.delete',
       'search.files',
-      'search.content'
+      'search.content',
+      'search.symbols'
     ]
 
     for (const method of methods) {
@@ -193,10 +194,42 @@ describe('checkRendererCall', () => {
     const allowed = new Set(allowedRendererMethods())
     const pluginMethods = IMPLEMENTED_METHODS.filter((method) => method.startsWith('plugin.'))
 
-    expect(pluginMethods.length).toBe(11)
+    // 11 → 12：P5 切片八补 `plugin.load_many`（`plugin.load` 的批量形式）。
+    expect(pluginMethods.length).toBe(12)
     for (const method of pluginMethods) {
       expect(allowed.has(method), `${method} 已在内核实现，应被放行`).toBe(true)
     }
+  })
+
+  /*
+   * 语言服务五条放行：内核侧五个 handler 已接线（能力表 74 → 79），外壳才跟着放。
+   * 放行边界写在 `policy.ts` 的注释里：`start` 拿不到「任意 shell 命令」，
+   * `request` 的 `method` 是枚举，`sync` / `stop` 不写盘。
+   */
+  it('放行语言服务五条协议方法', () => {
+    const methods = [
+      Methods.lsp.start,
+      Methods.lsp.stop,
+      Methods.lsp.servers,
+      Methods.lsp.request,
+      Methods.lsp.sync
+    ]
+
+    for (const method of methods) {
+      const decision = checkRendererCall(method)
+      expect(decision.allowed, `${method} 应被放行`).toBe(true)
+      expect(decision.reason, `${method} 放行时不应带拒绝原因`).toBeUndefined()
+    }
+  })
+
+  /*
+   * 反过来钉住「放行的都是内核已实现的方法」：五个 `lsp.*` 都在 `IMPLEMENTED` 里，
+   * 谁把某个方法退回 `DECLARED` 却忘了收紧白名单，这条会先炸。
+   */
+  it('语言服务方法已全部实现', () => {
+    const lspMethods = IMPLEMENTED_METHODS.filter((method) => method.startsWith('lsp.'))
+
+    expect(lspMethods.length).toBe(5)
   })
 
   /*
@@ -271,10 +304,20 @@ describe('checkRendererCall', () => {
       'git.diff',
       'git.stage',
       'git.status',
+      // 切片三：内联编辑只放行 `propose`——写盘仍是 `workspace.write_file`，
+      // 内核不越权改文件，外壳也就没必要给它开一个新口子。
+      'inline_edit.propose',
       'llm.cancel',
       'llm.chat_stream',
       'llm.count_tokens',
       'llm.list_models',
+      // 语言服务：五条都对应「编辑器状态变化」这类显式动作——开文件起服务、
+      // 切/存文件同步正文、关掉才 stop、按下跳转才 request。
+      'lsp.request',
+      'lsp.servers',
+      'lsp.start',
+      'lsp.stop',
+      'lsp.sync',
       'mcp.call',
       'mcp.connect',
       'mcp.disconnect',
@@ -291,6 +334,7 @@ describe('checkRendererCall', () => {
       'plugin.install',
       'plugin.list',
       'plugin.load',
+      'plugin.load_many',
       'plugin.reload',
       'plugin.revoke',
       'plugin.status',
@@ -302,6 +346,7 @@ describe('checkRendererCall', () => {
       'provider.upsert',
       'search.content',
       'search.files',
+      'search.symbols',
       'session.append_message',
       'session.create',
       'session.delete',

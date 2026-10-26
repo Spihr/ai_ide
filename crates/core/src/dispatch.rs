@@ -9,7 +9,9 @@ use crate::agent_api;
 use crate::audit_api;
 use crate::checkpoint_api;
 use crate::git_api;
+use crate::inline_edit_api;
 use crate::llm_api;
+use crate::lsp_api;
 use crate::mcp_api;
 use crate::peer::Peer;
 use crate::permission_api;
@@ -88,6 +90,7 @@ async fn handle_request(peer: &Peer, state: &AppState, req: Request) {
         // 检索（M1）
         methods::search::FILES => ws::search_files(peer, state, &req).await,
         methods::search::CONTENT => ws::search_content(peer, state, &req).await,
+        methods::search::SYMBOLS => ws::search_symbols(peer, state, &req).await,
 
         // Provider 与模型目录（M2）
         methods::provider::UPSERT => provider_api::provider_upsert(peer, state, &req).await,
@@ -103,6 +106,10 @@ async fn handle_request(peer: &Peer, state: &AppState, req: Request) {
         methods::llm::CANCEL => llm_api::cancel(peer, state, &req).await,
         methods::llm::LIST_MODELS => llm_api::list_models(peer, state, &req).await,
         methods::llm::COUNT_TOKENS => llm_api::count_tokens(peer, state, &req).await,
+
+        // Inline Edit（M3 切片三）：一次调用返回替换文本 + unified diff，不写盘、
+        // 不占 `stream_id`、不进会话消息——它是「编辑器里的一个动作」而非「一轮对话」。
+        methods::inline_edit::PROPOSE => inline_edit_api::propose(peer, state, &req).await,
 
         // Agent 运行时（M4）
         methods::agent::START => agent_api::start(peer, state, &req).await,
@@ -162,12 +169,23 @@ async fn handle_request(peer: &Peer, state: &AppState, req: Request) {
         methods::plugin::INSTALL => plugin_api::install(peer, state, &req).await,
         methods::plugin::UNINSTALL => plugin_api::uninstall(peer, state, &req).await,
         methods::plugin::LOAD => plugin_api::load(peer, state, &req).await,
+        // P5 切片八：批量并发装载（单插件语义与 `plugin.load` 同一段实现）。
+        methods::plugin::LOAD_MANY => plugin_api::load_many(peer, state, &req).await,
         methods::plugin::UNLOAD => plugin_api::unload(peer, state, &req).await,
         methods::plugin::RELOAD => plugin_api::reload(peer, state, &req).await,
         methods::plugin::CALL => plugin_api::call(peer, state, &req).await,
         methods::plugin::COMMAND => plugin_api::command(peer, state, &req).await,
         methods::plugin::GRANT => plugin_api::grant(peer, state, &req).await,
         methods::plugin::REVOKE => plugin_api::revoke(peer, state, &req).await,
+
+        // 语言服务（LSP 切片二）：五个方法都是真实实现，连接池按
+        // `workspace_id → server_id` 复用；诊断不走这里，是 `lsp.start`
+        // 之后由转发任务推 `lsp.diagnostics` 通知。
+        methods::lsp::START => lsp_api::start(peer, state, &req).await,
+        methods::lsp::STOP => lsp_api::stop(peer, state, &req).await,
+        methods::lsp::SERVERS => lsp_api::servers(peer, state, &req).await,
+        methods::lsp::REQUEST => lsp_api::request(peer, state, &req).await,
+        methods::lsp::SYNC => lsp_api::sync(peer, state, &req).await,
 
         other => {
             warn!(method = %other, "未实现的方法");

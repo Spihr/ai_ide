@@ -1,0 +1,85 @@
+# 换行符与文本/二进制归一化策略（新增，不改变任何已有文件内容）
+#
+# 背景：仓库此前未声明 .gitattributes，且本机 git config core.autocrlf=true，
+# 导致检出结果依赖个人配置、跨平台 diff 噪声大。此文件把换行符策略固化到仓库。
+#
+# 说明：本文件只是声明式配置，不触发任何 renormalize；如需让历史文件按新规则
+# 重新归一化，须另起一次显式 `git add --renormalize .` 提交（本阶段未执行）。
+
+* text=auto eol=lf
+
+# ---- Rust / 后端 ----
+*.rs        text eol=lf
+*.toml      text eol=lf
+Cargo.lock  text eol=lf
+*.proto     text eol=lf
+
+# ---- 前端 / 脚本（JS 生态）----
+*.ts        text eol=lf
+*.tsx       text eol=lf
+*.js        text eol=lf
+*.jsx       text eol=lf
+*.mjs       text eol=lf
+*.cjs       text eol=lf
+*.css       text eol=lf
+*.scss      text eol=lf
+*.html      text eol=lf
+
+# ---- 配置与文档 ----
+*.json      text eol=lf
+*.jsonc     text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.md        text eol=lf
+*.txt       text eol=lf
+*.lock      text eol=lf
+.gitignore      text eol=lf
+.gitattributes  text eol=lf
+.editorconfig   text eol=lf
+.npmrc          text eol=lf
+.prettierrc     text eol=lf
+
+# ---- Shell（POSIX）----
+*.sh        text eol=lf
+
+# ---- Windows 脚本：必须是 CRLF ----
+# PowerShell 5.1 / cmd 对 LF 结尾的 .ps1、.bat 兼容性差（尤其是多行块与续行符）。
+*.ps1       text eol=crlf
+*.psm1      text eol=crlf
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+*.reg       text eol=crlf
+
+# ---- 二进制：禁换行转换、禁文本 diff ----
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.webp      binary
+*.ico       binary
+*.icns      binary
+*.bmp       binary
+*.pdf       binary
+*.zip       binary
+*.7z        binary
+*.gz        binary
+*.tar       binary
+*.exe       binary
+*.dll       binary
+*.node      binary
+*.so        binary
+*.dylib     binary
+*.wasm      binary
+*.sqlite    binary
+*.db        binary
+*.woff      binary
+*.woff2     binary
+*.ttf       binary
+*.otf       binary
+*.mp4       binary
+*.mp3       binary
+
+# ---- 文本但特殊处理 ----
+*.svg       text eol=lf
+*.diff      text eol=lf
+*.patch     text eol=lf

@@ -10,6 +10,7 @@
 
 import { useEffect, useRef } from 'react'
 
+import { registerLspProviders } from '../lsp-providers'
 import { languageForPath, monaco } from '../monaco-setup'
 import { clearReveal, setEditorSelection, updateContent, useEditor } from '../store'
 
@@ -35,8 +36,14 @@ function reportSelection(
   }
   setEditorSelection({
     path,
-    startLine: Math.min(selection.startLineNumber, selection.endLineNumber),
-    endLine: Math.max(selection.startLineNumber, selection.endLineNumber)
+    startLine: Math.min(selection.selectionStartLineNumber, selection.positionLineNumber),
+    endLine: Math.max(selection.selectionStartLineNumber, selection.positionLineNumber),
+    // 列也一并上报：Inline Edit（Ctrl+K）按列精确替换，只给行范围会把整行连同缩进
+    // 一起重写。Monaco 的列是 1-based，内核 `TextSelection` 是 0-based，这里减 1。
+    // 用 `selectionStart` / `position` 而不是 `start*` / `end*`：前三者是「已按方向
+    // 归一」的那一对，反着拖（从下往上选）时也不会把起止行弄反。
+    startColumn: Math.max(selection.selectionStartColumn - 1, 0),
+    endColumn: Math.max(selection.positionColumn - 1, 0)
   })
 }
 
@@ -72,6 +79,12 @@ export function CodeEditor() {
     editorRef.current = editor
     currentRef.current = null
 
+    // 四个语言服务 provider（定义 / 引用 / 悬停 / 补全）挂在编辑器初始化这一处：
+    // Monaco 的 provider 注册是全局的、与具体 editor 实例无关，所以只注册一次。
+    // 幂等由 `registerLspProviders` 自己保证；卸载时撤销，避免 HMR 之后重复注册
+    // 导致每次查询跑两遍、定义列表出现重复项。
+    const disposeLspProviders = registerLspProviders(monaco)
+
     const subscription = editor.onDidChangeModelContent(() => {
       if (applyingRef.current) return
       const path = currentRef.current
@@ -88,6 +101,7 @@ export function CodeEditor() {
     const views = viewsRef.current
 
     return () => {
+      disposeLspProviders()
       subscription.dispose()
       selectionSubscription.dispose()
       editor.dispose()

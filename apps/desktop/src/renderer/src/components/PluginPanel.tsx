@@ -30,6 +30,12 @@
  *
  * 行内二次确认有两处：**卸载**（删账本 + 删安装目录）与**撤销关键能力**（连带卸载）。
  * 停止（`unload`）不删文件、不撤能力，所以不确认。
+ *
+ * P5 的「全部启用」（`plugin.load_many`）是**批量**入口：候选=已停用 + 已崩溃，
+ * 一次请求交给内核并发起进程。按钮上的数字是候选数（按下去之前就得知道会起几个
+ * 子进程），进度取自内核本来就会广播的 `plugin.state_changed`，结果条里失败项逐行
+ * 给原因并可单独重试——**一个插件失败不牵连其它插件**，这是这条通道与循环 `load`
+ * 的关键差别。
  */
 
 import { useEffect, useState } from 'react'
@@ -48,12 +54,16 @@ import {
 } from '../plugin-activity-store'
 import {
   cancelRevoke,
+  describePluginBatch,
+  dismissPluginBatch,
   dismissPluginError,
   dismissPluginHint,
   grantCapabilities,
   initPlugins,
   installPlugin,
+  loadablePluginIds,
   loadPlugin,
+  loadPluginsMany,
   refreshPlugins,
   reloadPlugin,
   revokeCapability,
@@ -86,6 +96,16 @@ export function PluginPanel(): React.JSX.Element {
    */
   const detailBusy = state.busyPlugin !== null
   const detail = state.detail
+
+  /**
+   * 「全部启用」的候选（已停用 + 已崩溃）。
+   *
+   * 按钮上的数字就是它：用户在按下之前就该知道这一次会起几个进程——装了一堆插件
+   * 却在点下去之后才知道要起十几个子进程，是面板最不该有的惊喜。
+   */
+  const batchCandidates = loadablePluginIds(state.plugins)
+  const batchRunning = state.batch?.running === true
+  const batchBusy = batchRunning || state.busyPlugin !== null || state.installing
 
   function onUninstall(pluginId: string): void {
     if (confirming === pluginId) {
@@ -141,6 +161,27 @@ export function PluginPanel(): React.JSX.Element {
         >
           刷新
         </button>
+        {/*
+          P5 切片八：一次请求并发装载。逐个点「加载」是串行的——每个插件一轮握手，
+          且第一个超时会把后面全堵住；这条走 `plugin.load_many`，内核并发起进程。
+          失败项互不牵连，结果条里逐条列原因。
+        */}
+        <button
+          className="ai-button ai-button--primary"
+          type="button"
+          data-testid="plugin-load-many"
+          disabled={batchBusy || batchCandidates.length === 0}
+          title={
+            batchCandidates.length === 0
+              ? '没有可批量启用的插件：已经在运行的不必再启用，待授权的需先到详情里授权'
+              : `并发启用这 ${batchCandidates.length} 个插件：${batchCandidates.join('、')}`
+          }
+          onClick={() => void loadPluginsMany()}
+        >
+          {batchRunning
+            ? `启用中 ${state.batch?.done ?? 0}/${state.batch?.total ?? 0}`
+            : `全部启用${batchCandidates.length > 0 ? `（${batchCandidates.length}）` : ''}`}
+        </button>
         {/* P5：日志/进度流水在右下角浮层里，这里只负责开关开关。 */}
         <button
           className="ai-button"
@@ -184,6 +225,64 @@ export function PluginPanel(): React.JSX.Element {
           <button className="ai-button ai-button--tiny" type="button" onClick={dismissPluginHint}>
             知道了
           </button>
+        </div>
+      ) : null}
+
+      {/*
+        「全部启用」的结果条：进度（装载中）+ 结局（成功几个/失败哪几个）。
+        失败项**逐行**列出，而不是折叠成「3 个失败」——用户要的是「哪个插件、为什么」，
+        而且每一行都能单独重试（批量失败不代表这个插件永远起不来，常常是缺能力或
+        端口占用，修完点一下就够，不必再整批重来）。
+      */}
+      {state.batch !== null ? (
+        <div
+          className={`ai-result ${
+            state.batch.failures.length > 0 ? 'ai-result--bad' : 'ai-result--ok'
+          }`}
+          data-testid="plugin-batch"
+        >
+          <div data-testid="plugin-batch-progress">{describePluginBatch(state.batch)}</div>
+          {state.batch.failures.length > 0 ? (
+            <ul className="plugin-issues" data-testid="plugin-batch-failures">
+              {state.batch.failures.map((failure) => {
+                const known = state.plugins.find((plugin) => plugin.id === failure.pluginId)
+                return (
+                  <li
+                    className="plugin-issue"
+                    key={failure.pluginId}
+                    data-testid={`plugin-batch-failure-${failure.pluginId}`}
+                  >
+                    <span className="plugin-issue__code">[{failure.code}]</span>
+                    <code className="plugin-issue__path">{known?.name ?? failure.pluginId}</code>
+                    <span className="plugin-issue__message">
+                      {failure.hint.length > 0
+                        ? `${failure.hint}（内核原文：${failure.message}）`
+                        : failure.message}
+                    </span>
+                    <button
+                      className="ai-button ai-button--tiny"
+                      type="button"
+                      data-testid={`plugin-batch-retry-${failure.pluginId}`}
+                      disabled={batchBusy}
+                      onClick={() => void loadPlugin(failure.pluginId)}
+                    >
+                      单独重试
+                    </button>
+                  </li>
+                )
+              })}
+            </ul>
+          ) : null}
+          {state.batch.running ? null : (
+            <button
+              className="ai-button ai-button--tiny"
+              type="button"
+              data-testid="plugin-batch-dismiss"
+              onClick={dismissPluginBatch}
+            >
+              知道了
+            </button>
+          )}
         </div>
       ) : null}
 

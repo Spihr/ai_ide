@@ -32,6 +32,7 @@ const RENDERER_ALLOWED = new Set<string>([
   // M1：检索。
   Methods.search.files,
   Methods.search.content,
+  Methods.search.symbols,
 
   // M2：模型接入。放行的理由与 M1 一致——这些都要用户显式动作才会发起：
   // 配置/删除 Provider 与模型、点「测试连接」、发一条对话、按「停止」。
@@ -49,6 +50,15 @@ const RENDERER_ALLOWED = new Set<string>([
   Methods.llm.cancel,
   Methods.llm.listModels,
   Methods.llm.countTokens,
+
+  // M3 切片三：Inline Edit（`Ctrl+K`）。放行的是**生成建议**这一步，而且这一步
+  // 本身不写盘——内核只回 `original` / `replacement` / `diff`。所以这条比
+  // `workspace.write_file` 还弱：用户点「接受」之后才由外壳走那条已经在白名单里的
+  // 写文件方法（带预期 hash，撞 CAS 就失败）。
+  //
+  // 触发路径同样只有「用户显式动作」：选中代码后按 Ctrl+K、打一条指令、回车。
+  // 选区越界由内核回 9001、模型没回代码回 9003，都不存在自动重试的入口。
+  Methods.inlineEdit.propose,
 
   // M4：Agent 运行。三条方法都是「用户显式动作」的产物，没有自动发起的路径：
   // `agent.start` 由按下「启动」触发，`agent.stop` 由按下「停止」触发，
@@ -142,6 +152,27 @@ const RENDERER_ALLOWED = new Set<string>([
   Methods.mcp.tools,
   Methods.mcp.call,
 
+  // 语言服务（LSP）。五条同样是「用户显式动作 / 编辑器状态变化」的后果——
+  // 打开某语言的文件才 `start`、切文件或保存才 `sync`、关掉才 `stop`、
+  // 面板要看连接清单才 `servers`、用户按下 F12 / 悬浮 / 补全才 `request`。
+  //
+  // 边界写清楚，否则「白名单里有 start」看起来像「UI 能自己起任意进程」：
+  //
+  // - `start` 的入参不能指定**任意可执行文件**：`command` 缺省时由内核按语言去
+  //   `PATH` 里找已知的那几个服务器（内置语言表），显式给 `command` 也只是覆盖成
+  //   用户自己机器上的另一个语言服务器二进制，参数只能是 `args` 数组——不存在
+  //   「拼一条 shell 命令」的通道（内核直接 spawn，不经 shell）。
+  // - `request` 的 `method` 是**枚举**（`definition` / `references` / `hover` /
+  //   `completion`），线格式方法名不许从渲染进程透传，所以外壳拿不到
+  //   `workspace/executeCommand` 这类有副作用的通道。
+  // - `sync` 只送当前打开文件的正文（didOpen / didChange），`stop` 只关一个句柄；
+  //   三者都不写盘。
+  Methods.lsp.start,
+  Methods.lsp.stop,
+  Methods.lsp.servers,
+  Methods.lsp.request,
+  Methods.lsp.sync,
+
   // P1：插件清单与安装。四条同样是「用户显式动作」的后果——打开插件视图才 `list`、
   // 点某个插件看详情才 `status`、填好本地包目录按「安装」才 `install`、按「卸载」才
   // `uninstall`。这四条拿不到「执行插件代码」的能力：`install` 只复制包目录与写账本
@@ -185,6 +216,9 @@ const RENDERER_ALLOWED = new Set<string>([
   Methods.plugin.status,
   Methods.plugin.uninstall,
   Methods.plugin.load,
+  // P5 切片八：`plugin.load_many` 是 `plugin.load` 的批量形式，作用域与副作用完全
+  // 一致（只对**本机账本里已安装**的插件起进程），因此与 `plugin.load` 同一条放行。
+  Methods.plugin.loadMany,
   Methods.plugin.unload,
   Methods.plugin.reload,
   //

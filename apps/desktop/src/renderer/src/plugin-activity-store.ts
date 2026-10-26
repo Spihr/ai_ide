@@ -31,7 +31,7 @@ import type {
   PluginStateChangedEvent
 } from '@ai-ide/shared-types'
 
-import { refreshPlugins } from './plugin-store'
+import { notePluginBatchProgress, refreshPlugins } from './plugin-store'
 
 /** 活动视图的条数上限。 */
 export const MAX_PLUGIN_ACTIVITY = 500
@@ -223,6 +223,9 @@ export function receivePluginStateChanged(event: PluginStateChangedEvent): void 
     percent: null,
     state: event.state
   })
+  // 「全部启用」的进度就挂在这条事件上：协议没有 `onProgress` 回调，而内核每落一次
+  // 账本就广播一次状态，这是唯一一条**实时**能看到「5 个里已起来 3 个」的通道。
+  notePluginBatchProgress(event.pluginId, event.state)
   void refreshPlugins()
 }
 

@@ -1,12 +1,22 @@
-/** 底部状态栏：内核状态 + 自检 + 当前文件信息。 */
+/** 底部状态栏：内核状态 + 自检 + 语言服务 + 当前文件信息。 */
 
 import { useState } from 'react'
 
 import type { CoreStatus } from '../../../shared/ipc'
+import { useCoreLog } from '../core-log-store'
+import { currentFileDiagnostics, statusLabel, useLspState } from '../lsp-store'
 import { useEditor } from '../store'
 
 interface StatusBarProps {
   core: CoreStatus | null
+}
+
+/** 状态栏里的日志摘要长度上限：超过就截断，完整内容在 title 里。 */
+const LOG_PREVIEW_CHARS = 48
+
+function truncateLog(text: string): string {
+  const single = text.replace(/\s+/g, ' ').trim()
+  return single.length > LOG_PREVIEW_CHARS ? `${single.slice(0, LOG_PREVIEW_CHARS)}…` : single
 }
 
 const CORE_LABEL: Record<CoreStatus['state'], string> = {
@@ -19,11 +29,30 @@ const CORE_LABEL: Record<CoreStatus['state'], string> = {
 
 export function StatusBar({ core }: StatusBarProps) {
   const state = useEditor()
+  const lsp = useLspState()
+  // 内核日志只显示「最近一行」：状态栏是窄条，塞进滚动列表会把别的指标挤掉。
+  // 悬停给完整一行，完整历史在磁盘的 core-shell-*.log 里。
+  const coreLog = useCoreLog()
+  const latestLog = coreLog.lines[0] ?? null
   const [selfCheck, setSelfCheck] = useState<string | null>(null)
   const [checking, setChecking] = useState(false)
 
   const active = state.tabs.find((tab) => tab.path === state.activePath) ?? null
   const dirty = active ? active.content !== active.savedContent : false
+
+  // 语言服务只在「有话说」时占位：`idle`（还没开过文件）不显示，免得空工作区
+  // 里挂一条「语言服务器不可用」吓人。`unavailable` / `error` 走 tooltip 说明，
+  // 不弹框——没装某个语言服务器是常态，不是故障。
+  const lspLabel = statusLabel(lsp)
+  const lspProblems = currentFileDiagnostics(lsp)
+  const lspTone =
+    lsp.status === 'ready'
+      ? 'ready'
+      : lsp.status === 'error'
+        ? 'failed'
+        : lsp.status === 'starting'
+          ? 'starting'
+          : 'idle'
 
   const runSelfCheck = async (): Promise<void> => {
     setChecking(true)
@@ -55,6 +84,15 @@ export function StatusBar({ core }: StatusBarProps) {
       </button>
 
       {selfCheck && <span className="status__item">{selfCheck}</span>}
+
+      {latestLog && (
+        <span
+          className="status__item"
+          title={`${coreLog.lines.length} 行${coreLog.dropped > 0 ? `（更早的 ${coreLog.dropped} 行已省略）` : ''}：${latestLog.text}`}
+        >
+          日志 {truncateLog(latestLog.text)}
+        </span>
+      )}
       {core?.state === 'failed' && core.error && (
         <span className="status__item status__item--failed" title={core.error}>
           {core.error}
@@ -62,6 +100,15 @@ export function StatusBar({ core }: StatusBarProps) {
       )}
 
       <span className="status__spacer" />
+
+      {lspLabel.length > 0 && (
+        <span className={`status__item status__item--${lspTone}`} title={lsp.notice ?? lspLabel}>
+          {lspLabel}
+          {lspProblems !== null && lspProblems.total > 0
+            ? ` · ${lspProblems.problems} 问题/${lspProblems.total} 条`
+            : ''}
+        </span>
+      )}
 
       {active && (
         <>

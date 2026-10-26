@@ -1,13 +1,16 @@
-//! 宿主能力（插件系统 P3.5 读侧 + P4 切片二写侧）：`host/fs.read` /
-//! `host/fs.list` / `host/fs.stat` / `host/search.content` / `host/workspace.info`
-//! 与 `host/fs.write` 的真实实现。
+//! 宿主能力（插件系统 P3.5 读侧 + P4 切片二写侧 + P5 出站与模型）：
+//! `host/fs.read` / `host/fs.list` / `host/fs.stat` / `host/search.content` /
+//! `host/workspace.info` / `host/fs.write` / `host/progress` /
+//! `host/net.fetch` / `host/llm.chat` 的真实实现。
 //!
 //! 这一层是 [`ai_ide_plugin::host_api::HostApi`] 的内核侧实现：`crates/plugin`
 //! 只负责把插件进程发出的 `host/*` 帧转过来，**资格判定、路径判定、审批判定、
 //! 用量判定全在这里**。遥测走 [`HostApi::notify`] 这条旁路：`host/log` 无条件
 //! 收（写日志没有额外信息面），`host/progress` 要 `progress` 能力，转成
 //! `plugin.progress` 推给外壳窗口与订阅了它的插件（P5 切片四）。网络
-//! （`net.fetch`）、模型（`llm.chat`）明确留给后续切片，一律回 `-32601`。
+//! （`net.fetch`）与模型（`llm.chat`）已在 P5 切片五、六落成真实出站：
+//! 前者走 `plugin_net.rs` 的协议 / 域名单 / 地址三重闸门，后者走
+//! `plugin_llm.rs` 的 Provider 通道，两者都要能力 + 清单声明配对校验。
 //!
 //! 闸门严格按 docs/14 §8.1 的顺序，且**顺序不可交换**：
 //!
@@ -55,6 +58,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use serde_json::{json, Value};
 
+use crate::logging::DailyJsonlWriter;
 use crate::peer::Peer;
 use crate::plugin_llm::{self, ChatPlan, LlmChannel, LlmPolicy, ProviderChannel};
 use crate::plugin_net::{self, FetchPlan, NetTransport, ReqwestTransport};
@@ -251,6 +255,13 @@ pub struct FsHostApi {
     llm_policy: Arc<RwLock<HashMap<String, LlmPolicy>>>,
     /// 模型调用通道（生产走 [`ProviderChannel`]，单测换假实现）。
     llm_channel: RwLock<Option<Arc<dyn LlmChannel>>>,
+    /// 插件日志的磁盘副本（P5 切片八）：`host/log` 的每一行同时追加到
+    /// `<logs>/plugin-<day>.jsonl`。
+    ///
+    /// 与事件通道**并列**而不是替代：窗口关了、渲染进程崩了，磁盘上那条仍在；
+    /// 反过来，用户眼前的面板也不该等一次 `fsync`。`None` = 没装（纯单测，
+    /// 或 `AI_IDE_LOG_JSONL=off` 显式关了落盘）。
+    log_sink: RwLock<Option<DailyJsonlWriter>>,
 }
 
 impl Default for FsHostApi {
@@ -331,7 +342,44 @@ impl FsHostApi {
             transport: RwLock::new(Arc::new(ReqwestTransport::new())),
             llm_policy: Arc::new(RwLock::new(HashMap::new())),
             llm_channel: RwLock::new(None),
+            log_sink: RwLock::new(None),
         }
+    }
+
+    /// 装上插件日志的磁盘副本（P5 切片八）。
+    ///
+    /// 由内核启动时调用一次：目录 / 滚动上限 / 脱敏开关全在
+    /// [`crate::logging::plugin_log_writer`] 里定，宿主只负责「有就往里写」。
+    pub fn install_plugin_log_sink(&self, writer: DailyJsonlWriter) {
+        if let Ok(mut slot) = self.log_sink.write() {
+            *slot = Some(writer);
+        }
+    }
+
+    /// 追加一行插件日志（JSONL）：`{timestamp,pluginId,level,message,fields?}`。
+    ///
+    /// 写失败**不影响**事件投递：日志是旁路，磁盘满 / 目录不可写不该让插件
+    /// 的 `host/log` 变成错误——那会让插件把「日志写不进去」当成宿主故障去重试。
+    fn append_plugin_log(&self, payload: &Value) {
+        let Ok(slot) = self.log_sink.read() else {
+            return;
+        };
+        let Some(writer) = slot.as_ref() else {
+            return;
+        };
+        let record = json!({
+            "timestamp": crate::logging::now_iso8601(),
+            "pluginId": payload.get("pluginId").cloned().unwrap_or(Value::Null),
+            "level": payload.get("level").cloned().unwrap_or(Value::Null),
+            "message": payload.get("message").cloned().unwrap_or(Value::Null),
+            // 结构化字段原样搬过去：`fields` 是插件自己的键值，宿主不解释也不筛，
+            // 但脱敏在写入器出口统一做（与内核日志同一套规则）。
+            "fields": payload.get("fields").cloned().unwrap_or(Value::Null),
+        });
+        let mut line = record.to_string();
+        line.push('\n');
+        let mut sink = writer.clone();
+        let _ = sink.write_all(line.as_bytes());
     }
 
     /// 记下某插件的网络域名单（装载 / 重新装载时用）。
@@ -1565,6 +1613,7 @@ impl HostApi for FsHostApi {
                 // 两条腿都要走：订阅了 `plugin.log` 的插件拿一份，用户眼前的
                 // 「插件活动」视图也拿一份（P5 切片七）。日志开销只在事件泵里
                 // 多一次队列写入，与「写日志本身」同量级，不值得为它加开关。
+                self.append_plugin_log(&payload);
                 self.publish_event(PLUGIN_LOG, payload.clone());
                 self.emit_shell(PLUGIN_LOG, payload);
                 Ok(())
@@ -1805,6 +1854,7 @@ mod tests {
     use super::*;
     use ai_ide_plugin::events::{MAX_PROGRESS_MESSAGE_CHARS, MAX_PROGRESS_TOKEN_CHARS};
 
+    use crate::logging::{DailyJsonlWriter, MAX_BYTES, PLUGIN_FILE_PREFIX};
     use crate::plugin_net::{NetReply, OfflineTransport};
 
     fn sandbox(tag: &str) -> PathBuf {
@@ -3229,6 +3279,74 @@ mod tests {
             .call("demo", "host/llm.chat", &chat_params())
             .expect_err("没有通道必须报错");
         assert_eq!(err.code, HostApiError::IO, "{}", err.message);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ⑧ `host/log` 落盘（P5 切片八）：一次一行 JSON、身份以宿主认定为准、
+    /// 密钥打码、同一天追加而不是覆盖。
+    #[test]
+    fn plugin_log_is_appended_to_its_own_jsonl_file() {
+        let root = sandbox("plugin-log");
+        let logs = root.join("logs");
+        let api = api_with(&root, &[]);
+        api.install_plugin_log_sink(DailyJsonlWriter::with_prefix(
+            &logs,
+            PLUGIN_FILE_PREFIX,
+            true,
+            MAX_BYTES,
+        ));
+
+        let secret = "sk-live0123456789abcdefghijklmn";
+        api.notify(
+            "demo",
+            LOG_METHOD,
+            &json!({
+                "level": "warn",
+                "message": format!("调用失败 key={secret}"),
+                "fields": { "attempt": 2 },
+                // 插件自报的身份必须被宿主覆盖，不能让它冒充别的插件写日志。
+                "pluginId": "spoofed",
+            }),
+        )
+        .expect("host/log 不该有能力门槛");
+
+        let file = std::fs::read_dir(&logs)
+            .expect("日志目录应已创建")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+            .expect("应落一个 jsonl 文件");
+        let name = file
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        assert!(name.starts_with("plugin-"), "文件名应是 plugin-*：{name}");
+
+        let text = std::fs::read_to_string(&file).expect("读日志");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1, "一次 host/log 只落一行：{text}");
+        let record: Value = serde_json::from_str(lines[0]).expect("每行都必须是完整 JSON");
+        assert_eq!(record["pluginId"], "demo", "身份用宿主认定的那个");
+        assert_eq!(record["level"], "warn");
+        assert_eq!(record["fields"]["attempt"], 2, "结构化字段要原样带上");
+        assert!(
+            record["timestamp"]
+                .as_str()
+                .is_some_and(|value| value.contains('T')),
+            "要有 ISO 时间戳：{record}"
+        );
+        assert!(!text.contains(secret), "明文密钥不该落盘：{text}");
+
+        // 同一天第二条：追加，不是覆盖。
+        api.notify(
+            "demo",
+            LOG_METHOD,
+            &json!({ "level": "info", "message": "第二条" }),
+        )
+        .expect("第二条");
+        let text = std::fs::read_to_string(&file).expect("再读");
+        assert_eq!(text.lines().count(), 2, "应是追加：{text}");
 
         std::fs::remove_dir_all(&root).ok();
     }

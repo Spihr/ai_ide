@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::sync::Mutex as AsyncMutex;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -438,6 +440,16 @@ pub enum Restart {
 #[derive(Default)]
 pub struct Host {
     loaded: Mutex<HashMap<String, Entry>>,
+    /// 每个插件 id 一把「装载闸门」（P5 切片八）。
+    ///
+    /// `alive()` 只能解释「已经装好了」，解释不了「正在装」。两个 `plugin.load`
+    /// 同 id 并发进来时，两边都会看到「表里没有 → 起进程」，于是同一个插件被起
+    /// 两份，后插入的那条把旧 `Entry` 顶掉（旧进程只能靠 `Drop` 兜底 kill）。
+    /// 这里用 `tokio::sync::Mutex` 做 per-id 串行：第二次请求在闸门后等待，等
+    /// 第一次装完再走一次 `alive()`，于是拿到 `reused: true` 而不是第二个进程。
+    ///
+    /// 粒度是**按 id**，不是全局：不同插件的闸门互不相同，装载依旧并发进行。
+    gates: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     /// 宿主能力实现方（P3.5）。`None` 时插件反向请求一律 `-32601`。
     ///
     /// 不加锁读也不是问题——它只在启动装配时写一次；用 `Mutex` 只是为了让
@@ -465,13 +477,36 @@ impl Host {
         self.api.lock().ok().and_then(|guard| guard.clone())
     }
 
+    /// 取某个插件 id 的装载闸门（不存在则建一把）。
+    ///
+    /// 返回 `Arc` 而不是持有 map 的锁：闸门本身要跨 `await` 持有，而 `gates`
+    /// 的锁只在这几行里短暂持有。同一个 id 拿到的是同一把锁，不同 id 各自一把。
+    fn gate(&self, plugin_id: &str) -> Arc<AsyncMutex<()>> {
+        let Ok(mut guard) = self.gates.lock() else {
+            // 锁中毒：退化成一把临时锁，宁可这一次不做互斥，也不要让装载直接失败。
+            return Arc::new(AsyncMutex::new(()));
+        };
+        Arc::clone(
+            guard
+                .entry(plugin_id.to_string())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+        )
+    }
+
     /// 装载（幂等）：已装载且进程活着时直接复用，不重复起进程。
     ///
     /// 每次成功装载都会开启一个新的「重启会话」：`restart_attempts` 归零。
     /// 也就是说「最多 3 次」是**每次装载**的预算，用户手动 `load` 相当于重新
     /// 给一次预算——他按下按钮这个动作本身就是在说「我知道它崩过，再试一次」。
+    ///
+    /// **同 id 并发只起一个进程**：整个装载过程（`alive` 检查 → 收残壳 → 起进程
+    /// → 握手 → 入表）都在该 id 的闸门内完成。并发的第二次请求在闸门外等待，
+    /// 进来后 `alive()` 命中刚装好的那个，返回 `reused: true`。不同插件的闸门
+    /// 互不相同，因此多插件装载依旧并行——闸门是 per-id，不是全局。
     pub async fn load(&self, spec: LoadSpec<'_>) -> Result<Loaded, LoadError> {
         let plugin_id = spec.plugin_id.to_string();
+        let gate = self.gate(&plugin_id);
+        let _permit = gate.lock().await;
 
         if let Some(existing) = self.alive(&plugin_id) {
             return Ok(Loaded {
@@ -604,7 +639,12 @@ impl Host {
     }
 
     /// 卸载：关停进程并返回被下架的工具全名。未装载时返回 `None`。
+    ///
+    /// 与 [`Self::load`] 共用同一把 per-id 闸门：装载途中来了卸载请求，会等这次
+    /// 装载落定再摘——否则「先摘表、后被 load 插回去」会留下一个谁都不认领的进程。
     pub async fn unload(&self, plugin_id: &str) -> Option<Vec<String>> {
+        let gate = self.gate(plugin_id);
+        let _permit = gate.lock().await;
         let entry = self.take(plugin_id)?;
         entry.start.process.shutdown().await;
         Some(entry.start.namespaced)

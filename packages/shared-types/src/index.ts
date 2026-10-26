@@ -69,6 +69,12 @@ export type { SearchFilesResult } from "./generated/SearchFilesResult";
 export type { SearchContentParams } from "./generated/SearchContentParams";
 export type { ContentMatch } from "./generated/ContentMatch";
 export type { SearchContentResult } from "./generated/SearchContentResult";
+// M3 切片一：符号检索（`search.symbols`）的请求 / 响应与符号视图类型。
+export type { SearchSymbolsParams } from "./generated/SearchSymbolsParams";
+export type { SearchSymbolsResult } from "./generated/SearchSymbolsResult";
+export type { SymbolKind } from "./generated/SymbolKind";
+export type { SymbolRange } from "./generated/SymbolRange";
+export type { Symbol } from "./generated/Symbol";
 
 // ---- provider.* 方法（M2）----
 export type { ProviderChangedEvent } from "./generated/ProviderChangedEvent";
@@ -119,12 +125,45 @@ export type { LlmUsageEvent } from "./generated/LlmUsageEvent";
 export type { ToolChoice } from "./generated/ToolChoice";
 export type { ToolSpec } from "./generated/ToolSpec";
 
+// ---- inline_edit.* 方法（M3 切片三：选区改写）----
+export type { InlineEditProposeParams } from "./generated/InlineEditProposeParams";
+export type { InlineEditProposeResult } from "./generated/InlineEditProposeResult";
+export type { InlineEditUsage } from "./generated/InlineEditUsage";
+export type { TextSelection } from "./generated/TextSelection";
+
 // ---- 上下文引用（M3）----
 export type { ChatContext } from "./generated/ChatContext";
 export type { CompressOptions } from "./generated/CompressOptions";
 export type { CompressStrategy } from "./generated/CompressStrategy";
 export type { ContextRef } from "./generated/ContextRef";
 export type { ContextRefKind } from "./generated/ContextRefKind";
+
+// ---- lsp.* 方法（语言服务，切片一：协议面先行，内核未接线）----
+// 坐标一律 1-based 行列：LSP 原生协议用 0-based，但本协议面给外壳用——两者换算
+// 只在内核做一次（`crates/lsp`），外壳与 DTO 都拿 1-based，避免「第一行是 0 还是 1」
+// 这类错误在三个进程间反复传播。
+export type { LspPosition } from "./generated/LspPosition";
+export type { LspRange } from "./generated/LspRange";
+export type { LspServerStatus } from "./generated/LspServerStatus";
+export type { LspServerInfo } from "./generated/LspServerInfo";
+export type { LspStartParams } from "./generated/LspStartParams";
+export type { LspStartResult } from "./generated/LspStartResult";
+export type { LspStopParams } from "./generated/LspStopParams";
+export type { LspStopResult } from "./generated/LspStopResult";
+export type { LspServersParams } from "./generated/LspServersParams";
+export type { LspServersResult } from "./generated/LspServersResult";
+export type { LspRequestMethod } from "./generated/LspRequestMethod";
+export type { LspRequestParams } from "./generated/LspRequestParams";
+export type { LspRequestResult } from "./generated/LspRequestResult";
+export type { LspLocation } from "./generated/LspLocation";
+export type { LspHover } from "./generated/LspHover";
+export type { LspCompletionItem } from "./generated/LspCompletionItem";
+export type { LspCompletionList } from "./generated/LspCompletionList";
+export type { LspSyncParams } from "./generated/LspSyncParams";
+export type { LspSyncResult } from "./generated/LspSyncResult";
+export type { LspDiagnosticSeverity } from "./generated/LspDiagnosticSeverity";
+export type { LspDiagnostic } from "./generated/LspDiagnostic";
+export type { LspDiagnosticsEvent } from "./generated/LspDiagnosticsEvent";
 
 // ---- agent.* 方法（M4）----
 export type { AgentMode } from "./generated/AgentMode";
@@ -258,6 +297,10 @@ export type { PluginUninstallParams } from "./generated/PluginUninstallParams";
 export type { PluginUninstallResult } from "./generated/PluginUninstallResult";
 export type { PluginLoadParams } from "./generated/PluginLoadParams";
 export type { PluginLoadResult } from "./generated/PluginLoadResult";
+export type { PluginLoadManyParams } from "./generated/PluginLoadManyParams";
+export type { PluginLoadManyResult } from "./generated/PluginLoadManyResult";
+export type { PluginLoadManyItem } from "./generated/PluginLoadManyItem";
+export type { PluginLoadFailure } from "./generated/PluginLoadFailure";
 export type { PluginUnloadParams } from "./generated/PluginUnloadParams";
 export type { PluginUnloadResult } from "./generated/PluginUnloadResult";
 export type { PluginReloadParams } from "./generated/PluginReloadParams";
@@ -355,6 +398,7 @@ export const Methods = {
   search: {
     files: "search.files",
     content: "search.content",
+    symbols: "search.symbols",
   },
   provider: {
     upsert: "provider.upsert",
@@ -372,6 +416,21 @@ export const Methods = {
     cancel: "llm.cancel",
     listModels: "llm.list_models",
     countTokens: "llm.count_tokens",
+  },
+  // M3 切片三：选区改写。语义上贴着 llm.*，但它是「编辑器动作」而非「一轮对话」，
+  // 因此单起一个命名空间——外壳以后要按这个前缀决定「不进会话、不写盘」。
+  inlineEdit: {
+    propose: "inline_edit.propose",
+  },
+  // 语言服务（切片一：协议面先行）。`request` 的 `method` 用枚举字符串而不是裸字符串，
+  // 因为外壳要按它选渲染组件（定义跳转 / 悬浮 / 补全），拼错一个字母就得到空结果，
+  // 那种失败最难查。`stop` 只带 `server_id`——被关的是连接，不是整个语言。
+  lsp: {
+    start: "lsp.start",
+    stop: "lsp.stop",
+    servers: "lsp.servers",
+    request: "lsp.request",
+    sync: "lsp.sync",
   },
   agent: {
     start: "agent.start",
@@ -429,6 +488,10 @@ export const Methods = {
     install: "plugin.install",
     uninstall: "plugin.uninstall",
     load: "plugin.load",
+    // P5 切片八：批量并发装载。Rust 源 `ai_ide_protocol::methods::plugin::LOAD_MANY`
+    // （crates/protocol/src/methods.rs）。语义是「一批插件的 load」，仍是本机账本内
+    // 已安装插件的装载动作，因此与 `plugin.load` 同一条放行策略。
+    loadMany: "plugin.load_many",
     unload: "plugin.unload",
     reload: "plugin.reload",
     call: "plugin.call",
@@ -452,6 +515,10 @@ export const Methods = {
     agentFinished: "agent.finished",
     terminalData: "terminal.data",
     terminalExit: "terminal.exit",
+    // 诊断是**推送**而非拉取：打开文件后语言服务器随时可能重算，外壳不能靠轮询
+    // （补全型服务器算一次诊断要几十毫秒，轮询会把编辑器拖死）。载荷见
+    // `LspDiagnosticsEvent`，带 `version` 供外壳丢弃过期批次。
+    lspDiagnostics: "lsp.diagnostics",
     // 插件可观测事件（P5 切片七）。名字取自 Rust `crates/plugin/src/events.rs`
     // 的常量（`PLUGIN_LOG` / `PLUGIN_PROGRESS` / `PLUGIN_STATE_CHANGED`）——
     // 这三个不是 `ai_ide_protocol::methods::event` 的成员，因为它们是宿主
@@ -474,7 +541,11 @@ export const Methods = {
  * M7 的 `mcp.*` 五项（Server 清单 / 连接 / 断开 / 工具 / 调用），
  * 以及插件系统 P0 的 `plugin.*` 十项（协议骨架：能路由，但统一回 6101）——
  * P5 切片二把其中第 11 项 `plugin.command`（命令网关）补成真实现，
- * 共 72 项，与 Rust `methods::IMPLEMENTED` 逐项对齐。
+ * 再加 M3 切片一的 `search.symbols`（符号检索内核面：七种语言的声明抽取，
+ * 外壳入口留待下一片），以及 M3 切片三的 `inline_edit.propose`（选区改写内核面：
+ * 一次补全 + 结构化 diff，内核不写盘），再加语言服务的 `lsp.*` 五项（启动 /
+ * 关闭 / 清单 / 查询 / 同步，内核 `lsp_api.rs` 已接线），共 80 项，
+ * 与 Rust `methods::IMPLEMENTED` 逐项对齐。
  */
 export const IMPLEMENTED_METHODS = [
   Methods.core.hello,
@@ -493,6 +564,7 @@ export const IMPLEMENTED_METHODS = [
   Methods.workspace.reveal,
   Methods.search.files,
   Methods.search.content,
+  Methods.search.symbols,
   Methods.provider.upsert,
   Methods.provider.list,
   Methods.provider.delete,
@@ -504,6 +576,7 @@ export const IMPLEMENTED_METHODS = [
   Methods.llm.cancel,
   Methods.llm.listModels,
   Methods.llm.countTokens,
+  Methods.inlineEdit.propose,
   Methods.agent.start,
   Methods.agent.stop,
   Methods.agent.decide,
@@ -549,6 +622,13 @@ export const IMPLEMENTED_METHODS = [
   Methods.plugin.command,
   Methods.plugin.grant,
   Methods.plugin.revoke,
+  Methods.lsp.start,
+  Methods.lsp.stop,
+  Methods.lsp.servers,
+  Methods.lsp.request,
+  Methods.lsp.sync,
+  // P5 切片八：`plugin.load` 的批量形式（一次请求装载多个插件，结果按插件逐项回报）。
+  Methods.plugin.loadMany,
 ] as const;
 
 /**
@@ -559,5 +639,9 @@ export const IMPLEMENTED_METHODS = [
  *
  * 它**不能**与 `IMPLEMENTED_METHODS` 有交集：`core.hello` 会把已实现清单当能力
  * 回给外壳，一旦虚报，外壳照单调用只会拿到一片 `-32601`。
+ *
+ * `lsp.*` 五项曾在这里待过一片：协议面（DTO / 常量 / 错误码）先定，`crates/lsp`
+ * 客户端与注册表随后落地，最后 `crates/core` 的 dispatch 接线。接线完成后整组挪进
+ * `IMPLEMENTED_METHODS`（74 → 80），本表随之清空——这才是它该有的常态。
  */
 export const DECLARED_NOT_IMPLEMENTED_METHODS: readonly string[] = [];

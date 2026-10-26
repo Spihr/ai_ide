@@ -64,6 +64,30 @@ export interface BuiltinCommandActions {
   /** 切到某个活动栏视图（资源管理器 / 搜索 / 插件 …）。 */
   showView: (view: 'explorer' | 'search' | 'ai' | 'git' | 'checkpoints' | 'permissions' | 'mcp' | 'plugin') => void
   toggleTerminal: () => void | Promise<void>
+  /** 唤出「转到符号」快速选择器（`Ctrl+T`，符号检索的浮层入口）。 */
+  gotoSymbol: () => void | Promise<void>
+  /**
+   * 唤出内联编辑浮层（`Ctrl+K`，选区改写的入口）。
+   *
+   * 与 `gotoSymbol` 分开而不是复用一个 `showOverlay(name)`：两者的前置条件不同
+   * （内联编辑要求「有文件 + 有选区」），共用一个动作就得让面板知道这些条件，
+   * 而那份判断应该留在 `inline-edit-store` 里。
+   */
+  inlineEdit: () => void | Promise<void>
+  /**
+   * 重启当前文件的语言服务器（`lsp.restart`）。
+   *
+   * 停掉再按同一份文件起一条：改了 `tsconfig` / 装完新插件后要靠它让服务器重新
+   * 握手。参数（缓冲正文）由 store 侧取，面板只说「重启」。
+   */
+  restartLsp: () => void | Promise<void>
+  /**
+   * 把语言服务状态压成一句提示（`lsp.status`）。
+   *
+   * 「为什么没有补全」这类问题，90% 是服务器没起（没装 / 崩了 / 降级），得先有一
+   * 个地方能一眼看到当前连接的命令、PID、重启次数。
+   */
+  showLspStatus: () => void | Promise<void>
 }
 
 export interface BuiltinCommandSpec {
@@ -110,6 +134,22 @@ export const BUILTIN_COMMAND_SPECS: readonly BuiltinCommandSpec[] = [
     run: (actions) => actions.showView('search')
   },
   {
+    id: 'symbol.goto',
+    title: '转到符号…',
+    description: '搜索工作区里的函数 / 类 / 常量并跳转（Ctrl+T）',
+    // 拼音首字母与「符号」放在一起：用户记不住图标名时，最可能输入的就是 Ctrl+T。
+    keywords: ['symbol', 'goto symbol', '符号', 'zhdf', 'ctrlt', '跳转'],
+    run: (actions) => actions.gotoSymbol()
+  },
+  {
+    id: 'edit.inline',
+    title: '内联编辑…',
+    description: '选中代码后说一句要改成什么，看 diff 再决定写不写（Ctrl+K）',
+    // 「AI 改代码」这条同义词也收进来：用户找它时未必知道叫「内联编辑」。
+    keywords: ['inline edit', 'inline', 'ai 改代码', 'nl', '内联编辑', '改写', 'ctrlk'],
+    run: (actions) => actions.inlineEdit()
+  },
+  {
     id: 'view.ai',
     title: '切换到 AI 对话',
     description: '左侧活动栏 · 与模型对话',
@@ -143,6 +183,21 @@ export const BUILTIN_COMMAND_SPECS: readonly BuiltinCommandSpec[] = [
     description: '底部终端面板（Ctrl+`）',
     keywords: ['terminal', 'shell', 'zd', '终端', '命令行'],
     run: (actions) => actions.toggleTerminal()
+  },
+  {
+    id: 'lsp.status',
+    title: '查看语言服务器状态',
+    description: '当前文件的 LSP 连接、命令、PID 与问题数',
+    // 「补全没反应」「跳转不灵」是用户找这条命令时的原话，一并收进别名。
+    keywords: ['lsp', 'language server', 'yyfwq', '语言服务器', '语言服务', '补全', '诊断'],
+    run: (actions) => actions.showLspStatus()
+  },
+  {
+    id: 'lsp.restart',
+    title: '重启语言服务器',
+    description: '停掉当前语言的服务器再按当前文件重新启动（读了 tsconfig / 装完插件后用）',
+    keywords: ['lsp restart', 'restart lsp', 'cqq', '重启', '语言服务器', 'reload'],
+    run: (actions) => actions.restartLsp()
   }
 ]
 

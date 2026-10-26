@@ -55,12 +55,19 @@ pub mod audit_api;
 pub mod checkpoint;
 pub mod checkpoint_api;
 pub mod context;
+/// 内核日志主动上报（P5 收口）：把 tracing 事件抬成 `core.log` 通知推给外壳。
+pub mod core_log;
 pub mod dispatch;
 pub mod git_api;
+/// Inline Edit 处理器（M3 切片三）：`inline_edit.propose` —— 读选区、补全一次、算 diff。
+pub mod inline_edit_api;
 pub mod llm_api;
 pub mod llm_runtime;
 /// 结构化日志（M5 任务 4）：JSONL 按天滚动 + 出口脱敏。
 pub mod logging;
+/// LSP 协议处理器（LSP 切片二）：`lsp.start` / `stop` / `servers` / `request` / `sync`，
+/// 连接本体在 `crates/lsp`，这里只管「按需起、按 id 复用、按 id 关」。
+pub mod lsp_api;
 /// MCP 协议处理器（M7 切片二）：`mcp.servers` / `connect` / `disconnect` / `tools` / `call`。
 pub mod mcp_api;
 /// MCP 连接管理器（M7 切片二）：在 core state 里管多 Server 的活连接。
@@ -111,8 +118,31 @@ fn session_store_path() -> std::path::PathBuf {
 pub async fn run() -> Result<()> {
     let state = Arc::new(AppState::new());
     let peer = Arc::new(Peer::new());
+
+    // 插件日志的磁盘副本（P5 切片八）：与内核日志同目录、同滚动、同脱敏，
+    // 只是文件族从 `core-*` 换成 `plugin-*`。装在 `run()` 而不是 `AppState::new()`：
+    // 单测会构造 AppState，装载器跑到用户默认目录里写文件是副作用污染。
+    match logging::plugin_log_writer() {
+        Some(writer) => {
+            info!(dir = %logging::log_dir().display(), "插件日志将追加写入 plugin-*.jsonl");
+            state.plugin_host().install_plugin_log_sink(writer);
+        }
+        None => info!("AI_IDE_LOG_JSONL 已关，插件日志只走事件通道"),
+    }
     // 把对端句柄交给状态：`workspace.changed` 这类事件需要主动推送。
     state.attach_peer(Arc::clone(&peer));
+
+    // 内核日志的第三出口（P5 收口）：`core.log` 通知。
+    //
+    // 装在这里而不是 `init_tracing`：投递要 `Peer`（写 stdout 帧），而 `Peer` 是
+    // `run()` 里才构造的。装之前的日志仍有 stderr 与 JSONL 两份，只是不推进外壳；
+    // `AI_IDE_CORE_LOG_PUSH=off` 时这一层照挂但不投递，方便「只留文件」的排查姿态。
+    if core_log::push_enabled() {
+        let receiver = core_log::install_channel();
+        tokio::spawn(core_log::pump(Arc::clone(&peer), receiver));
+    } else {
+        info!("AI_IDE_CORE_LOG_PUSH 已关，内核日志不推 core.log 事件");
+    }
 
     // 终端事件泵：`take_events` 只能取一次，必须在任何 `terminal.create` 之前取走，
     // 否则首个会话建立时的横向输出（shell 提示符 / banner）会随通道一起丢。

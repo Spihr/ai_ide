@@ -33,7 +33,14 @@ function fakeActions(): BuiltinCommandActions {
     openWorkspace: vi.fn(),
     saveActiveTab: vi.fn(),
     showView: vi.fn(),
-    toggleTerminal: vi.fn()
+    toggleTerminal: vi.fn(),
+    gotoSymbol: vi.fn(),
+    // 切片三：内联编辑入口。它的「有没有选区」判断在 `inline-edit-store` 里，
+    // 注册表只负责把点击转给这个动作。
+    inlineEdit: vi.fn(),
+    // 切片四：语言服务入口（状态查询 / 重启）。具体取数与重启在 `lsp-store`。
+    restartLsp: vi.fn(),
+    showLspStatus: vi.fn()
   }
 }
 
@@ -89,6 +96,48 @@ describe('内置命令注册表', () => {
 
     await rows.find((row) => row.id === 'builtin:workspace.open')?.run?.()
     expect(actions.openWorkspace).toHaveBeenCalledTimes(1)
+  })
+
+  it('「转到符号」是内建命令，走 gotoSymbol 动作', async () => {
+    const actions = fakeActions()
+    const row = builtinCommands(actions).find((entry) => entry.id === 'builtin:symbol.goto')
+
+    expect(row, '命令面板必须能搜到「转到符号」').toBeDefined()
+    // 描述里带快捷键：用户在面板里看到这一行就知道下次可以直接按。
+    expect(row?.description).toContain('Ctrl+T')
+
+    await row?.run?.()
+    expect(actions.gotoSymbol).toHaveBeenCalledTimes(1)
+  })
+
+  it('「转到符号」能被中文与 symbol 两种词召回', () => {
+    const rows = builtinCommands(fakeActions())
+
+    const byChinese = filterCommands(rows, '符号').map((row) => row.id)
+    expect(byChinese).toContain('builtin:symbol.goto')
+
+    const byEnglish = filterCommands(rows, 'symbol').map((row) => row.id)
+    expect(byEnglish).toContain('builtin:symbol.goto')
+  })
+
+  it('语言服务入口（状态 / 重启）在面板里可搜可执行', async () => {
+    const actions = fakeActions()
+    const rows = builtinCommands(actions)
+
+    // 三条召回路径：「lsp」是用户最可能敲的词，中文与「重启」是另一条常见路径。
+    expect(filterCommands(rows, 'lsp').map((row) => row.id)).toEqual(
+      expect.arrayContaining(['builtin:lsp.status', 'builtin:lsp.restart'])
+    )
+    expect(filterCommands(rows, '语言服务器').map((row) => row.id)).toEqual(
+      expect.arrayContaining(['builtin:lsp.status', 'builtin:lsp.restart'])
+    )
+    expect(filterCommands(rows, '重启').map((row) => row.id)).toContain('builtin:lsp.restart')
+
+    await rows.find((row) => row.id === 'builtin:lsp.status')?.run?.()
+    expect(actions.showLspStatus).toHaveBeenCalledTimes(1)
+
+    await rows.find((row) => row.id === 'builtin:lsp.restart')?.run?.()
+    expect(actions.restartLsp).toHaveBeenCalledTimes(1)
   })
 })
 

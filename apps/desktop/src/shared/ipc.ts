@@ -7,6 +7,7 @@
 
 import type {
   HelloResult,
+  LspDiagnosticsEvent,
   PluginLogEvent,
   PluginProgressEvent,
   PluginStateChangedEvent,
@@ -17,6 +18,7 @@ import type {
 } from '@ai-ide/shared-types'
 
 export type {
+  LspDiagnosticsEvent,
   PluginLogEvent,
   PluginProgressEvent,
   PluginStateChangedEvent,
@@ -86,7 +88,15 @@ export const IpcChannels = {
    *
    * 这条同时承担「刷新插件清单」的职责：状态变了就意味着面板上的行过期了。
    */
-  pluginStateChanged: 'plugin:state-changed'
+  pluginStateChanged: 'plugin:state-changed',
+  /**
+   * 主进程 → 渲染进程：语言服务的诊断批次（`lsp.diagnostics`）。
+   *
+   * 单独开一条通道的理由与终端 / 插件事件一致：诊断是**服务器主动推**的，一次
+   * 编辑就可能来一批（含「问题消失了」的空批次），塞进 `ai:event` 会让对话面板
+   * 跟着无谓唤醒。订阅方只有渲染侧的 `lsp-store`。
+   */
+  lspDiagnostics: 'lsp:diagnostics'
 } as const
 
 export type CoreState = 'idle' | 'starting' | 'ready' | 'failed' | 'stopped'
@@ -119,9 +129,17 @@ export interface PingBenchmarkResult {
   samplesMs: number[]
 }
 
-/** 内核 stderr 日志片段。 */
+/**
+ * 内核日志片段。
+ *
+ * `stream` 区分来源：
+ * - `stderr`：内核子进程的 stderr 原始字节（进程还活着时唯一能拿到的东西）；
+ * - `event`：内核主动推的 `core.log` 通知（`{level,target,message}`），由主进程
+ *   格式化成一行后与 stderr 走同一条通道——渲染端不必区分两套接口，磁盘上也
+ *   不必维护两种格式。
+ */
 export interface CoreLogChunk {
-  stream: 'stderr'
+  stream: 'stderr' | 'event'
   text: string
 }
 
@@ -198,6 +216,13 @@ export interface AiIdeApi {
   onPluginProgress: (listener: (event: PluginProgressEvent) => void) => () => void
   /** 订阅插件状态迁移（`plugin.state_changed`），返回取消订阅函数。 */
   onPluginStateChanged: (listener: (event: PluginStateChangedEvent) => void) => () => void
+  /**
+   * 订阅语言服务诊断（`lsp.diagnostics`），返回取消订阅函数。
+   *
+   * 载荷里的 `range` 是 **1-based** 行列、`severity` 是枚举字符串，转换与打点都在
+   * 渲染侧 `lsp-store` / `lsp-markers` 完成——preload 只转交，不改写载荷。
+   */
+  onLspDiagnostics: (listener: (event: LspDiagnosticsEvent) => void) => () => void
 }
 
 // ---------------------------------------------------------------------------

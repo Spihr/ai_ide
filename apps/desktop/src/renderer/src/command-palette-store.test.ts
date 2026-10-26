@@ -25,6 +25,7 @@ import {
   visibleCommands
 } from './command-palette-store'
 import { getEditorState } from './store'
+import { getSymbolPickerState, resetSymbolPickerState } from './symbol-picker-store'
 
 interface Call {
   method: string
@@ -95,6 +96,7 @@ function installHarness(): Harness {
 beforeEach(() => {
   vi.unstubAllGlobals()
   resetPaletteState()
+  resetSymbolPickerState()
 })
 
 describe('取数与分组', () => {
@@ -210,6 +212,20 @@ describe('执行分发', () => {
     expect(harness.calls.some((call) => call.method === Methods.plugin.command)).toBe(false)
     // 执行内置命令后浮层收起：内置动作往往自己会打开别的东西。
     expect(getPaletteState().open).toBe(false)
+  })
+
+  it('「转到符号」内置命令关掉面板并唤起符号选择器，同样不发 IPC', async () => {
+    const harness = installHarness()
+    openPalette()
+    const row = visibleCommands().find((candidate) => candidate.id === 'builtin:symbol.goto')
+    expect(row).toBeDefined()
+    expect(getSymbolPickerState().open).toBe(false)
+
+    await executeCommand(row!)
+
+    expect(getPaletteState().open).toBe(false)
+    expect(getSymbolPickerState().open).toBe(true)
+    expect(harness.calls.some((call) => call.method === Methods.plugin.command)).toBe(false)
   })
 
   it('插件命令走 plugin.command 通道，参数只带 plugin_id + command', async () => {

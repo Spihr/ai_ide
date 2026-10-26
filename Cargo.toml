@@ -12,6 +12,8 @@ members = [
     "crates/mcp",
     # M8 / 插件系统 P1：清单校验、安装目录与包复制（内核侧，不启动插件进程）。
     "crates/plugin",
+    # LSP 客户端基础层：分帧 stdio 传输、请求关联、通知广播、生命周期、文档同步。
+    "crates/lsp",
     "crates/core",
 ]
 
@@ -113,6 +115,8 @@ ai-ide-git = { path = "crates/git" }
 ai-ide-mcp = { path = "crates/mcp" }
 # 插件系统 P1：清单三段校验 + 安装目录/包复制（纯内核逻辑，spawn 留给 P2）
 ai-ide-plugin = { path = "crates/plugin" }
+# LSP 客户端基础层：Content-Length 分帧 stdio 传输、请求关联、通知广播、文档同步
+ai-ide-lsp = { path = "crates/lsp" }
 
 [profile.release]
 lto = "thin"

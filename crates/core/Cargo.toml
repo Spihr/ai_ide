@@ -25,6 +25,8 @@ ai-ide-terminal = { workspace = true }
 ai-ide-git = { workspace = true }
 # M7 切片二：内核接线 MCP（连接管理器、`mcp.*` 处理、工具注入 agent 注册表）。
 ai-ide-mcp = { workspace = true }
+# LSP 切片二：`lsp.*` 处理器复用 `crates/lsp` 的注册表（配置解析 / 命令探测）与连接本体。
+ai-ide-lsp = { workspace = true }
 # M8 切片一：插件系统 P1（清单校验 + 安装落盘 + 账本），不含进程管理。
 ai-ide-plugin = { workspace = true }
 # `terminal.write` / `terminal.data` 的载荷是原始字节的 base64，core 侧负责编解码。
@@ -32,6 +34,9 @@ base64 = { workspace = true }
 # P5 切片五：`host/net.fetch` 的出站传输。用 workspace 里已钉好的 reqwest（rustls +
 # webpki 根），不给 core 单独换一套 TLS 栈。
 reqwest = { workspace = true }
+# P5 切片八：`plugin.load_many` 的有界并发调度。只用到 `stream` 的
+# `iter` / `buffer_unordered`，不引入 `futures` 全量 crate（workspace 里 mcp 已用同一份）。
+futures-util = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

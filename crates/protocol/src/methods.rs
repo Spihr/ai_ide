@@ -30,10 +30,16 @@ pub mod workspace {
     pub const REVEAL: &str = "workspace.reveal";
 }
 
-/// 检索（M1：文件名模糊 + 内容检索；符号检索属 M3）。
+/// 检索（M1：文件名模糊 + 内容检索；M3 切片一补符号检索）。
 pub mod search {
     pub const FILES: &str = "search.files";
     pub const CONTENT: &str = "search.content";
+    /// 符号检索：按名字在源码里找函数 / 结构体 / 类 / 枚举 / 接口 / trait / 常量 / 方法。
+    ///
+    /// 与 [`CONTENT`] 的区别是**语义层级**：内容检索给的是「哪一行的文本里有这个词」，
+    /// 符号检索给的是「这个声明定义在哪、覆盖到哪一行」。前端据此做「跳到定义」，
+    /// 而不是把命中行当文本展示。
+    pub const SYMBOLS: &str = "search.symbols";
 }
 
 /// Provider 与模型管理（M2，已在 `crates/core` 接线）。
@@ -60,6 +66,19 @@ pub mod llm {
     pub const CANCEL: &str = "llm.cancel";
     pub const LIST_MODELS: &str = "llm.list_models";
     pub const COUNT_TOKENS: &str = "llm.count_tokens";
+}
+
+/// Inline Edit（M3 切片三：选区改写）。
+///
+/// 与 `llm.chat_stream` 的分工：那条是「对话」，流式、多轮、由 UI 拼消息；
+/// 这条是「编辑器里的一个动作」——给一段选区与一句指令，要回一段可直接落盘的替换文本。
+/// 因此它一次调用即返回完整结果，不走 `llm.*` 事件族，也不产生会话消息。
+pub mod inline_edit {
+    /// 依据指令改写文件中的一段选区，返回替换文本与 unified diff。
+    ///
+    /// 内核**不写盘**：结果只描述「应该改成什么」，落盘由外壳走 `workspace.write_file`
+    /// （带 `expected_hash` 乐观锁）。这样用户按 Esc 放弃时不需要任何撤销逻辑。
+    pub const PROPOSE: &str = "inline_edit.propose";
 }
 
 /// Agent 运行时（M4：协议面先定稿，`crates/core` 的接线随后落地）。
@@ -182,7 +201,7 @@ pub mod mcp {
 
 /// 插件宿主（P0 协议骨架）。
 ///
-/// 只有这 11 个方法属于**内核协议**：它们进 [`IMPLEMENTED`]、进 `core.hello`
+/// 只有这 12 个方法属于**内核协议**：它们进 [`IMPLEMENTED`]、进 `core.hello`
 /// 的能力清单、进外壳 `policy.ts` 白名单、由 ts-rs 导出类型。目录里的
 /// `plugin/*`（宿主 → 插件）与 `host/*`（插件 → 宿主）是插件包内部协议，
 /// **不进**这张表——混进来会让能力清单不再是「静态可审计」的（见 docs/14 §6.1）。
@@ -201,6 +220,13 @@ pub mod plugin {
     pub const UNINSTALL: &str = "plugin.uninstall";
     /// 授权齐备则起子进程并握手。
     pub const LOAD: &str = "plugin.load";
+    /// 批量并发装载（P5 切片八）：一次请求装多个插件，单个失败不影响其他。
+    ///
+    /// 与 [`LOAD`] 分开而不是让外壳循环调 `load`：并发上限、部分失败的结果归集、
+    /// 「同 id 只装一次」这三件事需要一个**可观测**的执行器来保证，散在渲染端
+    /// 循环里既测不到也说不清。单插件语义与 [`LOAD`] 完全一致（共用同一段装载
+    /// 实现），差别只在调度。
+    pub const LOAD_MANY: &str = "plugin.load_many";
     /// 停进程并把工具从 agent 注册表下架。
     pub const UNLOAD: &str = "plugin.unload";
     /// 停 + 起，用于开发调试。
@@ -218,6 +244,34 @@ pub mod plugin {
     pub const GRANT: &str = "plugin.grant";
     /// 撤销能力（关键能力则连带 unload）。
     pub const REVOKE: &str = "plugin.revoke";
+}
+
+/// 语言服务（LSP，切片二：内核已接线）。
+///
+/// 五个动作覆盖一条语言服务器连接的完整生命周期：`start` 起进程并握手、`sync`
+/// 把编辑缓冲推过去、`request` 发一次查询、`servers` 自查存活、`stop` 收掉。
+/// 形状与 [`terminal`] 同构，但有两点不同：
+///
+/// 1. **没有字节流**：语言服务器的输出是结构化结果（诊断 / 补全 / 悬停），
+///    诊断走 [`event::LSP_DIAGNOSTICS`] 单向推送，不需要 `lsp.data` 那种基座。
+/// 2. **`stop` 只认 `server_id`**：终端杀会话同理，但这里没有 `pid` 这类入参——
+///    进程归内核管，客户端能决定的只有「关哪一条连接」。
+///
+/// 五个方法整组坐在 [`IMPLEMENTED`] 里（能力数 74 → 79）：`crates/core` 的
+/// `dispatch.rs` 有五个真分支，实现在 `lsp_api.rs`，连接池按
+/// `workspace_id → server_id` 复用。诊断不走请求-应答，是
+/// [`event::LSP_DIAGNOSTICS`] 单向推送。
+pub mod lsp {
+    /// 为某个文件（或显式 `language_id`）起一条语言服务器连接。
+    pub const START: &str = "lsp.start";
+    /// 关掉一条连接（`shutdown` → `exit`，超时强杀兜底）。幂等：已关再关不报错。
+    pub const STOP: &str = "lsp.stop";
+    /// 列当前活着的连接（掉线重连后靠它捡回 `server_id`）。
+    pub const SERVERS: &str = "lsp.servers";
+    /// 发一次查询：定义 / 引用 / 悬停 / 补全（方法由枚举限定，不收自由字符串）。
+    pub const REQUEST: &str = "lsp.request";
+    /// 把编辑器里的文本同步给服务器（必要时自动 `didOpen` / `didChange`）。
+    pub const SYNC: &str = "lsp.sync";
 }
 
 /// Core → Main 的通知（事件）。
@@ -254,6 +308,13 @@ pub mod event {
     pub const TERMINAL_DATA: &str = "terminal.data";
     /// 终端子进程退出（M6）：自然结束、崩溃、被 `terminal.kill` 杀掉都走它。
     pub const TERMINAL_EXIT: &str = "terminal.exit";
+
+    /// 语言服务器推来一批诊断（切片一）。
+    ///
+    /// **整篇替换，不做增量**：服务器每次 `publishDiagnostics` 给的都是某文件的
+    /// 全量清单，按增量下发会让外壳自己维护「上一条还在不在」，一旦漏掉一条
+    /// 就永久残留一个红点。空数组表示「这个文件现在没毛病了」，必须转发。
+    pub const LSP_DIAGNOSTICS: &str = "lsp.diagnostics";
 }
 
 /// 内核**真正接线并可路由**的方法全集，用于单测与能力声明。
@@ -285,6 +346,7 @@ pub const IMPLEMENTED: &[&str] = &[
     workspace::REVEAL,
     search::FILES,
     search::CONTENT,
+    search::SYMBOLS,
     provider::UPSERT,
     provider::LIST,
     provider::DELETE,
@@ -296,6 +358,8 @@ pub const IMPLEMENTED: &[&str] = &[
     llm::CANCEL,
     llm::LIST_MODELS,
     llm::COUNT_TOKENS,
+    // M3 切片三：Inline Edit 内核面（一次调用返回替换文本 + unified diff，不写盘）。
+    inline_edit::PROPOSE,
     // M4 第三切片：agent 运行时（协议面与 core 接线均已落地）。
     agent::START,
     agent::STOP,
@@ -346,6 +410,8 @@ pub const IMPLEMENTED: &[&str] = &[
     plugin::INSTALL,
     plugin::UNINSTALL,
     plugin::LOAD,
+    // P5 切片八：批量并发装载（调度器在 `crates/core/src/plugin_api.rs`，能力数 79 → 80）。
+    plugin::LOAD_MANY,
     plugin::UNLOAD,
     plugin::RELOAD,
     plugin::CALL,
@@ -353,17 +419,22 @@ pub const IMPLEMENTED: &[&str] = &[
     plugin::COMMAND,
     plugin::GRANT,
     plugin::REVOKE,
+    // LSP 切片二：语言服务五个方法接线完成（实现在 `crates/core/src/lsp_api.rs`，
+    // 端到端用例在 `crates/core/tests/lsp_flow.rs`）。能力数 74 → 79。
+    lsp::START,
+    lsp::STOP,
+    lsp::SERVERS,
+    lsp::REQUEST,
+    lsp::SYNC,
 ];
 
 /// 协议面**已定义、但内核尚未接线**的方法。
 ///
-/// **M2 收尾后本表为空**：`provider.*` / `model.*` / `llm.*` 都已接进
-/// `crates/core` 的 `dispatch.rs`（M4 的 `agent.*` 也已接线，直接进
-/// [`IMPLEMENTED`]）。空表不是「这个机制没用」——它是给后续里程碑
-/// （M5 持久化、M6 终端与 Git、M7 MCP…）留的位置：协议先行定义、实现后补，
-/// 谁没接线谁就待在这里。
+/// M2 收尾时本表清空过一次；LSP 切片一曾临时装入 `lsp.*` 五项，切片二接线后
+/// 再次清空。保留这张表而不是删掉，是因为「先定义方法名、后接线」是这套协议的
+/// 既定做法：让「未实现」在协议层就有一等公民的位置，而不是让人误以为名字写错了。
 ///
-/// 它们**不能**出现在 [`IMPLEMENTED`] 里：`IMPLEMENTED` 会经 `core.hello`
+/// 表里的名字**不能**出现在 [`IMPLEMENTED`] 里：`IMPLEMENTED` 会经 `core.hello`
 /// 回报给 Main 作为能力清单，一旦虚报，Main 会照单调用、然后拿到一片 `-32601`。
 /// 接线时把对应常量从本表移入 [`IMPLEMENTED`]，两张表始终互斥。
 pub const DECLARED_NOT_IMPLEMENTED: &[&str] = &[];
@@ -374,11 +445,13 @@ mod tests {
 
     #[test]
     fn implemented_list_covers_core_m1_m2_agent_domains() {
-        assert_eq!(IMPLEMENTED.len(), 72);
+        assert_eq!(IMPLEMENTED.len(), 80);
         assert!(IMPLEMENTED.contains(&"core.ping"));
         assert!(IMPLEMENTED.contains(&"$/cancelRequest"));
         assert!(IMPLEMENTED.contains(&"workspace.read_file"));
         assert!(IMPLEMENTED.contains(&"search.content"));
+        // M3 切片一：符号检索进清单，与 `search.files` / `search.content` 同族。
+        assert!(IMPLEMENTED.contains(&search::SYMBOLS));
         assert!(IMPLEMENTED.contains(&provider::UPSERT));
         assert!(IMPLEMENTED.contains(&model::DELETE));
         // M2 收尾：`llm.*` 四个方法进清单，能力声明与 dispatch 分支一致。
@@ -386,6 +459,9 @@ mod tests {
         assert!(IMPLEMENTED.contains(&llm::CANCEL));
         assert!(IMPLEMENTED.contains(&llm::LIST_MODELS));
         assert!(IMPLEMENTED.contains(&llm::COUNT_TOKENS));
+        // M3 切片三：Inline Edit 内核面进清单，dispatch 有真分支（非 6101 式占位）。
+        assert!(IMPLEMENTED.contains(&inline_edit::PROPOSE));
+        assert_eq!(inline_edit::PROPOSE, "inline_edit.propose");
         // M4 第三切片：`agent.*` 三个方法进清单（协议面与 core 接线均已落地）。
         assert!(IMPLEMENTED.contains(&agent::START));
         assert!(IMPLEMENTED.contains(&agent::STOP));
@@ -448,12 +524,14 @@ mod tests {
         // P0 插件协议骨架：10 个方法进清单（dispatch 分支统一回 6101），
         // 而 `plugin/*` / `host/*` 这类插件包内部方法一律不进。
         // P5 切片二补第 11 个：`plugin.command`（命令网关，真实实现）。
+        // P5 切片八补第 12 个：`plugin.load_many`（批量并发装载）。
         for name in [
             plugin::LIST,
             plugin::STATUS,
             plugin::INSTALL,
             plugin::UNINSTALL,
             plugin::LOAD,
+            plugin::LOAD_MANY,
             plugin::UNLOAD,
             plugin::RELOAD,
             plugin::CALL,
@@ -466,18 +544,44 @@ mod tests {
         assert_eq!(plugin::LIST, "plugin.list");
         assert_eq!(plugin::CALL, "plugin.call");
         assert_eq!(plugin::COMMAND, "plugin.command");
+        assert_eq!(plugin::LOAD_MANY, "plugin.load_many");
         assert!(!IMPLEMENTED.iter().any(|name| name.starts_with("host/")));
         assert!(!IMPLEMENTED.iter().any(|name| name.starts_with("plugin/")));
     }
 
+    /// LSP 切片二：五个方法接线后**进**能力清单。
+    ///
+    /// 这条测试钉住两件事：字面量（外壳按这些字符串发请求）与落表位置
+    /// （在 `IMPLEMENTED` 而非待接线表）。能力数从 74 涨到 79 也是在这里
+    /// 定死的——虚报能力比不报更糟，漏报则让外壳以为功能不存在。
     #[test]
-    fn declared_table_is_empty_after_m2_wiring() {
-        // M2 把 `llm.*` 接进 dispatch 后，没有「定义了但没接线」的方法了。
-        // 一旦有人新增协议方法却忘了接线，这里会先响——比 Main 侧收到
-        // 一片 `-32601` 才发现要好得多。
+    fn lsp_methods_are_wired_into_the_capability_surface() {
+        assert_eq!(lsp::START, "lsp.start");
+        assert_eq!(lsp::STOP, "lsp.stop");
+        assert_eq!(lsp::SERVERS, "lsp.servers");
+        assert_eq!(lsp::REQUEST, "lsp.request");
+        assert_eq!(lsp::SYNC, "lsp.sync");
+        for name in [lsp::START, lsp::STOP, lsp::SERVERS, lsp::REQUEST, lsp::SYNC] {
+            assert!(IMPLEMENTED.contains(&name), "{name} 应已进能力清单");
+            assert!(
+                !DECLARED_NOT_IMPLEMENTED.contains(&name),
+                "{name} 已接线，不该留在待接线表里"
+            );
+        }
+        // 诊断是单向通知，永远不进能力清单（见 events_are_not_part_of_the_capability_surface）。
+        assert_eq!(event::LSP_DIAGNOSTICS, "lsp.diagnostics");
+        assert!(!DECLARED_NOT_IMPLEMENTED.contains(&event::LSP_DIAGNOSTICS));
+    }
+
+    #[test]
+    fn declared_table_is_empty_after_lsp_wiring() {
+        // M2 收尾时本表为空；LSP 切片一临时装过五个方法，切片二接线后再次清空。
+        // 一旦有人新增协议方法却忘了接线、或接线后忘了挪表，这里会先响——
+        // 比 Main 侧收到一片 `-32601` 才发现要好得多。
         assert!(
             DECLARED_NOT_IMPLEMENTED.is_empty(),
-            "M2 收尾后待接线方法表应为空，实际：{DECLARED_NOT_IMPLEMENTED:?}"
+            "待接线表应为空：{:?}",
+            DECLARED_NOT_IMPLEMENTED
         );
         for name in [
             llm::CHAT_STREAM,
@@ -497,9 +601,12 @@ mod tests {
         all.sort_unstable();
         all.dedup();
         assert_eq!(all.len(), total, "两张表不得有重叠");
+        // LSP 五个接线后已接线 79；P5 切片八补 `plugin.load_many` 后为 80、待接线 0。
+        assert_eq!(IMPLEMENTED.len(), 80, "P5 切片八后应为 80 个已接线方法");
+        assert_eq!(DECLARED_NOT_IMPLEMENTED.len(), 0);
         assert_eq!(
-            total, 72,
-            "应恰好覆盖协议里定义的全部 72 个请求方法（P5 切片二补 `plugin.command`）"
+            total, 80,
+            "应恰好覆盖协议里定义的全部 80 个请求方法（含 LSP 五个与 plugin.load_many）"
         );
     }
 
@@ -531,6 +638,7 @@ mod tests {
             event::AGENT_FINISHED,
             event::TERMINAL_DATA,
             event::TERMINAL_EXIT,
+            event::LSP_DIAGNOSTICS,
         ] {
             assert!(!IMPLEMENTED.contains(&event), "事件不该进能力清单: {event}");
             assert!(
@@ -574,6 +682,7 @@ mod tests {
         assert_eq!(workspace::READ_FILE, "workspace.read_file");
         assert_eq!(workspace::WRITE_FILE, "workspace.write_file");
         assert_eq!(search::FILES, "search.files");
+        assert_eq!(search::SYMBOLS, "search.symbols");
         assert_eq!(event::WORKSPACE_CHANGED, "workspace.changed");
     }
 }

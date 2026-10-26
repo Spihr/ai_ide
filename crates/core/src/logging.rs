@@ -50,8 +50,15 @@ pub const LOG_PROBE_ENV: &str = "AI_IDE_LOG_PROBE";
 /// 单个 JSONL 文件的滚动上限（32 MiB）。超出后追加序号后缀。
 pub const MAX_BYTES: u64 = 32 * 1024 * 1024;
 
-/// 文件名前缀；同日多份时形如 `core-2026-10-22-1.jsonl`。
+/// 内核自身日志的文件名前缀；同日多份时形如 `core-2026-10-22-1.jsonl`。
 const FILE_PREFIX: &str = "core";
+
+/// 插件日志的文件名前缀（P5 切片八）：`plugin-2026-10-22.jsonl`。
+///
+/// 与 `core-*` 分开一份的理由是**读的人不同**：内核日志是排查内核自身的，
+/// 插件日志是排查插件行为的，混在一个文件里，`grep plugin_id` 会同时捞到
+/// 「内核替插件记的事件」与「插件自己说的话」，分不清该怪谁。
+pub const PLUGIN_FILE_PREFIX: &str = "plugin";
 
 /// 读一个「开关型」环境变量：只有明确的假值才算关。
 fn flag(name: &str, default: bool) -> bool {
@@ -80,6 +87,23 @@ pub fn log_dir() -> PathBuf {
         Some(dir) => PathBuf::from(dir),
         None => crate::llm_runtime::default_data_dir().join("logs"),
     }
+}
+
+/// 插件日志写入器（P5 切片八）：与内核日志同目录、同滚动规则、同脱敏开关，
+/// 只是文件名前缀换成 `plugin`。
+///
+/// 返回 `None` 表示落盘被关掉（`AI_IDE_LOG_JSONL=off`）——那时插件日志只走
+/// 事件通道，「插件日志有磁盘副本」这条保证也随之关闭，是显式选择而非静默降级。
+pub fn plugin_log_writer() -> Option<DailyJsonlWriter> {
+    if !jsonl_enabled() {
+        return None;
+    }
+    Some(DailyJsonlWriter::with_prefix(
+        log_dir(),
+        PLUGIN_FILE_PREFIX,
+        redact_enabled(),
+        MAX_BYTES,
+    ))
 }
 
 /// Unix 天数 → `(年, 月, 日)`（Howard Hinnant 的 `civil_from_days`）。
@@ -126,6 +150,8 @@ struct State {
 
 struct Inner {
     dir: PathBuf,
+    /// 文件名前缀（`core` / `plugin`）：决定写进哪个文件族。
+    prefix: String,
     redact: bool,
     max_bytes: u64,
     state: Mutex<State>,
@@ -143,6 +169,7 @@ impl std::fmt::Debug for DailyJsonlWriter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DailyJsonlWriter")
             .field("dir", &self.inner.dir)
+            .field("prefix", &self.inner.prefix)
             .field("redact", &self.inner.redact)
             .field("max_bytes", &self.inner.max_bytes)
             .finish()
@@ -155,11 +182,26 @@ impl DailyJsonlWriter {
         Self::with_options(dir, redact_enabled(), MAX_BYTES)
     }
 
-    /// 显式指定目录、脱敏开关与单文件上限。
+    /// 显式指定目录、脱敏开关与单文件上限（内核日志，前缀 `core`）。
     pub fn with_options(dir: impl Into<PathBuf>, redact: bool, max_bytes: u64) -> Self {
+        Self::with_prefix(dir, FILE_PREFIX, redact, max_bytes)
+    }
+
+    /// 显式指定目录、**文件名前缀**、脱敏开关与单文件上限。
+    ///
+    /// 插件日志与内核日志共用这一套滚动 / 脱敏 / 断行逻辑，只是文件族不同：
+    /// 复制一份写入器只为了换个文件名，等于把「一行一条 JSON」「按天滚动」
+    /// 这些约束抄两遍，迟早抄歪一处。
+    pub fn with_prefix(
+        dir: impl Into<PathBuf>,
+        prefix: impl Into<String>,
+        redact: bool,
+        max_bytes: u64,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 dir: dir.into(),
+                prefix: prefix.into(),
                 redact,
                 max_bytes: max_bytes.max(1),
                 state: Mutex::new(State {
@@ -254,15 +296,19 @@ impl DailyJsonlWriter {
         Ok(())
     }
 
-    /// 文件名：`core-<day>.jsonl` / `core-<day>-<n>.jsonl`。
+    /// 文件名：`<prefix>-<day>.jsonl` / `<prefix>-<day>-<n>.jsonl`。
     fn path_for(&self, day: &str, index: u32) -> PathBuf {
+        let prefix = &self.inner.prefix;
         if index == 0 {
-            self.inner.dir.join(format!("{FILE_PREFIX}-{day}.jsonl"))
+            self.inner.dir.join(format!("{prefix}-{day}.jsonl"))
         } else {
-            self.inner
-                .dir
-                .join(format!("{FILE_PREFIX}-{day}-{index}.jsonl"))
+            self.inner.dir.join(format!("{prefix}-{day}-{index}.jsonl"))
         }
+    }
+
+    /// 目录 + 前缀（测试与文档用：断言这两个值比读文件名更稳）。
+    pub fn prefix(&self) -> &str {
+        &self.inner.prefix
     }
 }
 
@@ -332,7 +378,7 @@ where
         let mut object = serde_json::Map::new();
         object.insert(
             "timestamp".to_string(),
-            serde_json::Value::String(iso8601_now()),
+            serde_json::Value::String(now_iso8601()),
         );
         object.insert(
             "level".to_string(),
@@ -399,7 +445,7 @@ impl tracing::field::Visit for JsonVisitor {
 }
 
 /// 当前时刻的 ISO-8601（UTC，毫秒精度）。
-fn iso8601_now() -> String {
+pub fn now_iso8601() -> String {
     let dur = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
@@ -508,6 +554,34 @@ mod tests {
         let text = read_all(&dir);
         assert!(!text.contains(secret), "明文密钥不该落盘：{text}");
         assert!(text.contains("***"), "应留下打码痕迹：{text}");
+    }
+
+    /// 插件日志必须落进 `plugin-*` 这一族文件，不能和内核日志混在一起。
+    #[test]
+    fn plugin_writer_keeps_its_own_file_family() {
+        let dir = temp_dir("plugin-prefix");
+        let mut writer = DailyJsonlWriter::with_prefix(&dir, PLUGIN_FILE_PREFIX, true, MAX_BYTES);
+        writer
+            .write_all(b"{\"pluginId\":\"demo\"}\n")
+            .expect("写入");
+        writer.flush().expect("刷新");
+
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .expect("列目录")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names
+                .iter()
+                .any(|name| name.starts_with("plugin-") && name.ends_with(".jsonl")),
+            "应落在 plugin-*.jsonl：{names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name.starts_with("core-")),
+            "插件日志不该写进内核文件族：{names:?}"
+        );
+        assert_eq!(writer.prefix(), PLUGIN_FILE_PREFIX);
     }
 
     #[test]

@@ -17,6 +17,7 @@ import type {
   ContentMatch,
   Eol,
   FileMatch,
+  Symbol,
   TreeEntry,
   WorkspaceChangedEvent,
   WorkspaceIndexedEvent,
@@ -74,6 +75,16 @@ export interface EditorSelection {
   startLine: number
   /** 结束行（1-based，含）。 */
   endLine: number
+  /**
+   * 起始列（**0-based**，含）——与内核 `TextSelection.start_column` 同一口径。
+   *
+   * 列是可选的两件事之一：对话面板的「引用」只要行范围，而 Inline Edit（Ctrl+K）
+   * 必须精确到列，否则「把这一行改成早退」会把整行连同缩进一起重写。老的上报方
+   * （或测试）不传列时，`null` 语义由使用方决定：引用照旧、改写按整行处理。
+   */
+  startColumn?: number
+  /** 结束列（0-based，不含）。缺失时表示「到该行行尾」。 */
+  endColumn?: number
 }
 
 /** 内容搜索点击后要在编辑器里定位的位置。 */
@@ -110,6 +121,17 @@ export interface EditorState {
   contentTruncated: boolean
   searching: boolean
   searchError: string | null
+  /**
+   * 符号检索（`search.symbols`）的输入与结果。
+   *
+   * 与文件名 / 内容两组并列、而不是塞进 `searching` / `searchError`：符号浮层和搜索
+   * 面板的「符号」模式共用这一份结果，共用一个 loading 标志会让两处互相把对方的
+   * 「检索中…」掐掉。
+   */
+  symbolQuery: string
+  symbolMatches: Symbol[]
+  symbolSearching: boolean
+  symbolError: string | null
   notice: Notice | null
   /** 待执行的编辑器跳转。 */
   reveal: RevealTarget | null
@@ -133,6 +155,10 @@ const initialState: EditorState = {
   contentTruncated: false,
   searching: false,
   searchError: null,
+  symbolQuery: '',
+  symbolMatches: [],
+  symbolSearching: false,
+  symbolError: null,
   notice: null,
   reveal: null
 }
@@ -188,6 +214,16 @@ function relPath(absPath: string): string {
   const base = normalize(root).replace(/\/+$/, '')
   if (target === base) return ''
   return target.startsWith(`${base}/`) ? target.slice(base.length + 1) : absPath
+}
+
+/**
+ * 绝对路径 → 相对工作区根的路径（`/` 分隔）。不在工作区内时原样返回。
+ *
+ * 对外暴露的理由：`inline_edit.propose` 的 `path` 与 `workspace.*` 同口径（相对根、
+ * 正斜杠），而 Inline Edit 的浮层活在独立 store 里，拿不到这里的私有函数。
+ */
+export function workspaceRelativePath(absPath: string): string {
+  return relPath(absPath)
 }
 
 function parentRel(rel: string): string {
@@ -420,6 +456,18 @@ export function updateContent(path: string, content: string): void {
   patchTab(path, { content })
 }
 
+/**
+ * 由外壳自己写盘之后的回填（Inline Edit 接受建议走这里）。
+ *
+ * 与 `saveTab` 的区别只有「谁发起写」：写请求已经由 `inline-edit-store` 发完了，
+ * 这里只把内存里的标签对齐到磁盘上的新状态——`content` 与 `savedContent` 一起换，
+ * 于是标签算干净（没有未保存改动），`hash` 换成写回后的新值，否则下一次保存会拿旧
+ * hash 去撞 CAS 直接失败。
+ */
+export function applyWrittenContent(path: string, content: string, hash: string): void {
+  patchTab(path, { content, savedContent: content, hash, error: null })
+}
+
 /** 保存标签；返回是否真的写盘。 */
 export async function saveTab(path?: string): Promise<boolean> {
   const target = path ?? state.activePath
@@ -448,7 +496,15 @@ export async function saveTab(path?: string): Promise<boolean> {
 function sameSelection(a: EditorSelection | null, b: EditorSelection | null): boolean {
   if (a === b) return true
   if (!a || !b) return false
-  return a.path === b.path && a.startLine === b.startLine && a.endLine === b.endLine
+  // 列也要比：单选一行内拖动时行号没变，只有列在变；漏掉列会让选区快照永远停在
+  // 第一次上报的位置，Ctrl+K 拿到的是几秒前的那一段。
+  return (
+    a.path === b.path &&
+    a.startLine === b.startLine &&
+    a.endLine === b.endLine &&
+    a.startColumn === b.startColumn &&
+    a.endColumn === b.endColumn
+  )
 }
 
 /**
@@ -470,6 +526,19 @@ export function setEditorSelection(selection: EditorSelection | null): void {
     path: selection.path,
     startLine: Math.min(startLine, endLine),
     endLine: Math.max(startLine, endLine)
+  }
+  // 列是可选的：只有两端都是 ≥0 的整数才采纳，否则保持「整行」语义——宁可把范围
+  // 放宽到行，也不要拿一个半截的列去让内核按越界拒绝（9001）。
+  const startColumn = selection.startColumn
+  const endColumn = selection.endColumn
+  if (
+    Number.isInteger(startColumn) &&
+    Number.isInteger(endColumn) &&
+    (startColumn as number) >= 0 &&
+    (endColumn as number) >= 0
+  ) {
+    next.startColumn = startColumn
+    next.endColumn = endColumn
   }
   if (sameSelection(state.selection, next)) return
   set({ selection: next })
@@ -555,6 +624,66 @@ export async function runContentSearch(
 /** 搜索结果点击：打开文件并请求编辑器定位到行列。 */
 let revealNonce = 0
 
+/**
+ * 符号检索的请求序号。
+ *
+ * 符号检索是「逐字符触发 + 内核扫全库」，先发的请求完全可能后到。只让**最后一次**
+ * 请求写回结果，否则输入 `run` 之后你会看到 `ru` 的命中把 `run` 的命中盖掉。
+ */
+let symbolRequestSeq = 0
+
+/**
+ * 符号检索。
+ *
+ * `allowEmpty`：快速选择器（`Ctrl+T`）一打开就要有东西可选，空串必须真的发请求
+ * （内核按空 query 列出全部符号）；搜索面板的「符号」模式则沿袭文件名 / 内容的习惯，
+ * 空输入直接清空结果，不发无意义的全库扫描。
+ */
+export async function runSymbolSearch(
+  query: string,
+  options: { allowEmpty?: boolean } = {}
+): Promise<void> {
+  set({ symbolQuery: query })
+  const workspace = state.workspace
+  if (!workspace) {
+    // 没有工作区就没有符号可搜：顺手清掉上一个工作区留下来的结果，
+    // 否则浮层会在「未打开工作区」的空状态下继续显示别的项目的符号。
+    set({ symbolMatches: [], symbolSearching: false, symbolError: null })
+    return
+  }
+  const trimmed = query.trim()
+  if (trimmed === '' && options.allowEmpty !== true) {
+    set({ symbolMatches: [], symbolError: null })
+    return
+  }
+  const seq = (symbolRequestSeq += 1)
+  set({ symbolSearching: true, symbolError: null })
+  try {
+    const result = await workspaceApi.searchSymbols(workspace.workspace_id, trimmed)
+    if (seq !== symbolRequestSeq) return
+    set({ symbolMatches: result.symbols, symbolSearching: false })
+  } catch (error) {
+    if (seq !== symbolRequestSeq) return
+    set({ symbolSearching: false, symbolError: cleanMessage(error) })
+  }
+}
+
+/**
+ * 符号跳转：打开 `symbol.path` 并把光标放到 `range.start_line`。
+ *
+ * 协议里 `range` 只有行、没有列（见 docs/03 的 `SymbolRange`），所以列固定给 1——
+ * 编辑器那边收到列 1 就是把光标放到行首，正是「转到符号」该有的落点。
+ */
+export async function openSymbol(symbol: Symbol): Promise<void> {
+  await openMatch(symbol.path, symbol.range.start_line, 1)
+}
+
+/**
+ * 打开（或切到）某个文件，并把光标定位到 `line` / `column`（1-based）。
+ *
+ * `symbol.path` 与文件树的相对路径同形，所以「转到符号」直接复用这条通道，
+ * 不必再造一条只给符号用的打开逻辑。
+ */
 export async function openMatch(
   relPathFromRoot: string,
   line: number,

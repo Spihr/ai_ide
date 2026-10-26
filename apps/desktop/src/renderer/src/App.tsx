@@ -12,18 +12,25 @@ import { CommandPalette } from './components/CommandPalette'
 import { EditorTabs } from './components/EditorTabs'
 import { FileTree } from './components/FileTree'
 import { GitPanel } from './components/GitPanel'
+import { InlineEditOverlay } from './components/InlineEditOverlay'
+import { LspBridge } from './components/LspBridge'
 import { McpPanel } from './components/McpPanel'
 import { PermissionPanel } from './components/PermissionPanel'
 import { PluginPanel } from './components/PluginPanel'
 import { SearchPanel } from './components/SearchPanel'
 import { StatusBar } from './components/StatusBar'
+import { SymbolPicker } from './components/SymbolPicker'
 import { PluginActivityPanel } from './components/PluginActivityPanel'
 import { TerminalPanel } from './components/TerminalPanel'
 import { initCheckpoints } from './checkpoint-store'
 import { togglePalette } from './command-palette-store'
 import { initGit } from './git-store'
+import { openInlineEdit } from './inline-edit-store'
 import { initSessions } from './session-store'
+import { initCoreLogEvents } from './core-log-store'
 import { initPluginActivityEvents } from './plugin-activity-store'
+import { resolveShortcut } from './shortcuts'
+import { toggleSymbolPicker } from './symbol-picker-store'
 import { initTerminalEvents, toggleTerminalPanel } from './terminal-store'
 import {
   closeWorkspace,
@@ -77,6 +84,12 @@ export function App() {
      * 是发生在你没看着面板的时候。
      */
     const offPluginActivity = initPluginActivityEvents()
+    /*
+     * P5 切片八：内核日志（stderr + `core.log` 通知）同样常驻。这条订阅必须
+     * 最早挂上——内核启动失败的那几行恰好落在窗口刚建好的瞬间，晚一步订阅，
+     * 用户点开状态栏只会看到一句 `failed`，上下文全在磁盘里。
+     */
+    const offCoreLog = initCoreLogEvents()
     // M6：Git 状态是「工作区内容」的视图——`git.*` 没有自己的事件，靠 `workspace.changed`
     // 去抖后重拉。订阅常驻，这样活动栏角标在别的视图里也能实时对上。
     const offGit = initGit()
@@ -86,34 +99,45 @@ export function App() {
       offWorkspace()
       offTerminal()
       offPluginActivity()
+      offCoreLog()
       offGit()
       disposeAi()
     }
   }, [])
 
-  // 窗口级快捷键
+  // 窗口级快捷键：解析落在 `shortcuts.ts`（纯函数，单测覆盖），这里只做分发。
+  // 顺序敏感的 `Ctrl+Shift+P` / `Ctrl+P`、`Ctrl+Shift+...` 都在那边判完，避免这段
+  // if/else 越加越长以后被后来的组合键吃掉。
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent): void => {
-      if (!event.ctrlKey && !event.metaKey) return
-      const key = event.key.toLowerCase()
-      if (key === 's' && !event.shiftKey) {
-        event.preventDefault()
-        void saveTab()
-      } else if (key === 'p' && event.shiftKey) {
-        // Ctrl/Cmd+Shift+P：全局命令面板（FR-1.7）。必须排在纯 Ctrl+P 之前，
-        // 否则 shift+p 会先被「切到搜索」吃掉——`event.key` 已经把 shift 归一成 'P'。
-        event.preventDefault()
-        togglePalette()
-      } else if (key === 'p') {
-        event.preventDefault()
-        setActivity('search')
-      } else if (key === 'b') {
-        event.preventDefault()
-        setActivity('explorer')
-      } else if (key === '`' && !event.metaKey) {
-        // Ctrl+` 开关终端面板（与 VS Code 一致）；不拦 Meta 组合，避免抢系统快捷键。
-        event.preventDefault()
-        void toggleTerminalPanel()
+      const action = resolveShortcut(event)
+      if (action === null) return
+      event.preventDefault()
+      switch (action) {
+        case 'save':
+          void saveTab()
+          break
+        case 'command-palette':
+          togglePalette()
+          break
+        case 'search':
+          setActivity('search')
+          break
+        case 'explorer':
+          setActivity('explorer')
+          break
+        case 'terminal':
+          void toggleTerminalPanel()
+          break
+        case 'symbols':
+          // Ctrl+T：转到符号（`search.symbols` 的浮层入口，与命令面板里的同名命令同源）。
+          toggleSymbolPicker()
+          break
+        case 'inline-edit':
+          // Ctrl+K：内联编辑。不判「有没有选区」——那件事由 `openInlineEdit` 做，
+          // 无选区时它只发提示，不会吞掉按键去干别的。
+          openInlineEdit()
+          break
       }
     }
     window.addEventListener('keydown', onKeyDown)
@@ -205,6 +229,7 @@ export function App() {
             <>
               <EditorTabs />
               <CodeEditor />
+              <LspBridge />
             </>
           ) : (
             <div className="welcome">
@@ -235,6 +260,12 @@ export function App() {
 
       {/* P5：全局命令面板是浮层，放在 body 之外、notice 之前——浮层要压住所有面板。 */}
       <CommandPalette />
+
+      {/* 切片二：Ctrl+T 的「转到符号」浮层，与命令面板同一个层级、同样的遮罩。 */}
+      <SymbolPicker />
+
+      {/* 切片三：Ctrl+K 的内联编辑浮层（指令输入 → diff 预览 → 接受/拒绝）。 */}
+      <InlineEditOverlay />
 
       {state.notice && (
         <div className={`notice notice--${state.notice.kind}`} onClick={dismissNotice} role="alert">

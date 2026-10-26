@@ -60,13 +60,15 @@ use ai_ide_plugin::{details_json, install as install_package, manifest, PackageE
 use ai_ide_protocol::dto::{
     PluginCallParams, PluginCallResult, PluginCommandParams, PluginCommandResult,
     PluginCommandSummary, PluginGrantParams, PluginGrantResult, PluginInstallParams,
-    PluginInstallResult, PluginListParams, PluginListResult, PluginLoadParams, PluginLoadResult,
+    PluginInstallResult, PluginListParams, PluginListResult, PluginLoadFailure, PluginLoadManyItem,
+    PluginLoadManyParams, PluginLoadManyResult, PluginLoadParams, PluginLoadResult,
     PluginReloadParams, PluginReloadResult, PluginRevokeParams, PluginRevokeResult, PluginState,
     PluginStatusParams, PluginStatusResult, PluginSummary, PluginToolRisk, PluginToolSummary,
     PluginUninstallParams, PluginUninstallResult, PluginUnloadParams, PluginUnloadResult,
 };
 use ai_ide_protocol::{ErrorCode, ErrorObject, Request};
 use ai_ide_store::{audit_kind, plugin_status, NewPlugin, PluginRecord, Store, StoreError};
+use futures_util::StreamExt;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 
@@ -441,6 +443,158 @@ pub async fn load(peer: &Peer, state: &AppState, req: &Request) {
             .await;
             peer.respond_error(&req.id, &err).await
         }
+    }
+}
+
+/// `plugin.load_many`：批量并发装载（P5 切片八）。
+///
+/// 与 [`load`] 共用同一段装载实现（[`load_into`]），差别只在**调度**：
+///
+/// - **并发**：不同插件同时装载，靠 `buffer_unordered(n)` 把 n 条装载 future
+///   一起推进（起进程与握手都是 IO 等待，串行做纯浪费）。这里不额外 `spawn`：
+///   装载需要借用 `&AppState`，起任务就得把整个状态机搬进 `'static`，收益不抵成本。
+/// - **上限**：`max_concurrent` 归一后落在 `1..=MAX_CONCURRENT_LIMIT`。上限是
+///   必要的——每个插件都是一个真实子进程 + 15s 握手窗口，外壳一次点「全部启用」
+///   不能把几十个进程一起怼上来。单次批量再限制 `MAX_PLUGINS` 条。
+/// - **同 id**：入参先去重（保留首次出现的位置）。即便外壳漏了去重，宿主侧
+///   per-id 闸门也会让第二次装载等第一次的结果，不会起第二个进程。
+/// - **部分失败**：单个插件失败只体现在它自己的 `error` 上，其余照常返回，
+///   不把整批变成一个 JSON-RPC 错误——「5 个里挂 1 个」时调用方要的是另外 4 个的结果。
+pub async fn load_many(peer: &Peer, state: &AppState, req: &Request) {
+    let Some(params) = require_params::<PluginLoadManyParams>(peer, req).await else {
+        return;
+    };
+    let max_concurrent = normalize_max_concurrent(params.max_concurrent);
+
+    // 去重保序 + 空值校验：空白 id 是畸形请求（-32602），静默丢弃会让外壳
+    // 以为「请求成功但少装了一个」，比报错更难排查。
+    let mut plugin_ids: Vec<String> = Vec::new();
+    for raw in &params.plugin_ids {
+        let plugin_id = raw.trim();
+        if plugin_id.is_empty() {
+            return peer
+                .respond_error(&req.id, &ErrorObject::invalid_params("plugin_id 不能为空"))
+                .await;
+        }
+        if !plugin_ids.iter().any(|seen| seen == plugin_id) {
+            plugin_ids.push(plugin_id.to_string());
+        }
+    }
+    if plugin_ids.len() > PluginLoadManyParams::MAX_PLUGINS {
+        return peer
+            .respond_error(
+                &req.id,
+                &ErrorObject::invalid_params(format!(
+                    "单次最多装载 {} 个插件，本次 {} 个",
+                    PluginLoadManyParams::MAX_PLUGINS,
+                    plugin_ids.len()
+                )),
+            )
+            .await;
+    }
+
+    let store = match store_of(state) {
+        Ok(store) => store,
+        Err(err) => return peer.respond_error(&req.id, &err).await,
+    };
+
+    // 巡检一次足够：`load_into` 本身不巡检，批次开始时统一做，避免 n 个装载各自
+    // 回库扫一遍崩溃插件。
+    sweep_crashed(state, store).await;
+
+    let outcomes: Vec<(usize, String, Result<PluginLoadResult, ErrorObject>)> =
+        futures_util::stream::iter(plugin_ids.iter().cloned().enumerate().map(
+            |(index, plugin_id)| async move {
+                let outcome = load_into(state, store, &plugin_id).await;
+                (index, plugin_id, outcome)
+            },
+        ))
+        .buffer_unordered(max_concurrent as usize)
+        .collect()
+        .await;
+
+    // `buffer_unordered` 按完成顺序产出，结果要按入参顺序排回去——调用方拿到的
+    // `items` 顺序必须与 `plugin_ids` 一致，否则它没法把结果和入参对齐。
+    let mut ordered = outcomes;
+    ordered.sort_by_key(|(index, _, _)| *index);
+
+    let mut items = Vec::with_capacity(ordered.len());
+    for (_, plugin_id, outcome) in ordered {
+        match outcome {
+            Ok(result) => {
+                plugin_audit::record_user(
+                    store,
+                    PluginAuditRow::new(
+                        audit_kind::PLUGIN_LIFECYCLE,
+                        &plugin_id,
+                        ACTION_LOAD,
+                        DECISION_ALLOW,
+                    )
+                    .target(Some(result.plugin.id.as_str()))
+                    .note("tools", json!(result.tools.len()))
+                    .note("state", json!(result.plugin.state))
+                    .note("batch", json!(true)),
+                )
+                .await;
+                items.push(PluginLoadManyItem {
+                    plugin_id,
+                    result: Some(result),
+                    error: None,
+                });
+            }
+            Err(err) => {
+                // 单插件失败也记审计：批次里「谁没起来、为什么」必须能事后对上。
+                plugin_audit::record_user(
+                    store,
+                    PluginAuditRow::new(
+                        audit_kind::PLUGIN_LIFECYCLE,
+                        &plugin_id,
+                        ACTION_LOAD,
+                        DECISION_DENY,
+                    )
+                    .note("code", json!(err.code.as_i32()))
+                    .note("message", json!(err.message))
+                    .note("batch", json!(true)),
+                )
+                .await;
+                items.push(PluginLoadManyItem {
+                    plugin_id,
+                    result: None,
+                    error: Some(PluginLoadFailure {
+                        code: err.code.as_i32(),
+                        message: err.message,
+                    }),
+                });
+            }
+        }
+    }
+
+    let succeeded = items.iter().filter(|item| item.result.is_some()).count();
+    tracing::info!(
+        requested = items.len(),
+        succeeded,
+        failed = items.len() - succeeded,
+        max_concurrent,
+        "批量装载结束"
+    );
+    peer.respond(
+        &req.id,
+        &PluginLoadManyResult {
+            items,
+            max_concurrent,
+        },
+    )
+    .await;
+}
+
+/// 归一 `plugin.load_many` 的并发度：缺省 4，`0` 视同缺省，超上限截断。
+///
+/// 不把越界值当参数错误：并发度是**性能偏好**而非语义参数，为它拒绝一次装载
+/// 只会让外壳多写一份兜底逻辑，而结果完全一样。
+fn normalize_max_concurrent(raw: Option<u32>) -> u32 {
+    match raw {
+        None | Some(0) => PluginLoadManyParams::DEFAULT_MAX_CONCURRENT,
+        Some(value) => value.min(PluginLoadManyParams::MAX_CONCURRENT_LIMIT),
     }
 }
 

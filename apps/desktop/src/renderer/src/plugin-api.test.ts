@@ -50,6 +50,14 @@ function installHarness(): Call[] {
       if (method === Methods.plugin.load) return { plugin: { name: 'x' }, tools: [] }
       if (method === Methods.plugin.reload) return { plugin: { name: 'x' }, tools: [] }
       if (method === Methods.plugin.unload) return { plugin_id: 'x', removed_tools: 0 }
+      if (method === Methods.plugin.loadMany) {
+        // 内核按入参顺序回 items，这里只回形状，具体结局由 plugin-store.test.ts 覆盖
+        const ids = ((params ?? {}) as { plugin_ids?: string[] }).plugin_ids ?? []
+        return {
+          items: ids.map((id) => ({ plugin_id: id, result: null, error: null })),
+          max_concurrent: 4
+        }
+      }
       throw new Error(`测试收到了意外方法：${method}`)
     }
   } as unknown as AiIdeApi
@@ -221,6 +229,7 @@ describe('API 封装', () => {
       Methods.plugin.status,
       Methods.plugin.uninstall,
       Methods.plugin.load,
+      Methods.plugin.loadMany,
       Methods.plugin.unload,
       Methods.plugin.reload
     ])
@@ -230,11 +239,27 @@ describe('API 封装', () => {
     await pluginApi.install('E:\\p')
     await pluginApi.uninstall('x.y')
     await pluginApi.load('x.y')
+    await pluginApi.loadMany(['x.y', 'z.w'])
     await pluginApi.unload('x.y')
     await pluginApi.reload('x.y')
 
     for (const call of calls) {
       expect(allowed.has(call.method), `${call.method} 不该由当前面板发起`).toBe(true)
     }
+  })
+
+  it('批量装载：默认并发度交给内核归一（null），显式传值才写进参数', async () => {
+    const calls = installHarness()
+
+    await pluginApi.loadMany(['a.one', 'b.two'])
+    await pluginApi.loadMany(['a.one'], 3)
+
+    expect(calls.map((call) => call.method)).toEqual([
+      Methods.plugin.loadMany,
+      Methods.plugin.loadMany
+    ])
+    // null 而不是省略或 0：0 在内核里有「按默认处理」的歧义，null 才是「没指定」
+    expect(calls[0]?.params).toEqual({ plugin_ids: ['a.one', 'b.two'], max_concurrent: null })
+    expect(calls[1]?.params).toEqual({ plugin_ids: ['a.one'], max_concurrent: 3 })
   })
 })

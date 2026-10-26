@@ -10,9 +10,14 @@ import { Methods } from '@ai-ide/shared-types'
 import type {
   CreateKind,
   Eol,
+  InlineEditProposeParams,
+  InlineEditProposeResult,
   OkResult,
   SearchContentResult,
   SearchFilesResult,
+  SearchSymbolsResult,
+  SymbolKind,
+  TextSelection,
   WorkspaceDeleteResult,
   WorkspaceOpenResult,
   WorkspaceReadFileResult,
@@ -24,6 +29,12 @@ function req<T>(method: string, params?: unknown): Promise<T> {
   return window.aiide.request(method, params) as Promise<T>
 }
 
+/** `search.symbols` 的可选参数。 */
+export interface SymbolSearchOptions {
+  /** 只保留这些 kind；缺省由内核返回全部 kind。 */
+  kinds?: SymbolKind[]
+}
+
 /** `search.content` 的可选参数。 */
 export interface ContentSearchOptions {
   isRegex?: boolean
@@ -31,6 +42,22 @@ export interface ContentSearchOptions {
   includes?: string[]
   excludes?: string[]
   maxResults?: number
+}
+
+/** `inline_edit.propose` 的可选参数。 */
+export interface InlineEditOptions {
+  /** 选区上下各带几行；`null` 交给内核用缺省 40。 */
+  contextLines?: number | null
+  /** 指定模型；`null` 走默认模型。 */
+  modelRef?: InlineEditProposeParams['model_ref']
+}
+
+/** `inline_edit.propose` 的必填部分：改哪个文件的哪一段、要改成什么。 */
+export interface InlineEditRequest {
+  /** 相对工作区根的路径，`/` 分隔。 */
+  path: string
+  instruction: string
+  selection: TextSelection
 }
 
 export const workspaceApi = {
@@ -97,6 +124,22 @@ export const workspaceApi = {
     })
   },
 
+  /**
+   * 符号检索（`search.symbols`）。`query` 为**子串**匹配，空串表示列出全部符号
+   * （内核上限 200 条，按相关度排序）——快速选择器一打开就要有东西可选，靠的就是它。
+   */
+  searchSymbols(
+    workspaceId: string,
+    query: string,
+    options: SymbolSearchOptions = {}
+  ): Promise<SearchSymbolsResult> {
+    return req<SearchSymbolsResult>(Methods.search.symbols, {
+      workspace_id: workspaceId,
+      query,
+      kinds: options.kinds ?? null
+    })
+  },
+
   searchContent(
     workspaceId: string,
     query: string,
@@ -110,6 +153,28 @@ export const workspaceApi = {
       includes: options.includes ?? [],
       excludes: options.excludes ?? [],
       max_results: options.maxResults ?? null
+    })
+  },
+
+  /**
+   * 选区改写建议（`inline_edit.propose`）。
+   *
+   * 注意契约：**内核不写盘**——回的是 `original` / `replacement` / `diff`，写不写
+   * 由外壳在用户点「接受」时决定（走 `writeFile`）。所以这里也没有预期 hash 参数：
+   * 真正写盘那一刻才需要 CAS。
+   */
+  inlineEditPropose(
+    workspaceId: string,
+    request: InlineEditRequest,
+    options: InlineEditOptions = {}
+  ): Promise<InlineEditProposeResult> {
+    return req<InlineEditProposeResult>(Methods.inlineEdit.propose, {
+      workspace_id: workspaceId,
+      path: request.path,
+      instruction: request.instruction,
+      selection: request.selection,
+      context_lines: options.contextLines ?? null,
+      model_ref: options.modelRef ?? null
     })
   }
 }

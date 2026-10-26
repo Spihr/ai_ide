@@ -1,0 +1,14 @@
+# rustfmt 配置（新增）
+#
+# 所有取值均与"当前代码在 rustfmt 默认配置下已通过"的现状一致：
+#   `cargo fmt --all -- --check` 在未加本文件时退出码 0，
+#   因此这里只把默认值显式化，不引入任何会改写现有代码的设置。
+# 验证：crates/ 下 156 个 .rs 文件 p99 行宽 89、仅 68 行超过 100，与 max_width = 100 吻合。
+edition = "2021"
+max_width = 100
+hard_tabs = false
+tab_spaces = 4
+# newline_style 保持默认 "Auto"，不强制 Unix：
+# 本机 core.autocrlf=true 检出后部分 .rs 工作副本是 CRLF，写死 "Unix" 会让
+# `cargo fmt --check` 直接报 Incorrect newline style（实测会导致门禁从 0 变 1）。
+# 换行符归一化属于 .gitattributes + 一次 renormalize 的职责，不由 rustfmt 承担。

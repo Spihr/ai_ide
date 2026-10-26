@@ -17,6 +17,12 @@ pub const PROTOCOL_VERSION: &str = ai_ide_protocol::PROTOCOL_VERSION;
 /// **M5 任务 4**：在 stderr 之外再挂一条 JSONL 文件通道（见 [`crate::logging`]）。
 /// 两条通道共用同一个 `EnvFilter`，因此级别开关只需要拧一次；文件通道按天滚动、
 /// 出口脱敏，`AI_IDE_LOG_JSONL=off` 可整体关掉。
+///
+/// **P5 收口**：再挂一条 `core.log` 上报 layer（见 [`crate::core_log`]），把同一批
+/// 事件抬成对外壳的单向通知。三条通道共用同一个 filter，脱敏口径也一致；
+/// 上报本身可用 `AI_IDE_CORE_LOG_PUSH=off` 单独关掉，落盘不受影响。
+/// layer 在这里挂、落点在 `run()` 里装：`init_tracing` 早于 `Peer` 构造，
+/// 这段窗口里的日志只有 stderr 与文件两份，不会凭空消失。
 pub fn init_tracing() {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -32,7 +38,10 @@ pub fn init_tracing() {
         .with_target(true);
     let registry = tracing_subscriber::registry()
         .with(filter)
-        .with(stderr_layer);
+        .with(stderr_layer)
+        // 第三条通道：把事件抬成 `core.log` 通知（落点在 `run()` 里装）。
+        // 没装落点时这一层直接返回，不会比「没有这一层」多做什么。
+        .with(crate::core_log::CoreLogLayer::default());
 
     if crate::logging::jsonl_enabled() {
         let writer = crate::logging::DailyJsonlWriter::new(crate::logging::log_dir());
