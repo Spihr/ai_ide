@@ -65,6 +65,42 @@ if (existsSync(sourceCore)) {
   check('target/release 内核可对照', false, `未找到 ${sourceCore}（跳过体积一致性核对）`)
 }
 
+// --- 2.5 Electron 运行时文件完备性 ------------------------------------------
+// 这一项是 2026-10-27 事故补的：某次 `package:dir` 中断后 win-unpacked 只有
+// exe + 几个 dll，icudtl.dat / *.pak / locales 全没复制上，双击 exe 一闪就退，
+// debug.log 里只留一句「Invalid file descriptor to ICU data received」——
+// 页面根本没机会加载。asar 与内核都合格，静态校验却全绿，因为缺的是 Electron
+// 自己的运行时文件，谁都没查。这里把它们列成硬门槛。
+const runtimeRequired = [
+  'icudtl.dat',
+  'resources.pak',
+  'chrome_100_percent.pak',
+  'chrome_200_percent.pak',
+  'snapshot_blob.bin',
+  'v8_context_snapshot.bin',
+  'ffmpeg.dll',
+  'locales'
+]
+const missingRuntime = runtimeRequired.filter((name) => !existsSync(join(unpackedDir, name)))
+check('Electron 运行时文件齐备', missingRuntime.length === 0, missingRuntime.join(', ') || '齐备')
+if (missingRuntime.length > 0) {
+  fail(
+    `win-unpacked 缺 Electron 运行时文件：${missingRuntime.join(', ')}。` +
+      '这是半成品产物（多半是上次打包被占用或中断），请关掉运行中的实例后重跑 pnpm package:dir:offline'
+  )
+}
+
+// 与本地 electron dist 全量对照：只把差集打出来，不判失败（LICENSE 之类
+// 是否复制取决于 electron-builder 版本，拿来判死会误伤）。
+const electronDist = join(repoRoot, 'apps', 'desktop', 'node_modules', 'electron', 'dist')
+if (existsSync(electronDist)) {
+  const skip = new Set(['electron.exe', 'resources', 'version', 'LICENSE', 'LICENSES.chromium.html'])
+  const absent = readdirSync(electronDist).filter(
+    (name) => !skip.has(name) && !existsSync(join(unpackedDir, name))
+  )
+  check('与 electron dist 对照无遗漏', absent.length === 0, absent.join(', ') || '无差集')
+}
+
 // --- 3/4/5. asar 内容 -------------------------------------------------------
 const asarPath = join(unpackedDir, 'resources', 'app.asar')
 check('app.asar 存在', existsSync(asarPath), asarPath)
