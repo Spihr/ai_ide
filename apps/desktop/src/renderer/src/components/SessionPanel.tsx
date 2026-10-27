@@ -21,15 +21,20 @@ import {
   pluginAuditLine
 } from '../audit-view'
 import {
+  clearMessageSearch,
   createSession,
   deleteSession,
   dismissSessionHint,
   exportSession,
   forkSession,
+  hasEarlierMessages,
+  loadEarlierMessages,
   loadMoreAudit,
+  loadMoreMessageHits,
   loadMoreSessions,
   refreshAudit,
   renameSession,
+  searchMessages,
   selectSession,
   setAuditKind,
   setAuditScope,
@@ -67,11 +72,19 @@ export function SessionPanel(): React.JSX.Element {
   const [editing, setEditing] = useState(false)
   const [titleDraft, setTitleDraft] = useState('')
   const [auditOpen, setAuditOpen] = useState(false)
+  const [messageQueryDraft, setMessageQueryDraft] = useState('')
+  const [searchScope, setSearchScope] = useState<'all' | 'current'>('all')
 
   const current = state.current
   const busy = state.busy
   // 流式生成中一律不许换会话：气泡被替换后，这一轮的正文就落在别人的会话里了。
   const locked = streaming || busy
+
+  const submitMessageSearch = (): void => {
+    const scope = searchScope === 'current' ? state.currentId : null
+    if (searchScope === 'current' && scope === null) return
+    void searchMessages(messageQueryDraft, scope)
+  }
 
   const beginRename = (): void => {
     if (!current) return
@@ -292,12 +305,146 @@ export function SessionPanel(): React.JSX.Element {
             </button>
           </div>
 
+          {/*
+            长会话只加载了最近一屏：这里按已加载条数往前补一页。`messagesTotal`
+            是会话真实总数，靠它判断到底了没有——不用「本页是否满」来猜。
+          */}
+          <div className="ai-row" data-testid="session-message-window">
+            <span className="ai-note">
+              已加载 {state.messages.length} / {state.messagesTotal} 条消息
+            </span>
+            {hasEarlierMessages(state) ? (
+              <button
+                className="ai-button ai-button--tiny"
+                type="button"
+                data-testid="session-load-earlier"
+                disabled={busy}
+                title="往前再拉一页更早的消息"
+                onClick={() => void loadEarlierMessages()}
+              >
+                加载更早
+              </button>
+            ) : null}
+          </div>
+
         </>
       ) : (
         <div className="ai-note">
           没有选中会话：发一条消息会自动建一个（绑定当前工作区与模型）。
         </div>
       )}
+
+      {/*
+        消息检索与上面的「搜标题或消息正文」不是一回事：那个筛的是会话列表，
+        这里给的是消息级命中（哪条会话的哪一轮、片段长什么样），能直接跳过去。
+      */}
+      <h4 className="ai-section__subtitle">消息检索</h4>
+      <div className="ai-row">
+        <input
+          className="ai-input"
+          data-testid="session-message-search"
+          placeholder="搜消息正文，回车检索…"
+          value={messageQueryDraft}
+          onChange={(event) => setMessageQueryDraft(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') submitMessageSearch()
+          }}
+        />
+        <button
+          className={`ai-button ai-button--tiny${searchScope === 'all' ? ' ai-button--primary' : ''}`}
+          type="button"
+          data-testid="session-message-search-scope-all"
+          title="在所有会话里搜"
+          onClick={() => setSearchScope('all')}
+        >
+          全部会话
+        </button>
+        <button
+          className={`ai-button ai-button--tiny${searchScope === 'current' ? ' ai-button--primary' : ''}`}
+          type="button"
+          data-testid="session-message-search-scope-current"
+          disabled={state.currentId === null}
+          title="只在当前会话里搜"
+          onClick={() => setSearchScope('current')}
+        >
+          当前会话
+        </button>
+        <button
+          className="ai-button"
+          type="button"
+          data-testid="session-message-search-go"
+          disabled={state.searching || messageQueryDraft.trim().length === 0}
+          onClick={submitMessageSearch}
+        >
+          {state.searching ? '检索中…' : '检索'}
+        </button>
+        {state.messageQuery.length > 0 ? (
+          <button
+            className="ai-button ai-button--tiny"
+            type="button"
+            data-testid="session-message-search-clear"
+            onClick={() => {
+              setMessageQueryDraft('')
+              clearMessageSearch()
+            }}
+          >
+            清空
+          </button>
+        ) : null}
+      </div>
+
+      {state.messageQuery.length > 0 ? (
+        <ul className="ai-list" data-testid="session-message-hits">
+          {state.messageHits.length === 0 ? (
+            <li className="ai-note">
+              {state.searching ? '正在检索…' : `没有消息命中「${state.messageQuery}」。`}
+            </li>
+          ) : (
+            state.messageHits.map((hit) => (
+              <li
+                key={hit.message_id}
+                className="ai-list__item"
+                data-testid="session-message-hit"
+                data-session-id={hit.session_id}
+                title={`${hit.session_title} · ${hit.role} · ${formatTime(hit.created_at_ms)}`}
+              >
+                <button
+                  className="ai-button ai-button--tiny"
+                  type="button"
+                  data-testid="session-message-hit-open"
+                  disabled={locked}
+                  title="打开这条消息所在的会话"
+                  onClick={() => void selectSession(hit.session_id)}
+                >
+                  {hit.session_id === state.currentId ? '当前' : '打开'}
+                </button>
+                <span className="ai-list__meta">
+                  {hit.session_title} · {hit.role} · {formatTime(hit.created_at_ms)}
+                </span>
+                <span className="ai-note" data-testid="session-message-hit-snippet">
+                  {hit.snippet}
+                </span>
+              </li>
+            ))
+          )}
+          {state.messageHitsTotal > state.messageHits.length ? (
+            <li className="ai-note">
+              共 {state.messageHitsTotal} 条命中，当前显示最近 {state.messageHits.length} 条。
+              <button
+                className="ai-button ai-button--tiny"
+                type="button"
+                data-testid="session-message-hit-more"
+                disabled={state.searchLoadingMore}
+                onClick={() =>
+                  void loadMoreMessageHits(searchScope === 'current' ? state.currentId : null)
+                }
+              >
+                {state.searchLoadingMore ? '加载中…' : '加载更多'}
+              </button>
+            </li>
+          ) : null}
+        </ul>
+      ) : null}
 
       <h4 className="ai-section__subtitle">审计回执</h4>
       <div className="ai-row">

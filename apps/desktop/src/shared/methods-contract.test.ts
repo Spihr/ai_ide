@@ -267,6 +267,8 @@ describe('协议常量', () => {
       'session.messages',
       'session.export',
       'session.fork',
+      // 缺口第六批：消息级全文检索（crates/store 用 instr 子串匹配，dispatch 已接线）。
+      'session.search_messages',
       'checkpoint.create',
       'checkpoint.list',
       'checkpoint.restore',
@@ -336,8 +338,9 @@ describe('协议常量', () => {
     expect([...DECLARED_NOT_IMPLEMENTED_METHODS]).toEqual([])
     // 能力数 74 → 79：lsp 五项进清单；79 → 80：P5 切片八补 plugin.load_many；
     // 80 → 89：缺口第二批补 Git 深化（checkout / fetch / pull / push / stash 五项）；
-    // 89 → 93：缺口第四、五批补单 hunk 暂存两项与冲突按侧解决两项。
-    expect(IMPLEMENTED_METHODS).toHaveLength(93)
+    // 89 → 93：缺口第四、五批补单 hunk 暂存两项与冲突按侧解决两项；
+    // 93 → 94：缺口第六批补消息级检索（session.search_messages）。
+    expect(IMPLEMENTED_METHODS).toHaveLength(94)
     for (const method of DECLARED_NOT_IMPLEMENTED_METHODS) {
       // 虚报能力会让外壳照单调进一片 -32601，互斥关系必须钉死。
       expect(IMPLEMENTED_METHODS as readonly string[]).not.toContain(method)

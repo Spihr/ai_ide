@@ -16,13 +16,20 @@ import { useSyncExternalStore } from 'react'
 
 import type {
   AuditEventView,
+  MessageSearchHit,
   MessageView,
   SessionExportFormat,
   SessionView
 } from '@ai-ide/shared-types'
 
 import { loadBubbles, getAiState, type ChatBubble } from './ai-store'
-import { bubbleRoleOf, DEFAULT_SESSION_TITLE, sessionApi } from './session-api'
+import {
+  bubbleRoleOf,
+  DEFAULT_MESSAGE_PAGE,
+  DEFAULT_SEARCH_PAGE,
+  DEFAULT_SESSION_TITLE,
+  sessionApi
+} from './session-api'
 import {
   clearPersistError,
   releaseActiveSession,
@@ -51,6 +58,14 @@ export interface SessionState {
   current: SessionView | null
   messages: MessageView[]
   messagesTotal: number
+  /** 正文检索词；空串表示「没在检索」。 */
+  messageQuery: string
+  /** 正文检索命中（最近的在前）。 */
+  messageHits: MessageSearchHit[]
+  messageHitsTotal: number
+  /** 检索进行中：与「翻页加载中」分开，否则翻页会清空结果列表。 */
+  searching: boolean
+  searchLoadingMore: boolean
   audit: AuditEventView[]
   auditTotal: number
   /** 审计范围：本会话 / 全局（插件事件只在这里出现）。 */
@@ -78,6 +93,11 @@ function initialState(): SessionState {
     current: null,
     messages: [],
     messagesTotal: 0,
+    messageQuery: '',
+    messageHits: [],
+    messageHitsTotal: 0,
+    searching: false,
+    searchLoadingMore: false,
     audit: [],
     auditTotal: 0,
     auditScope: 'session',
@@ -238,25 +258,79 @@ export async function loadMoreSessions(): Promise<boolean> {
 // 当前会话
 // ---------------------------------------------------------------------------
 
-/** 打开一条会话：拉全量消息、设为活动会话、把历史灌回对话面板。 */
+/**
+ * 打开一条会话：拉**最近一屏**消息、设为活动会话、把历史灌回对话面板。
+ *
+ * 不拉全量：长会话动辄几千条，一次 `session.get` 会把 IPC 和渲染都拖住。这里用
+ * `tail = true` 只取末尾 `DEFAULT_MESSAGE_PAGE` 条，更早的用「加载更早」按需补。
+ * `messagesTotal` 仍取会话真实总数，UI 靠它判断还有没有更早的。
+ */
 export async function selectSession(sessionId: string): Promise<boolean> {
   if (state.busy) return false
   setState({ busy: true, error: null })
   try {
-    const result = await sessionApi.get(sessionId, true)
-    const messages = result.messages ?? []
+    const [detail, page] = await Promise.all([
+      sessionApi.get(sessionId, false),
+      sessionApi.messages(sessionId, DEFAULT_MESSAGE_PAGE, 0, true)
+    ])
+    const messages = page.messages ?? []
     clearPersistError()
     setState({
       busy: false,
       currentId: sessionId,
-      current: result.session,
+      current: detail.session,
       messages,
-      messagesTotal: messages.length,
+      messagesTotal: page.total ?? messages.length,
       hint: null
     })
     setActiveSessionId(sessionId)
     loadBubbles(bubblesOf(messages))
     void refreshAudit(sessionId)
+    return true
+  } catch (error) {
+    setState({ busy: false, error: describe(error) })
+    return false
+  }
+}
+
+/** 当前会话还有没有更早的消息没加载。 */
+export function hasEarlierMessages(current: SessionState = state): boolean {
+  return current.currentId !== null && current.messages.length < current.messagesTotal
+}
+
+/**
+ * 「加载更早」：把上一页更早的消息拼到现有窗口**前面**。
+ *
+ * offset 直接用已加载条数——窗口恒为「从末尾往前连续的若干页」，中间没有洞。内核
+ * 返回的页仍是时间正序，所以拼接是 `[...更早, ...已加载]`。按 `message_id` 去重：
+ * 翻页期间若有新消息追加，窗口会整体后移，重复项比漏项更难被发现。
+ */
+export async function loadEarlierMessages(): Promise<boolean> {
+  const sessionId = state.currentId
+  if (sessionId === null || state.busy || !hasEarlierMessages()) return false
+  setState({ busy: true, error: null })
+  try {
+    const page = await sessionApi.messages(
+      sessionId,
+      DEFAULT_MESSAGE_PAGE,
+      state.messages.length,
+      true
+    )
+    // 会话在这期间被切走了：结果作废，别把别人的消息拼进来。
+    if (state.currentId !== sessionId) {
+      setState({ busy: false })
+      return false
+    }
+    const known = new Set(state.messages.map((message) => message.message_id))
+    const earlier = (page.messages ?? []).filter((message) => !known.has(message.message_id))
+    if (earlier.length === 0) {
+      // 内核说还有、却给了空页：把总数收敛到已加载，避免「加载更早」点了没反应。
+      setState({ busy: false, messagesTotal: state.messages.length })
+      return false
+    }
+    const messages = [...earlier, ...state.messages]
+    setState({ busy: false, messages, messagesTotal: page.total ?? state.messagesTotal })
+    loadBubbles(bubblesOf(messages))
     return true
   } catch (error) {
     setState({ busy: false, error: describe(error) })
@@ -431,6 +505,89 @@ export async function forkSession(
     setState({ busy: false, error: describe(error) })
     return false
   }
+}
+
+// ---------------------------------------------------------------------------
+// 消息检索
+// ---------------------------------------------------------------------------
+
+/**
+ * 检索消息正文（`session_id = null` 表示跨会话）。
+ *
+ * 和标题过滤（`list` 的 `query`）是两件事：那个只筛会话列表、且同样会搜正文，
+ * 但拿不到「第几条消息、片段长什么样」。这里返回的是消息级命中，能直接跳到那一轮。
+ * 空词等于「清空检索结果」，不发请求——内核会把它当参数错误。
+ */
+export async function searchMessages(
+  query: string,
+  sessionId: string | null = null
+): Promise<boolean> {
+  const trimmed = query.trim()
+  if (trimmed.length === 0) {
+    setState({ messageQuery: '', messageHits: [], messageHitsTotal: 0, searching: false })
+    return false
+  }
+  setState({ messageQuery: trimmed, searching: true, error: null })
+  try {
+    const result = await sessionApi.searchMessages({
+      query: trimmed,
+      session_id: sessionId,
+      limit: DEFAULT_SEARCH_PAGE,
+      offset: 0
+    })
+    // 输入框已经改成别的词时，这一批结果作废（输入即搜，慢请求会晚到）。
+    if (state.messageQuery !== trimmed) {
+      setState({ searching: false })
+      return false
+    }
+    setState({
+      searching: false,
+      messageHits: result.hits ?? [],
+      messageHitsTotal: result.total ?? 0
+    })
+    return true
+  } catch (error) {
+    setState({ searching: false, messageHits: [], messageHitsTotal: 0, error: describe(error) })
+    return false
+  }
+}
+
+/** 检索结果翻页：按 `message_id` 去重后追加。 */
+export async function loadMoreMessageHits(sessionId: string | null = null): Promise<boolean> {
+  if (state.searching || state.searchLoadingMore) return false
+  if (state.messageHits.length >= state.messageHitsTotal) return false
+  const trimmed = state.messageQuery
+  if (trimmed.length === 0) return false
+  setState({ searchLoadingMore: true, error: null })
+  try {
+    const result = await sessionApi.searchMessages({
+      query: trimmed,
+      session_id: sessionId,
+      limit: DEFAULT_SEARCH_PAGE,
+      offset: state.messageHits.length
+    })
+    if (state.messageQuery !== trimmed) {
+      setState({ searchLoadingMore: false })
+      return false
+    }
+    const known = new Set(state.messageHits.map((hit) => hit.message_id))
+    const extra = (result.hits ?? []).filter((hit) => !known.has(hit.message_id))
+    setState({
+      searchLoadingMore: false,
+      messageHits: [...state.messageHits, ...extra],
+      messageHitsTotal: result.total ?? state.messageHitsTotal
+    })
+    return true
+  } catch (error) {
+    setState({ searchLoadingMore: false, error: describe(error) })
+    return false
+  }
+}
+
+/** 清空检索：结果与输入词一起清，避免「看到旧结果却以为搜的是新词」。 */
+export function clearMessageSearch(): void {
+  if (state.messageQuery === '' && state.messageHits.length === 0) return
+  setState({ messageQuery: '', messageHits: [], messageHitsTotal: 0, searching: false })
 }
 
 // ---------------------------------------------------------------------------

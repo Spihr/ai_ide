@@ -8,11 +8,12 @@
 //! 并发请求创建」这类竞态就得由上层自己兜。
 
 use ai_ide_protocol::dto::{
-    MessageView, SessionAppendMessageParams, SessionAppendMessageResult, SessionCreateParams,
-    SessionCreateResult, SessionDeleteParams, SessionDeleteResult, SessionExportParams,
-    SessionExportResult, SessionForkParams, SessionForkResult, SessionGetParams, SessionGetResult,
-    SessionListParams, SessionListResult, SessionMessagesParams, SessionMessagesResult,
-    SessionUpdateParams, SessionView,
+    MessageSearchHit, MessageView, SessionAppendMessageParams, SessionAppendMessageResult,
+    SessionCreateParams, SessionCreateResult, SessionDeleteParams, SessionDeleteResult,
+    SessionExportParams, SessionExportResult, SessionForkParams, SessionForkResult,
+    SessionGetParams, SessionGetResult, SessionListParams, SessionListResult,
+    SessionMessagesParams, SessionMessagesResult, SessionSearchMessagesParams,
+    SessionSearchMessagesResult, SessionUpdateParams, SessionView,
 };
 use ai_ide_protocol::{ErrorCode, ErrorObject, Request};
 use ai_ide_store::{
@@ -35,6 +36,11 @@ const LIST_MAX_LIMIT: u32 = 500;
 /// `session.messages` 的默认 / 最大返回条数：长对话必须能分页读，不能一帧拉全量。
 const MESSAGES_DEFAULT_LIMIT: u32 = 200;
 const MESSAGES_MAX_LIMIT: u32 = 10_000;
+
+/// 检索默认返回命中数：够填满一屏搜索结果、又不至于把大仓库的回复撑爆。
+const SEARCH_DEFAULT_LIMIT: u32 = 20;
+/// 检索单页上限：与仓储侧 instr 全表扫描的成本折中，超出交给分页。
+const SEARCH_MAX_LIMIT: u32 = 200;
 
 // ---------------------------------------------------------------------------
 // session.create
@@ -409,10 +415,17 @@ pub async fn messages(peer: &Peer, state: &AppState, req: &Request) {
         Ok(total) => total as u64,
         Err(err) => return peer.respond_error(&req.id, &map_store_error(err)).await,
     };
-    let rows = match store
-        .list_messages(&params.session_id, limit as i64, offset as i64)
-        .await
-    {
+    // 两种取页方向共用一个 offset 语义差：正序是「跳过最早 N 条」，尾序是
+    // 「跳过最新 N 条」。`tail` 缺省取正序——老客户端不带这个字段，行为不变。
+    let rows = match if params.tail.unwrap_or(false) {
+        store
+            .list_message_page_tail(&params.session_id, limit as i64, offset as i64)
+            .await
+    } else {
+        store
+            .list_messages(&params.session_id, limit as i64, offset as i64)
+            .await
+    } {
         Ok(rows) => rows,
         Err(err) => return peer.respond_error(&req.id, &map_store_error(err)).await,
     };
@@ -422,6 +435,129 @@ pub async fn messages(peer: &Peer, state: &AppState, req: &Request) {
         total,
     };
     peer.respond(&req.id, &result).await;
+}
+
+// ---------------------------------------------------------------------------
+// session.search_messages
+// ---------------------------------------------------------------------------
+
+/// 检索命中的上下文宽度（按字符算）：命中词两侧各留这么多字符。
+///
+/// 按字符而不是字节截断——中文一个字三字节，按字节切会把词切成半个。
+const SNIPPET_PAD: usize = 40;
+
+pub async fn search_messages(peer: &Peer, state: &AppState, req: &Request) {
+    let params: SessionSearchMessagesParams = match parse_params(req.params.as_ref()) {
+        Ok(params) => params,
+        Err(err) => return peer.respond_error(&req.id, &err).await,
+    };
+    let store = match store_of(state) {
+        Ok(store) => store,
+        Err(err) => return peer.respond_error(&req.id, &err).await,
+    };
+
+    let query = params.query.trim();
+    // 空关键词直接拒：`instr(x, '')` 恒为 1，等于把整个会话库倒出来当结果。
+    if query.is_empty() {
+        let err = ErrorObject::invalid_params("query 不能为空");
+        return peer.respond_error(&req.id, &err).await;
+    }
+
+    // 限定会话时必须先确认它存在：否则「会话不存在」和「这会话里没有命中」
+    // 在结果上都是空列表，用户分不清是自己搜错了还是会话被删了。
+    if let Some(session_id) = params.session_id.as_deref() {
+        if let Err(err) = load_session(store, session_id).await {
+            return peer.respond_error(&req.id, &err).await;
+        }
+    }
+
+    let limit = params
+        .limit
+        .unwrap_or(SEARCH_DEFAULT_LIMIT)
+        .clamp(1, SEARCH_MAX_LIMIT);
+    let offset = params.offset.unwrap_or(0);
+    let scope = params.session_id.as_deref();
+
+    let total = match store.count_matching_messages(query, scope).await {
+        Ok(total) => total as u64,
+        Err(err) => return peer.respond_error(&req.id, &map_store_error(err)).await,
+    };
+    let rows = match store
+        .search_messages(query, scope, limit as i64, offset as i64)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(err) => return peer.respond_error(&req.id, &map_store_error(err)).await,
+    };
+
+    // 会话标题按 id 去重后各查一次：一页最多 200 条命中，命中的会话通常个位数。
+    let mut titles: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut hits = Vec::with_capacity(rows.len());
+    for message in &rows {
+        let title = match titles.get(&message.session_id) {
+            Some(title) => title.clone(),
+            None => {
+                let title = match store.get_session(&message.session_id).await {
+                    Ok(Some(session)) => session.title,
+                    // 会话被并发删掉：命中仍然有正文，标题退回 id，不给整个检索报错。
+                    Ok(None) => message.session_id.clone(),
+                    Err(err) => return peer.respond_error(&req.id, &map_store_error(err)).await,
+                };
+                titles.insert(message.session_id.clone(), title.clone());
+                title
+            }
+        };
+        hits.push(MessageSearchHit {
+            message_id: message.id.clone(),
+            session_id: message.session_id.clone(),
+            session_title: title,
+            role: message.role,
+            snippet: snippet_of(&message.content, query),
+            created_at_ms: message.created_at,
+        });
+    }
+
+    let result = SessionSearchMessagesResult { hits, total };
+    peer.respond(&req.id, &result).await;
+}
+
+/// 截一段以命中词为中心的片段。
+///
+/// 命中词可能不在正文里（命中的是 `content_json`，命中点可能落在附件路径上）：
+/// 此时退回正文开头，而不是返回空片段——空片段在列表里等于一条看不见的结果。
+fn snippet_of(content: &str, query: &str) -> String {
+    let chars: Vec<char> = content.chars().collect();
+    let start = match find_hit_char_index(content, query) {
+        Some(pos) => pos.saturating_sub(SNIPPET_PAD).min(chars.len()),
+        None => 0,
+    };
+    let end = (start + SNIPPET_PAD * 2 + query.chars().count()).min(chars.len());
+    let mut snippet: String = chars[start..end].iter().collect();
+    // 单行显示：换行会在列表里把一条结果撑成好几行，把别的命中挤下去。
+    snippet = snippet.split_whitespace().collect::<Vec<_>>().join(" ");
+    if start > 0 {
+        snippet.insert(0, '…');
+    }
+    if end < chars.len() {
+        snippet.push('…');
+    }
+    snippet
+}
+
+/// 命中词在正文里的**字符**下标（找不到返回 `None`）。
+///
+/// 不用 `String::find` 的返回值：那是字节偏移，而大小写折叠会改字节宽度
+/// （`İ` 折叠成两个字符），拿折叠后的字节偏移回头切原串，可能切在半个字符上直接
+/// panic。这里先把两边都折成「小写字符序列」再比，得到的是字符下标，切成
+/// `&chars[start..end]` 永远安全。折叠后长度可能多一位，偏差只影响片段起点偏移
+/// 一个字符，肉眼不可见。
+fn find_hit_char_index(content: &str, query: &str) -> Option<usize> {
+    let hay: Vec<char> = content.chars().flat_map(|ch| ch.to_lowercase()).collect();
+    let needle: Vec<char> = query.chars().flat_map(|ch| ch.to_lowercase()).collect();
+    if needle.is_empty() || needle.len() > hay.len() {
+        return None;
+    }
+    (0..=hay.len() - needle.len()).find(|&start| hay[start..start + needle.len()] == needle[..])
 }
 
 // ---------------------------------------------------------------------------

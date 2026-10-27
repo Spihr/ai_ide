@@ -236,6 +236,177 @@ fn sessions_survive_core_restart() {
     assert_eq!(messages[0]["content"], json!("重启后我还得在"));
 }
 
+/// 尾页分页与正文检索（缺口第六批）：`tail` 开关与 `session.search_messages` 的端到端行为。
+#[test]
+fn tail_paging_and_message_search_round_trip() {
+    let data = TempDataDir::new("session-tail-search");
+    let mut core = Core::spawn(&data.root);
+
+    // 改的是协议面，能力清单必须跟着出现：客户端只靠 hello 判断能不能用。
+    let capabilities = core.capabilities();
+    assert!(
+        capabilities
+            .iter()
+            .any(|name| name == "session.search_messages"),
+        "session.search_messages 应在能力清单里，实际：{capabilities:?}"
+    );
+
+    let first = core.ok("session.create", json!({ "title": "长对话" }));
+    let first_id = first["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+    let second = core.ok("session.create", json!({ "title": "另一个会话" }));
+    let second_id = second["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+
+    // 五条消息：索引 0..4，正文里带一个大写混杂的关键词。
+    for index in 0..5 {
+        let content = format!("第 {index} 条：SessionStore 的细节 {index}");
+        core.ok(
+            "session.append_message",
+            json!({
+                "session_id": first_id,
+                "message": text_message("user", &content),
+            }),
+        );
+    }
+    core.ok(
+        "session.append_message",
+        json!({
+            "session_id": second_id,
+            "message": text_message("assistant", "另一个会话里也提到 sessionstore"),
+        }),
+    );
+
+    // tail = true：取最近 2 条，仍是时间正序（最后两条），total 是全量。
+    let tail = core.ok(
+        "session.messages",
+        json!({ "session_id": first_id, "limit": 2, "offset": 0, "tail": true }),
+    );
+    assert_eq!(tail["total"], json!(5));
+    let tail_messages = tail["messages"].as_array().expect("messages");
+    assert_eq!(tail_messages.len(), 2);
+    assert_eq!(
+        tail_messages[0]["content"],
+        json!("第 3 条：SessionStore 的细节 3")
+    );
+    assert_eq!(
+        tail_messages[1]["content"],
+        json!("第 4 条：SessionStore 的细节 4")
+    );
+
+    // 「加载更早」：offset 表示从末尾往前跳过的条数。
+    let earlier = core.ok(
+        "session.messages",
+        json!({ "session_id": first_id, "limit": 2, "offset": 2, "tail": true }),
+    );
+    let earlier_messages = earlier["messages"].as_array().expect("messages");
+    assert_eq!(earlier_messages.len(), 2);
+    assert_eq!(
+        earlier_messages[0]["content"],
+        json!("第 1 条：SessionStore 的细节 1")
+    );
+    assert_eq!(
+        earlier_messages[1]["content"],
+        json!("第 2 条：SessionStore 的细节 2")
+    );
+
+    // 不带 tail 的老行为不变：从头取。
+    let head = core.ok(
+        "session.messages",
+        json!({ "session_id": first_id, "limit": 2, "offset": 0 }),
+    );
+    assert_eq!(
+        head["messages"][0]["content"],
+        json!("第 0 条：SessionStore 的细节 0")
+    );
+
+    // 跨会话检索：6 条命中，最近的在前（第二个会话那条最后写入）。
+    let all = core.ok(
+        "session.search_messages",
+        json!({ "query": "sessionstore" }),
+    );
+    assert_eq!(all["total"], json!(6), "忽略大小写");
+    let hits = all["hits"].as_array().expect("hits");
+    assert_eq!(hits.len(), 6);
+    assert_eq!(hits[0]["session_id"], json!(second_id));
+    assert_eq!(
+        hits[0]["session_title"],
+        json!("另一个会话"),
+        "跨会话命中要带标题"
+    );
+    assert_eq!(hits[1]["session_id"], json!(first_id));
+    assert_eq!(hits[1]["session_title"], json!("长对话"));
+    assert_eq!(hits[1]["role"], json!("user"));
+    assert!(
+        hits[1]["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("SessionStore"),
+        "片段要带命中词本身：{:?}",
+        hits[1]["snippet"]
+    );
+    assert!(
+        hits[1]["created_at_ms"].as_i64().unwrap_or(0) > 0,
+        "带创建时刻"
+    );
+
+    // 限定会话：只剩 5 条，total 同步收窄。
+    let scoped = core.ok(
+        "session.search_messages",
+        json!({ "query": "SessionStore", "session_id": first_id }),
+    );
+    assert_eq!(scoped["total"], json!(5));
+    assert_eq!(scoped["hits"].as_array().map(Vec::len), Some(5));
+
+    // 分页：limit=2 取最近两条，offset 往后翻不重复。
+    let page_one = core.ok(
+        "session.search_messages",
+        json!({ "query": "sessionstore", "session_id": first_id, "limit": 2, "offset": 0 }),
+    );
+    assert_eq!(page_one["total"], json!(5));
+    assert_eq!(page_one["hits"].as_array().map(Vec::len), Some(2));
+    let page_two = core.ok(
+        "session.search_messages",
+        json!({ "query": "sessionstore", "session_id": first_id, "limit": 2, "offset": 2 }),
+    );
+    assert_ne!(
+        page_one["hits"][0]["message_id"], page_two["hits"][0]["message_id"],
+        "第二页必须换一批"
+    );
+
+    // 中文可搜，`%` / `_` 是字面量（正文里没有这两个字符）。
+    assert_eq!(
+        core.ok("session.search_messages", json!({ "query": "细节" }))["total"],
+        json!(5)
+    );
+    assert_eq!(
+        core.ok("session.search_messages", json!({ "query": "%" }))["total"],
+        json!(0)
+    );
+    assert_eq!(
+        core.ok("session.search_messages", json!({ "query": "_" }))["total"],
+        json!(0)
+    );
+
+    // 空关键词是参数错误：`instr(x, '')` 恒真，等于把整个库倒出来。
+    assert_eq!(
+        core.error_code("session.search_messages", json!({ "query": "   " })),
+        -32602
+    );
+    // 限定到不存在的会话：要和「这会话里没有命中」区分开。
+    assert_eq!(
+        core.error_code(
+            "session.search_messages",
+            json!({ "query": "细节", "session_id": "no-such-session" })
+        ),
+        5001
+    );
+}
+
 /// 错误分支要说清楚话：参数错报 -32602，对象不存在报 5001，工作区没开报 1001。
 #[test]
 fn session_errors_are_explicit() {

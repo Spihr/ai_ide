@@ -233,4 +233,88 @@ impl Store {
             > 0;
         Ok(deleted)
     }
+
+    /// 从**末尾**取一页消息，仍按时间正序返回。
+    ///
+    /// `skip` 是「末尾往前跳过多少条」，也就是外壳已经显示的那部分——长会话打开时
+    /// 先取最后 N 条，用户往上翻时把已显示条数当 `skip` 再要一页。与
+    /// [`Store::list_messages`] 的区别只在起点方向：后者从最早一条开始。
+    ///
+    /// 实现上是「先倒序取一页，再套一层正序排」，因为 SQLite 没有 `LIMIT ... FROM END`；
+    /// 外层必须带 `_row`（`rowid`）兜同毫秒顺序，否则同一毫秒的两条消息在两次查询里
+    /// 可能换位，翻页时就会重复或漏条。
+    pub async fn list_message_page_tail(
+        &self,
+        session_id: &str,
+        limit: i64,
+        skip: i64,
+    ) -> Result<Vec<Message>> {
+        let rows = sqlx::query_as::<_, MessageRow>(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM (SELECT rowid AS _row, {MESSAGE_COLUMNS} FROM message \
+             WHERE session_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?) \
+             ORDER BY created_at ASC, _row ASC"
+        ))
+        .bind(session_id)
+        .bind(limit.clamp(1, MAX_LIMIT))
+        .bind(skip.max(0))
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(MessageRow::into_message).collect()
+    }
+
+    /// 按关键词检索消息正文，可选限定会话。
+    ///
+    /// 判定用 `instr(lower(content_json), lower(?))` 而不是 `LIKE '%?%'`：
+    /// - `LIKE` 会把用户输入的 `%` / `_` 当通配符，搜 `snake_case` 就等于搜「任意字符」；
+    /// - `instr` 是纯子串匹配，没有元字符问题。
+    ///
+    /// `lower()` 在 SQLite 里只对 ASCII 生效，正好是想要的语义：英文忽略大小写，
+    /// 中文不受影响（也没有大小写）。
+    ///
+    /// 命中的是 `content_json` 而不是正文：正文以 JSON 存在列里，抽出来再比等于把
+    /// 整表读进内存。代价是理论上可能命中附件字段里的同名字符串——可接受，因为
+    /// 结果列表点进去看到的就是那条消息，不存在「搜到了却看不见」。
+    ///
+    /// 会话标题由调用方按 `session_id` 另查（命中的会话数受 `limit` 约束，很小）：
+    /// 在这里 join 会让 `MESSAGE_COLUMNS` 这份显式列清单失去复用价值。
+    pub async fn search_messages(
+        &self,
+        query: &str,
+        session_id: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Message>> {
+        let rows = sqlx::query_as::<_, MessageRow>(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM message \
+             WHERE (?1 IS NULL OR session_id = ?1) \
+               AND instr(lower(content_json), lower(?2)) > 0 \
+             ORDER BY created_at DESC, rowid DESC LIMIT ?3 OFFSET ?4"
+        ))
+        .bind(session_id)
+        .bind(query)
+        .bind(limit.clamp(1, MAX_LIMIT))
+        .bind(offset.max(0))
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(MessageRow::into_message).collect()
+    }
+
+    /// 同一过滤条件下的命中总数（给分页用）。
+    pub async fn count_matching_messages(
+        &self,
+        query: &str,
+        session_id: Option<&str>,
+    ) -> Result<i64> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM message WHERE (?1 IS NULL OR session_id = ?1) \
+               AND instr(lower(content_json), lower(?2)) > 0",
+        )
+        .bind(session_id)
+        .bind(query)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
 }

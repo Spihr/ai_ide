@@ -10,5 +10,16 @@ export type SessionMessagesParams = { session_id: string,
 limit: number | null, 
 /**
  * 偏移量，缺省 0。
+ *
+ * `tail = true` 时它表示「从末尾往前跳过多少条」，用来做「加载更早」：
+ * 已经显示最近 N 条，再要一页就传 `offset = N`。
  */
-offset: number | null, };
+offset: number | null, 
+/**
+ * 从**末尾**取页（缺省 `false`，即从最早的开始正序翻）。
+ *
+ * 长会话打开时用户要看的是最近几轮，而不是开天辟地第一条；不带这个开关，
+ * 外壳只能先拉全量再截尾，等于分页白做。两种模式返回的消息都按时间正序，
+ * UI 不必为方向写两套逻辑。
+ */
+tail: boolean | null, };

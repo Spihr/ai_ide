@@ -23,20 +23,25 @@ import type { AiIdeApi } from '../../shared/ipc'
 import { getAiState, resetAiState } from './ai-store'
 import { getActiveSessionId, releaseActiveSession, setActiveSessionId } from './session-bridge'
 import {
+  bubblesOf,
+  clearMessageSearch,
   createSession,
   deleteSession,
   dismissSessionHint,
   exportSession,
   forkSession,
   getSessionState,
+  hasEarlierMessages,
   initSessions,
+  loadEarlierMessages,
   loadMoreAudit,
+  loadMoreMessageHits,
   loadMoreSessions,
-  bubblesOf,
   refreshAudit,
   refreshSessions,
   renameSession,
   resetSessionState,
+  searchMessages,
   selectSession,
   setAuditKind,
   setAuditScope,
@@ -105,7 +110,9 @@ function auditEvent(id: number, kind: string): AuditEventView {
   }
 }
 
-function installHarness(options: { seedSessions?: number } = {}): Harness {
+function installHarness(
+  options: { seedSessions?: number; longMessages?: number } = {}
+): Harness {
   const calls: Call[] = []
   const seed = options.seedSessions ?? 2
   let sessions: SessionView[] =
@@ -125,6 +132,13 @@ function installHarness(options: { seedSessions?: number } = {}): Harness {
       message('m-5', 's-1', 'assistant', '   ')
     ],
     's-2': [message('m-9', 's-2', 'user', '接口 500 了')]
+  }
+  // 长会话：`tail` 分页与检索翻页的用例要「超过一页」的数据，靠它把窗口撑过 200。
+  if (options.longMessages !== undefined) {
+    sessions = [session('s-long', '长对话', 9), ...sessions]
+    messages['s-long'] = Array.from({ length: options.longMessages }, (_, index) =>
+      message(`m-long-${index}`, 's-long', 'user', `第 ${index} 条 alpha`)
+    )
   }
   let savePath: string | null = 'C:\\out\\会话.md'
   let failure: { message: string; method: string | null } | null = null
@@ -191,6 +205,41 @@ function installHarness(options: { seedSessions?: number } = {}): Harness {
           const ids = p.session_ids as string[]
           sessions = sessions.filter((item) => !ids.includes(item.session_id))
           return { ok: true, deleted: ids.length }
+        }
+        case Methods.session.messages: {
+          const id = p.session_id as string
+          const all = messages[id] ?? []
+          const limit = (p.limit as number | undefined) ?? 200
+          const offset = (p.offset as number | undefined) ?? 0
+          // 与内核同口径：tail 下 offset 表示「从末尾跳过多少条」，返回仍是正序。
+          const slice =
+            p.tail === true
+              ? all.slice(Math.max(0, all.length - offset - limit), all.length - offset)
+              : all.slice(offset, offset + limit)
+          return { messages: slice, total: all.length }
+        }
+        case Methods.session.searchMessages: {
+          // 正文子串、忽略大小写、最近的在前——和 store 实现保持一致。
+          const query = String(p.query ?? '').toLowerCase()
+          const scope = (p.session_id as string | null) ?? null
+          const hits = sessions
+            .filter((item) => scope === null || item.session_id === scope)
+            .flatMap((item) =>
+              (messages[item.session_id] ?? [])
+                .filter((message) => message.content.toLowerCase().includes(query))
+                .map((message) => ({
+                  message_id: message.message_id,
+                  session_id: item.session_id,
+                  session_title: item.title,
+                  role: message.role,
+                  snippet: message.content,
+                  created_at_ms: message.created_at_ms
+                }))
+            )
+            .reverse()
+          const offset = (p.offset as number | undefined) ?? 0
+          const limit = (p.limit as number | undefined) ?? 20
+          return { hits: hits.slice(offset, offset + limit), total: hits.length }
         }
         case Methods.session.export:
           return { ok: true, path: p.out_path as string, bytes: 512, messages: 3 }
@@ -721,5 +770,139 @@ describe('消息级分叉', () => {
     ])
 
     expect(bubbles.map((bubble) => bubble.messageId)).toEqual(['m-2', 'm-5'])
+  })
+})
+
+describe('尾页窗口', () => {
+  it('打开长会话只拉最近一屏，tail 语义与总数一起落到状态里', async () => {
+    h = installHarness({ longMessages: 250 })
+    resetSessionState()
+
+    const ok = await selectSession('s-long')
+
+    expect(ok).toBe(true)
+    const params = callsOf(Methods.session.messages)[0]?.params
+    expect(params?.tail).toBe(true)
+    expect(params?.offset).toBe(0)
+    expect(params?.limit).toBe(200)
+
+    const state = getSessionState()
+    // 只拿到末尾 200 条，但总数是真实的 250：UI 靠这个差值判断「还有更早」。
+    expect(state.messages).toHaveLength(200)
+    expect(state.messagesTotal).toBe(250)
+    expect(state.messages[0]?.message_id).toBe('m-long-50')
+    expect(state.messages.at(-1)?.message_id).toBe('m-long-249')
+    expect(hasEarlierMessages(state)).toBe(true)
+    // 气泡只灌了这 200 条，不是 250 条。
+    expect(getAiState().bubbles).toHaveLength(200)
+  })
+
+  it('「加载更早」把上一页拼到前面，offset 用已加载条数，到底后不再请求', async () => {
+    h = installHarness({ longMessages: 250 })
+    resetSessionState()
+    await selectSession('s-long')
+
+    const ok = await loadEarlierMessages()
+
+    expect(ok).toBe(true)
+    const params = callsOf(Methods.session.messages)[1]?.params
+    expect(params?.tail).toBe(true)
+    expect(params?.offset).toBe(200)
+
+    const state = getSessionState()
+    expect(state.messages).toHaveLength(250)
+    expect(state.messages[0]?.message_id).toBe('m-long-0')
+    expect(state.messages.at(-1)?.message_id).toBe('m-long-249')
+    expect(hasEarlierMessages(state)).toBe(false)
+    // 气泡也跟着补齐，且顺序是正序（最早的在前）。
+    expect(getAiState().bubbles).toHaveLength(250)
+    expect(getAiState().bubbles[0]?.text).toBe('第 0 条 alpha')
+
+    // 已经到底：直接返回 false，不再发第二次请求。
+    const before = callsOf(Methods.session.messages).length
+    expect(await loadEarlierMessages()).toBe(false)
+    expect(callsOf(Methods.session.messages)).toHaveLength(before)
+  })
+
+  it('没有选中会话时「加载更早」什么都不做', async () => {
+    const ok = await loadEarlierMessages()
+
+    expect(ok).toBe(false)
+    expect(callsOf(Methods.session.messages)).toHaveLength(0)
+  })
+})
+
+describe('消息检索', () => {
+  it('跨会话检索正文：命中带标题与片段，最近的在前', async () => {
+    const ok = await searchMessages('接口')
+
+    expect(ok).toBe(true)
+    const params = callsOf(Methods.session.searchMessages)[0]?.params
+    expect(params?.session_id).toBeNull()
+    expect(params?.limit).toBe(20)
+    expect(params?.offset).toBe(0)
+
+    const state = getSessionState()
+    expect(state.messageQuery).toBe('接口')
+    expect(state.messageHitsTotal).toBe(1)
+    expect(state.messageHits[0]?.session_title).toBe('接口调试')
+    expect(state.messageHits[0]?.snippet).toContain('接口')
+    expect(state.searching).toBe(false)
+  })
+
+  it('限定会话时把 session_id 传下去，命中只来自该会话', async () => {
+    await searchMessages('周报', 's-1')
+
+    expect(callsOf(Methods.session.searchMessages)[0]?.params?.session_id).toBe('s-1')
+    expect(getSessionState().messageHits.map((hit) => hit.message_id)).toEqual(['m-2'])
+  })
+
+  it('空白词不发请求，直接把结果清空', async () => {
+    await searchMessages('接口')
+    const before = callsOf(Methods.session.searchMessages).length
+
+    expect(await searchMessages('   ')).toBe(false)
+    expect(callsOf(Methods.session.searchMessages)).toHaveLength(before)
+    expect(getSessionState().messageQuery).toBe('')
+    expect(getSessionState().messageHits).toHaveLength(0)
+    expect(getSessionState().messageHitsTotal).toBe(0)
+  })
+
+  it('检索失败时清空结果并留下可读错误', async () => {
+    h.failNext('检索超时', Methods.session.searchMessages)
+
+    expect(await searchMessages('接口')).toBe(false)
+    expect(getSessionState().error).toContain('检索超时')
+    expect(getSessionState().searching).toBe(false)
+    expect(getSessionState().messageHits).toHaveLength(0)
+  })
+
+  it('命中翻页按已命中条数当 offset，并去重后追加', async () => {
+    h = installHarness({ longMessages: 250 })
+    resetSessionState()
+
+    await searchMessages('alpha')
+    let state = getSessionState()
+    expect(state.messageHits).toHaveLength(20)
+    expect(state.messageHitsTotal).toBe(250)
+
+    expect(await loadMoreMessageHits()).toBe(true)
+    expect(callsOf(Methods.session.searchMessages)[1]?.params?.offset).toBe(20)
+    state = getSessionState()
+    expect(state.messageHits).toHaveLength(40)
+    // 去重：拼起来不能有重复的 message_id。
+    expect(new Set(state.messageHits.map((hit) => hit.message_id)).size).toBe(40)
+  })
+
+  it('已全部加载时翻页不再请求；清空动作把结果与检索词一起清掉', async () => {
+    await searchMessages('接口')
+    expect(await loadMoreMessageHits()).toBe(false)
+    expect(callsOf(Methods.session.searchMessages)).toHaveLength(1)
+
+    clearMessageSearch()
+    const state = getSessionState()
+    expect(state.messageQuery).toBe('')
+    expect(state.messageHits).toHaveLength(0)
+    expect(state.messageHitsTotal).toBe(0)
   })
 })

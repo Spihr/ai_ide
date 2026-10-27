@@ -127,6 +127,8 @@ async fn handle_request(peer: &Peer, state: &AppState, req: Request) {
         // M5 切片三：导出与分叉。
         methods::session::EXPORT => session_api::export(peer, state, &req).await,
         methods::session::FORK => session_api::fork(peer, state, &req).await,
+        // M5 切片四：历史消息检索。
+        methods::session::SEARCH_MESSAGES => session_api::search_messages(peer, state, &req).await,
         methods::audit::LIST => audit_api::list(peer, state, &req).await,
 
         // 检查点与回滚（M5 切片五）：快照落文件，元数据落 meta.json

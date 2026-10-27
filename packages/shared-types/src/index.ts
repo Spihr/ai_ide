@@ -205,6 +205,9 @@ export type { SessionExportResult } from "./generated/SessionExportResult";
 export type { SessionExportDocument } from "./generated/SessionExportDocument";
 export type { SessionForkParams } from "./generated/SessionForkParams";
 export type { SessionForkResult } from "./generated/SessionForkResult";
+export type { SessionSearchMessagesParams } from "./generated/SessionSearchMessagesParams";
+export type { SessionSearchMessagesResult } from "./generated/SessionSearchMessagesResult";
+export type { MessageSearchHit } from "./generated/MessageSearchHit";
 
 // ---- checkpoint.* 方法（M5）----
 export type { CheckpointView } from "./generated/CheckpointView";
@@ -497,6 +500,7 @@ export const Methods = {
     messages: "session.messages",
     export: "session.export",
     fork: "session.fork",
+    searchMessages: "session.search_messages",
   },
   checkpoint: {
     create: "checkpoint.create",
@@ -618,7 +622,9 @@ export const Methods = {
  * 关闭 / 清单 / 查询 / 同步，内核 `lsp_api.rs` 已接线），再加 M6 切片四的
  * `git.*` 九项（分支切换 `git.checkout`、远端同步 `git.fetch` / `git.pull` /
  * `git.push`、stash 五项 `git.stash` / `git.stash_list` / `git.stash_pop` /
- * `git.stash_apply` / `git.stash_drop`），共 89 项，
+ * `git.stash_apply` / `git.stash_drop`），此时 89 项；再经缺口第四 / 第五批
+ * （单 hunk 暂存两项、冲突按侧解决两项、`plugin.load` 批量一项）与缺口第六批
+ * （`session.search_messages`）补至 **94 项**，
  * 与 Rust `methods::IMPLEMENTED` 逐项对齐。
  */
 export const IMPLEMENTED_METHODS = [
@@ -663,6 +669,8 @@ export const IMPLEMENTED_METHODS = [
   Methods.session.messages,
   Methods.session.export,
   Methods.session.fork,
+  // 缺口第六批：消息级检索（`session.messages` 的 `tail` 只是入参扩展，不新增方法）。
+  Methods.session.searchMessages,
   Methods.checkpoint.create,
   Methods.checkpoint.list,
   Methods.checkpoint.restore,

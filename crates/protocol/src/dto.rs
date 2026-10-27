@@ -1720,9 +1720,19 @@ pub struct SessionMessagesParams {
     #[ts(type = "number | null")]
     pub limit: Option<u32>,
     /// 偏移量，缺省 0。
+    ///
+    /// `tail = true` 时它表示「从末尾往前跳过多少条」，用来做「加载更早」：
+    /// 已经显示最近 N 条，再要一页就传 `offset = N`。
     #[serde(default)]
     #[ts(type = "number | null")]
     pub offset: Option<u32>,
+    /// 从**末尾**取页（缺省 `false`，即从最早的开始正序翻）。
+    ///
+    /// 长会话打开时用户要看的是最近几轮，而不是开天辟地第一条；不带这个开关，
+    /// 外壳只能先拉全量再截尾，等于分页白做。两种模式返回的消息都按时间正序，
+    /// UI 不必为方向写两套逻辑。
+    #[serde(default)]
+    pub tail: Option<bool>,
 }
 
 /// `session.messages` 响应结果。
@@ -1732,6 +1742,59 @@ pub struct SessionMessagesResult {
     /// 按 `created_at_ms` 正序（同毫秒按写入顺序）。
     pub messages: Vec<MessageView>,
     /// 该会话的消息总数（不受 `limit` / `offset` 影响）。
+    #[ts(type = "number")]
+    pub total: u64,
+}
+
+// ---------------------------------------------------------------------------
+// session.search_messages（缺口第六批：消息检索）
+// ---------------------------------------------------------------------------
+
+/// `session.search_messages` 请求参数。
+///
+/// 检索的是**正文**，不是文件名：`search.content` 面向工作区文件，这里面向
+/// 已经落盘的对话。两者不可互相替代——对话正文不在工作区里。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SessionSearchMessagesParams {
+    /// 关键词，去空白后为空直接报参数错误（全表扫描没有意义）。
+    pub query: String,
+    /// 限定会话；`None` 表示跨全部会话搜。
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// 返回条数上限，缺省 20，内部夹到 1..=200。
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub limit: Option<u32>,
+    /// 偏移量，缺省 0。
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub offset: Option<u32>,
+}
+
+/// 一条命中：够定位、够显示上下文，但不把整条消息搬回外壳。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct MessageSearchHit {
+    pub message_id: String,
+    pub session_id: String,
+    /// 所属会话标题：跨会话搜索时结果列表必须能说清「这条属于哪个对话」。
+    pub session_title: String,
+    pub role: ChatRole,
+    /// 命中片段：以命中词为中心截取，两侧各留一段上下文。
+    pub snippet: String,
+    /// 创建时刻（Unix 毫秒）。
+    #[ts(type = "number")]
+    pub created_at_ms: i64,
+}
+
+/// `session.search_messages` 响应结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SessionSearchMessagesResult {
+    /// 按 `created_at_ms` 倒序（最近的命中先看）。
+    pub hits: Vec<MessageSearchHit>,
+    /// 同一条件下的命中总数（不受 `limit` / `offset` 影响）。
     #[ts(type = "number")]
     pub total: u64,
 }

@@ -647,3 +647,181 @@ async fn keyword_search_spans_title_and_message_body() {
     // 空关键词等于不过滤（调用方把空串归一为 None，这里验证 None 的语义）。
     assert_eq!(store.count_sessions(None, None).await.unwrap(), 3);
 }
+
+/// 尾页分页：从末尾往前取页，页内仍是正序，相邻页不重不漏。
+///
+/// 长会话打开时先看最近几轮，「加载更早」把已显示条数当 `skip`——这条路径最容易
+/// 出的错是「同毫秒的两条消息在两次查询里换位」，所以这里刻意让多条消息同毫秒。
+#[tokio::test]
+async fn tail_pagination_walks_backwards_without_gaps() {
+    let store = Store::open_in_memory().await.expect("打开内存库");
+    let session = store
+        .create_session(NewSession::new("长对话").with_created_at(1_700_000_000_000))
+        .await
+        .unwrap();
+
+    let base = 1_700_000_100_000;
+    let mut written = Vec::new();
+    for index in 0..7 {
+        // 两两同毫秒：把「同刻顺序」这件事逼出来。
+        let created = base + index / 2;
+        let message = store
+            .append_message(
+                NewMessage::user(&session.id, format!("第 {index} 条")).with_created_at(created),
+            )
+            .await
+            .unwrap();
+        written.push(message.id);
+    }
+
+    // 最近 3 条：仍是时间正序（最后三条）。
+    let last_page = store
+        .list_message_page_tail(&session.id, 3, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        last_page.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+        written[4..].to_vec(),
+        "先取末尾一页，页内正序"
+    );
+
+    // skip = 已显示条数，再往前一页：正好接上，不重叠。
+    let middle_page = store
+        .list_message_page_tail(&session.id, 3, 3)
+        .await
+        .unwrap();
+    assert_eq!(
+        middle_page.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+        written[1..4].to_vec()
+    );
+
+    // 到底了：skip 超过总数只返回剩余部分，不报错。
+    let head_page = store
+        .list_message_page_tail(&session.id, 3, 6)
+        .await
+        .unwrap();
+    assert_eq!(
+        head_page.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+        written[..1].to_vec()
+    );
+    assert!(store
+        .list_message_page_tail(&session.id, 3, 7)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // 三页拼起来就是全量，恰好每条一次。
+    let mut rebuilt = head_page.clone();
+    rebuilt.extend(middle_page);
+    rebuilt.extend(last_page);
+    assert_eq!(
+        rebuilt.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+        written
+    );
+
+    // 与「从前往后」的分页互不干扰：tail = false 的行为没变。
+    let head_first = store.list_messages(&session.id, 3, 0).await.unwrap();
+    assert_eq!(
+        head_first.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+        written[..3].to_vec()
+    );
+}
+
+/// 消息正文检索：大小写不敏感、跨会话 / 限定会话两种口径、计数与分页同源。
+#[tokio::test]
+async fn message_search_matches_body_case_insensitively_and_scopes() {
+    let store = Store::open_in_memory().await.expect("打开内存库");
+    let base = 1_700_000_000_000;
+
+    let first = store
+        .create_session(NewSession::new("会话一").with_created_at(base))
+        .await
+        .unwrap();
+    let second = store
+        .create_session(NewSession::new("会话二").with_created_at(base + 1))
+        .await
+        .unwrap();
+
+    let hit_old = store
+        .append_message(
+            NewMessage::user(&first.id, "把 SessionStore 的落盘队列改串行")
+                .with_created_at(base + 10),
+        )
+        .await
+        .unwrap();
+    let hit_new = store
+        .append_message(
+            NewMessage::assistant(&first.id, "sessionstore 已经改好了").with_created_at(base + 11),
+        )
+        .await
+        .unwrap();
+    let other = store
+        .append_message(
+            NewMessage::user(&second.id, "换个话题：SESSIONSTORE 也算命中")
+                .with_created_at(base + 12),
+        )
+        .await
+        .unwrap();
+    store
+        .append_message(NewMessage::user(&second.id, "今天天气如何").with_created_at(base + 13))
+        .await
+        .unwrap();
+
+    // 跨会话：三条都命中，最近的在前。
+    let all = store
+        .search_messages("sessionstore", None, 50, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        all.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+        vec![other.id.clone(), hit_new.id.clone(), hit_old.id.clone()],
+        "正文命中、忽略大小写、按时间倒序"
+    );
+    assert_eq!(
+        store
+            .count_matching_messages("sessionstore", None)
+            .await
+            .unwrap(),
+        3
+    );
+
+    // 限定会话：只剩该会话的命中，计数也跟着收窄。
+    let scoped = store
+        .search_messages("sessionstore", Some(&first.id), 50, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        scoped.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+        vec![hit_new.id.clone(), hit_old.id.clone()]
+    );
+    assert_eq!(
+        store
+            .count_matching_messages("sessionstore", Some(&first.id))
+            .await
+            .unwrap(),
+        2
+    );
+
+    // 中文同样可搜：lower() 只影响 ASCII，中文不受影响也不能被破坏。
+    assert_eq!(
+        store.count_matching_messages("落盘", None).await.unwrap(),
+        1
+    );
+
+    // `%` / `_` 是字面量：没有哪条正文里真有这两个字符，必须命中 0。
+    assert_eq!(store.count_matching_messages("%", None).await.unwrap(), 0);
+    assert_eq!(store.count_matching_messages("_", None).await.unwrap(), 0);
+
+    // 分页：limit=1 取到最近一条，计数口径不变。
+    let paged = store
+        .search_messages("sessionstore", None, 1, 0)
+        .await
+        .unwrap();
+    assert_eq!(paged.len(), 1);
+    assert_eq!(paged[0].id, other.id);
+    let next = store
+        .search_messages("sessionstore", None, 1, 1)
+        .await
+        .unwrap();
+    assert_eq!(next[0].id, hit_new.id);
+}

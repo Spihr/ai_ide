@@ -101,6 +101,11 @@ pub mod session {
     pub const EXPORT: &str = "session.export";
     /// 复制会话及其消息生成一个新会话，可截断到指定消息（M5 切片三）。
     pub const FORK: &str = "session.fork";
+    /// 按关键词检索已落盘的对话正文（缺口第六批）。
+    ///
+    /// 与 `search.content` 的分工：后者搜工作区文件，前者搜会话库。对话正文不在
+    /// 工作区里，抄不到文件检索那条路上。
+    pub const SEARCH_MESSAGES: &str = "session.search_messages";
 }
 
 /// 检查点与回滚（M5 切片五）。
@@ -417,6 +422,8 @@ pub const IMPLEMENTED: &[&str] = &[
     // M5 切片三：导出与分叉（`crates/core` 已有 dispatch 分支）。
     session::EXPORT,
     session::FORK,
+    // 缺口第六批：对话正文检索。能力数 93 → 94。
+    session::SEARCH_MESSAGES,
     // M5 切片四：审计查询（写入由内核在会话关键操作处旁路完成）。
     audit::LIST,
     // M5 切片五：检查点与回滚（快照落文件、元数据落 meta.json）。
@@ -512,9 +519,9 @@ mod tests {
     #[test]
     fn implemented_list_covers_core_m1_m2_agent_domains() {
         // 缺口第四批补了两个单 hunk 暂存方法后 89 → 91；缺口第五批再补两个冲突
-        // 解决方法后 91 → 93；这个数与 `core.hello` 回报的能力数、以及
-        // `crates/core/tests/lsp_flow.rs` 的断言必须一致。
-        assert_eq!(IMPLEMENTED.len(), 93);
+        // 解决方法后 91 → 93；缺口第六批补对话正文检索后 93 → 94。这个数与
+        // `core.hello` 回报的能力数、以及 `crates/core/tests/lsp_flow.rs` 的断言必须一致。
+        assert_eq!(IMPLEMENTED.len(), 94);
         assert!(IMPLEMENTED.contains(&"core.ping"));
         assert!(IMPLEMENTED.contains(&"$/cancelRequest"));
         assert!(IMPLEMENTED.contains(&"workspace.read_file"));
@@ -548,6 +555,9 @@ mod tests {
         assert!(IMPLEMENTED.contains(&session::FORK));
         assert_eq!(session::EXPORT, "session.export");
         assert_eq!(session::FORK, "session.fork");
+        // 缺口第六批：对话正文检索进清单（dispatch 有真分支，不是占位名）。
+        assert!(IMPLEMENTED.contains(&session::SEARCH_MESSAGES));
+        assert_eq!(session::SEARCH_MESSAGES, "session.search_messages");
         // M5 切片五：检查点四个方法进清单。
         assert!(IMPLEMENTED.contains(&checkpoint::CREATE));
         assert!(IMPLEMENTED.contains(&checkpoint::LIST));
@@ -673,13 +683,13 @@ mod tests {
         // LSP 五个接线后 79；P5 切片八补 `plugin.load_many` 后 80；
         // 缺口第二批 Git 深化补九个（checkout / fetch / pull / push / stash 系列）后 89；
         // 缺口第四批补两个单 hunk 暂存（stage_hunk / unstage_hunk）后 91；
-        // 缺口第五批补两个冲突解决（conflict_read / conflict_resolve）后 93，
-        // 待接线仍为 0。
-        assert_eq!(IMPLEMENTED.len(), 93, "缺口第五批后应为 93 个已接线方法");
+        // 缺口第五批补两个冲突解决（conflict_read / conflict_resolve）后 93；
+        // 缺口第六批补 `session.search_messages` 后 94，待接线仍为 0。
+        assert_eq!(IMPLEMENTED.len(), 94, "缺口第六批后应为 94 个已接线方法");
         assert_eq!(DECLARED_NOT_IMPLEMENTED.len(), 0);
         assert_eq!(
-            total, 93,
-            "应恰好覆盖协议里定义的全部 93 个请求方法（含 LSP 五个、plugin.load_many、Git 深化九个、单 hunk 暂存两个与冲突解决两个）"
+            total, 94,
+            "应恰好覆盖协议里定义的全部 94 个请求方法（含 LSP 五个、plugin.load_many、Git 深化九个、单 hunk 暂存两个、冲突解决两个与消息检索一个）"
         );
     }
 
