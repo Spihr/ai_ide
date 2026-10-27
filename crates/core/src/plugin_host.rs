@@ -826,6 +826,18 @@ impl FsHostApi {
                 HostApiError::invalid_params("maxBytes 必须是大于 0 的整数（字节）")
             })?,
         };
+        // 二进制资产（FBX / GLB / 图片）没法走 `from_utf8_lossy`：占位符会毁掉字节。
+        // 写侧早有 `base64`，读侧缺它就只能「读不了自己写的文件」，因此对齐同一套口径。
+        let encoding = match params.get("encoding") {
+            None | Some(Value::Null) => "utf8".to_string(),
+            Some(Value::String(text)) => text.to_ascii_lowercase(),
+            Some(_) => return Err(HostApiError::invalid_params("encoding 必须是字符串")),
+        };
+        if encoding != "utf8" && encoding != "base64" {
+            return Err(HostApiError::invalid_params(format!(
+                "不支持的 encoding：{encoding}（支持 utf8 / base64）"
+            )));
+        }
         let meta = std::fs::metadata(abs).map_err(|err| io_error(abs, &err))?;
         if meta.is_dir() {
             return Err(HostApiError::new(
@@ -843,9 +855,15 @@ impl FsHostApi {
         let truncated = buffer.len() as u64 > max_bytes;
         let keep = (buffer.len() as u64).min(max_bytes) as usize;
         buffer.truncate(keep);
+        let content = if encoding == "base64" {
+            BASE64.encode(&buffer)
+        } else {
+            String::from_utf8_lossy(&buffer).to_string()
+        };
         Ok(json!({
             "path": self.display_path(abs),
-            "content": String::from_utf8_lossy(&buffer).to_string(),
+            "content": content,
+            "encoding": encoding,
             "bytes": buffer.len(),
             "truncated": truncated,
         }))
@@ -1906,6 +1924,47 @@ mod tests {
         assert_eq!(cut["bytes"], 10);
         assert_eq!(cut["truncated"], true);
         assert_eq!(cut["content"].as_str().unwrap_or("").len(), 10);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `fs.read` 的 `encoding: base64` 要字节级往返：二进制资产不能被 utf8 损耗。
+    #[test]
+    fn fs_read_base64_round_trips_binary() {
+        let root = sandbox("read-base64");
+        // 含 0xFF / 0xFE 的字节序列：任何 utf8 lossy 处理都会把它变成 U+FFFD。
+        let raw: Vec<u8> = vec![0x00, 0xFF, 0xFE, 0x80, 0x41, 0x42];
+        std::fs::write(root.join("blob.bin"), &raw).expect("写二进制");
+        let api = api_with(&root, &["fs.read"]);
+
+        let reply = api
+            .call(
+                "demo",
+                "host/fs.read",
+                &json!({ "path": "blob.bin", "encoding": "base64" }),
+            )
+            .expect("base64 读取应成功");
+        assert_eq!(reply["encoding"], "base64");
+        assert_eq!(reply["bytes"], raw.len());
+        let decoded = BASE64
+            .decode(reply["content"].as_str().unwrap_or(""))
+            .expect("回包必须是合法 base64");
+        assert_eq!(decoded, raw, "字节必须原样回来");
+
+        // 默认仍是 utf8：不传 encoding 的老调用方不受影响。
+        let text = api
+            .call("demo", "host/fs.read", &json!({ "path": "blob.bin" }))
+            .expect("utf8 读取不报错");
+        assert_eq!(text["encoding"], "utf8");
+
+        let bad = api
+            .call(
+                "demo",
+                "host/fs.read",
+                &json!({ "path": "blob.bin", "encoding": "gbk" }),
+            )
+            .expect_err("未知 encoding 必须拒");
+        assert_eq!(bad.code, HostApiError::INVALID_PARAMS);
 
         std::fs::remove_dir_all(&root).ok();
     }
