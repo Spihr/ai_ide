@@ -133,8 +133,10 @@ export function validateManifest(raw) {
 
   const commands = Array.isArray(raw.commands) ? raw.commands : []
   for (const cmd of commands) {
-    if (!cmd || typeof cmd.id !== 'string' || !TOOL_RE.test(cmd.id)) {
-      errors.push(`命令 id 非法：${JSON.stringify(cmd?.id)}`)
+    // 与内核一致：命令名的规范键是 name，id 只作为老包兼容。
+    const commandName = cmd?.name ?? cmd?.id
+    if (typeof commandName !== 'string' || !TOOL_RE.test(commandName)) {
+      errors.push(`命令 name 非法：${JSON.stringify(commandName)}（须匹配 ${TOOL_RE}）`)
     }
   }
 
@@ -152,7 +154,11 @@ export function validateManifest(raw) {
       main: raw.main,
       capabilities,
       tools: normalizedTools,
-      commands: commands.map((c) => ({ id: c.id, title: c.title ?? c.id })),
+      // 内部仍用 id 做键（命令面板按 id 触发），但来源统一取 name ?? id。
+      commands: commands.map((c) => {
+        const commandName = c.name ?? c.id
+        return { id: commandName, name: commandName, title: c.title ?? commandName }
+      }),
       subscriptions: Array.isArray(raw.subscriptions) ? raw.subscriptions : []
     },
     errors,

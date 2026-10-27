@@ -34,14 +34,24 @@ export const Methods = {
     STATE_CHANGED: 'plugin.state_changed',
     DIAGNOSTICS: 'plugin.diagnostics'
   },
-  /** 宿主 → 插件的调用 */
+  /**
+   * 宿主 → 插件的调用。
+   *
+   * 这里的方法名以 `crates/plugin/src/host.rs` 的常量为准（`plugin/handshake`、
+   * `plugin/tool-invoke`、`plugin/command-invoke`、`plugin/event`）。`LEGACY_*`
+   * 是 P1 之前的旧口径，只用于兼容老 demo 包，新写插件不要用。
+   */
   rpc: {
-    INITIALIZE: 'plugin/initialize',
+    HANDSHAKE: 'plugin/handshake',
+    LEGACY_HANDSHAKE: 'plugin/initialize',
     SHUTDOWN: 'plugin/shutdown',
     PING: 'plugin/ping',
-    TOOL_INVOKE: 'tool/invoke',
-    COMMAND_INVOKE: 'command/invoke',
-    EVENT_NOTIFY: 'event/notify'
+    TOOL_INVOKE: 'plugin/tool-invoke',
+    LEGACY_TOOL_INVOKE: 'tool/invoke',
+    COMMAND_INVOKE: 'plugin/command-invoke',
+    LEGACY_COMMAND_INVOKE: 'command/invoke',
+    EVENT_NOTIFY: 'plugin/event',
+    LEGACY_EVENT_NOTIFY: 'event/notify'
   },
   /** 插件 → 宿主的能力调用 */
   host: {
@@ -50,7 +60,7 @@ export const Methods = {
     FS_LIST: 'host/fs.list',
     FS_STAT: 'host/fs.stat',
     SEARCH_CONTENT: 'host/search/content',
-    WORKSPACE_INFO: 'host/workspace/info',
+    WORKSPACE_INFO: 'host/workspace.info',
     NET_FETCH: 'host/net.fetch',
     LOG: 'host/log',
     PROGRESS: 'host/progress'

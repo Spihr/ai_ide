@@ -148,7 +148,7 @@ export class PluginHost extends EventEmitter {
 
     entry.proc = proc.start()
 
-    const result = await entry.proc.request(Methods.rpc.INITIALIZE, {
+    const result = await entry.proc.request(Methods.rpc.HANDSHAKE, {
       pluginApi: PLUGIN_API_VERSION,
       host: { product: 'ai-ide', version: '0.0.0-demo' },
       plugin: { id: entry.manifest.id, version: entry.manifest.version },

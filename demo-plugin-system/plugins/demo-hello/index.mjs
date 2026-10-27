@@ -56,7 +56,7 @@ function progress(token, message, percent) {
 // ── 工具实现 ──────────────────────────────────────────────────────────────
 
 async function repoStats() {
-  const info = await callHost('host/workspace/info')
+  const info = await workspaceInfo()
   const extCount = new Map()
   let files = 0
   let dirs = 0
@@ -69,10 +69,13 @@ async function repoStats() {
     progress('repo-stats', `扫描 ${dir}`, Math.min(90, depth * 25))
     for (const entry of entries) {
       // 点开头目录自己先跳过：即便不跳，PathGuard 也会拦（escape_probe 证明了这点）
-      if (entry.kind === 'dir') {
+      // 内核回 { name, dir, size }（没有绝对路径），原型宿主回 { kind, path }：两种都认。
+      const isDir = entry.dir === true || entry.kind === 'dir'
+      const childPath = entry.path ?? (dir === '.' ? entry.name : `${dir}/${entry.name}`)
+      if (isDir) {
         if (entry.name.startsWith('.')) continue
         dirs += 1
-        await walk(entry.path, depth + 1)
+        await walk(childPath, depth + 1)
       } else {
         files += 1
         bytes += entry.size
@@ -86,7 +89,7 @@ async function repoStats() {
 
   const top = [...extCount.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5)
   const lines = [
-    `工作区：${info.name}（${info.id}）`,
+    `工作区：${info.name}（${info.root}）`,
     `文件 ${files} 个 / 目录 ${dirs} 个 / 合计 ${(bytes / 1024).toFixed(1)} KiB`,
     '扩展名分布：',
     ...top.map(([ext, n]) => `  ${ext.padEnd(10, ' ')} ${n}`)
@@ -119,7 +122,7 @@ async function escapeProbe() {
   for (const attempt of attempts) {
     try {
       const r = await callHost('host/fs.read', { path: attempt.path })
-      lines.push(`✗ ${attempt.label} 未被拦截，读到 ${r.size} 字节 —— 闸门失效`)
+      lines.push(`✗ ${attempt.label} 未被拦截，读到 ${r.bytes ?? 0} 字节 —— 闸门失效`)
     } catch (err) {
       lines.push(`✓ ${attempt.label} 被拦：${err.code} ${err.message}`)
     }
@@ -169,29 +172,49 @@ const TOOLS = {
 
 const COMMANDS = {
   greet: async () => {
-    const info = await callHost('host/workspace/info')
+    const info = await workspaceInfo()
     return { content: `你好，来自 demo-hello @ ${info.name}` }
   }
 }
 
 // ── RPC 主循环 ────────────────────────────────────────────────────────────
 
-async function handleRequest(method, params) {
-  switch (method) {
-    case 'plugin/initialize': {
-      context = params
-      log('info', `initialize，宿主 ${context.host?.product} ，工作区 ${context.workspace?.name}`)
-      // 刻意不回传 rootPath：插件不需要知道绝对路径。
-      return {
-        pluginApi: PLUGIN_API,
-        name: 'demo-hello',
-        version: '1.0.0',
-        tools: Object.keys(TOOLS).map((name) => ({ name })),
-        commands: [{ id: 'greet', title: 'Demo Hello: 打个招呼' }],
-        subscriptions: ['workspace.changed']
-      }
-    }
+/**
+ * 方法名以内核常量（crates/plugin/src/host.rs）为准，旧名保留只为兼容
+ * demo-plugin-system/mock-host 这套原型宿主（它的 Methods.rpc 还是 P1 口径）。
+ */
+const HANDSHAKE_METHODS = new Set(['plugin/handshake', 'plugin/initialize'])
 
+/** 内核叫 `host/workspace.info`，原型宿主叫 `host/workspace/info`：撞 -32601 就换旧名。 */
+async function workspaceInfo() {
+  try {
+    return await callHost('host/workspace.info')
+  } catch (err) {
+    if (err.code !== -32601) throw err
+    return await callHost('host/workspace/info')
+  }
+}
+
+function handshake(params) {
+  context = params
+  log('info', `handshake，宿主 ${context.host?.product} ，工作区 ${context.workspace?.name}`)
+  // 刻意不回传 rootPath：插件不需要知道绝对路径。
+  // commands 的键名只能是 name：宿主按 serde 严格解，name 与 id 同时出现会报 duplicate field。
+  return {
+    pluginApi: PLUGIN_API,
+    name: 'demo-hello',
+    version: '1.0.0',
+    tools: Object.keys(TOOLS).map((name) => ({ name })),
+    commands: [{ name: 'greet', title: 'Demo Hello: 打个招呼' }],
+    subscriptions: ['workspace.changed']
+  }
+}
+
+async function handleRequest(method, params) {
+  if (HANDSHAKE_METHODS.has(method)) return handshake(params)
+
+  switch (method) {
+    case 'plugin/tool-invoke':
     case 'tool/invoke': {
       const fn = TOOLS[params?.tool]
       if (!fn) {
@@ -202,6 +225,7 @@ async function handleRequest(method, params) {
       return await fn(params.arguments ?? {})
     }
 
+    case 'plugin/command-invoke':
     case 'command/invoke': {
       const fn = COMMANDS[params?.command]
       if (!fn) {
@@ -209,7 +233,8 @@ async function handleRequest(method, params) {
         err.code = -32601
         throw err
       }
-      return await fn(params.arguments ?? {})
+      // 内核发的是 { command, args }；原型宿主发的是 arguments。
+      return await fn(params.args ?? params.arguments ?? {})
     }
 
     case 'plugin/ping':
@@ -259,7 +284,8 @@ rl.on('line', (line) => {
 
   // 通知帧（无 id）
   if (frame.id === undefined) {
-    if (frame.method === 'event/notify') {
+    // 内核用 plugin/event 投递事件；event/notify 是原型宿主的旧名。
+    if (frame.method === 'plugin/event' || frame.method === 'event/notify') {
       log('info', `收到事件 ${frame.params?.event}：${JSON.stringify(frame.params?.payload ?? {})}`)
     }
     return
