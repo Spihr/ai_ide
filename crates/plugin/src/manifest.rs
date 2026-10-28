@@ -28,7 +28,12 @@ use serde_json::{json, Map, Value};
 pub const HOST_PLUGIN_API_MAJOR: u32 = 1;
 
 /// 宿主实现的插件 API 小版本。清单 minor 高于它只降级、不拒载。
-pub const HOST_PLUGIN_API_MINOR: u32 = 0;
+///
+/// 1.1 = 声明式视图（docs/24）：`views[]` 解析、`plugin.status` 原样下发、
+/// `plugin:view` 刷新事件、外部视口 spawn。这一整套已经在这里落地，宿主就该
+/// 如实报 1 而不是继续报 0——否则消费方（asset3d）声明 `1.1` 时会被打上
+/// 「按宿主演进能力集降级运行」的告警，用户看到的是一条并不存在的兼容问题。
+pub const HOST_PLUGIN_API_MINOR: u32 = 1;
 
 /// 清单文件名。
 pub const MANIFEST_FILE: &str = "plugin.json";

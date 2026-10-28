@@ -268,7 +268,9 @@ async fn api_major_mismatch_is_reported() {
             host: host_api,
         }) => {
             assert_eq!(plugin, "2.0");
-            assert_eq!(host_api, "1.0");
+            // 宿主能力集写死在这里是有意的：minor 变了就说明 `plugin.status` 的
+            // 字段集变了（1.1 起多下发 `views`），这条断言逼着人回来确认一次。
+            assert_eq!(host_api, "1.1");
         }
         other => panic!("API major 不等必须拒绝，实际 {other:?}"),
     }
