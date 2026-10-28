@@ -41,7 +41,9 @@
     "verify:m6": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test -p ai-ide-terminal && cargo test -p ai-ide-git && cargo test --workspace && cargo build -p ai-ide-core && node scripts/smoke-core.mjs && node scripts/smoke-m1.mjs && pnpm scan:secrets && pnpm lint && pnpm typecheck && pnpm test && pnpm --filter @ai-ide/desktop build && node scripts/e2e-m1.mjs",
     "verify:m7": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo build -p ai-ide-mcp --bin mcp-mock-server && cargo test -p ai-ide-mcp && cargo test --workspace && cargo build -p ai-ide-core && node scripts/smoke-core.mjs && node scripts/smoke-m1.mjs && pnpm scan:secrets && pnpm lint && pnpm typecheck && pnpm test && pnpm --filter @ai-ide/desktop build && node scripts/e2e-m1.mjs",
     "e2e:m7": "node scripts/e2e-m7.mjs",
-    "e2e:m8": "node scripts/e2e-m8.mjs"
+    "e2e:m8": "node scripts/e2e-m8.mjs",
+    "package:dir:offline": "pnpm verify:versions && node scripts/prepack-core.mjs && pnpm --filter @ai-ide/desktop build && node scripts/offline-pack.mjs --dir && node scripts/verify-package.mjs",
+    "dist:offline": "pnpm verify:versions && node scripts/prepack-core.mjs && pnpm --filter @ai-ide/desktop build && node scripts/offline-pack.mjs && node scripts/verify-package.mjs --installer"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

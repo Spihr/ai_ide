@@ -55,7 +55,7 @@
     }
   ],
   "commands": [
-    { "id": "greet", "title": "Demo Hello: 打个招呼" }
+    { "name": "greet", "title": "Demo Hello: 打个招呼" }
   ],
   "subscriptions": ["workspace.changed"]
 }

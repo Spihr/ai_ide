@@ -81,6 +81,10 @@ pub struct HandshakeTool {
 /// 握手回包里的命令声明。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandshakeCommand {
+    /// 命令名。兼容清单里的 `id` 写法：清单校验（`manifest::parse_commands`）本来就
+    /// 接受 `name` / `id` 两种键，握手却只认 `name`，同一个包会在两步得到相反结论
+    /// ——清单过了、握手报 6106 `missing field name`。口径必须一致。
+    #[serde(alias = "id")]
     pub name: String,
     #[serde(default)]
     pub title: Option<String>,
@@ -1121,9 +1125,56 @@ async fn handshake(process: &PluginProcess, params: Value) -> Result<Handshake, 
         Err(error) => return Err(map_request_error(HANDSHAKE_METHOD, process, error).await),
     };
 
-    serde_json::from_value(reply).map_err(|error| LoadError::Protocol {
-        message: format!("握手回包不是合法的握手结构：{error}"),
+    serde_json::from_value(reply.clone()).map_err(|error| LoadError::Protocol {
+        message: format!(
+            "握手回包不是合法的握手结构：{}{}",
+            error,
+            locate_handshake_field(&reply, &error)
+        ),
     })
+}
+
+/// 给 serde 的「missing field `x`」补一条定位线索。
+///
+/// `serde_json` 只报字段名，不报它在数组的第几项——插件作者拿到一句
+/// `missing field \`name\`` 只能全文搜索，而真正出错的地方常常是
+/// `commands[0]` 用了 `id`。这里把回包里最可能的越界项连同它现有的键名一起指出来。
+fn locate_handshake_field(reply: &Value, error: &serde_json::Error) -> String {
+    let detail = error.to_string();
+    let Some((_, tail)) = detail.split_once("missing field `") else {
+        return String::new();
+    };
+    let field = tail.split('`').next().unwrap_or("");
+    if field.is_empty() {
+        return String::new();
+    }
+    for section in ["tools", "commands"] {
+        let Some(items) = reply.get(section).and_then(Value::as_array) else {
+            continue;
+        };
+        for (index, item) in items.iter().enumerate() {
+            let Some(object) = item.as_object() else {
+                continue;
+            };
+            if object.contains_key(field) {
+                continue;
+            }
+            let keys = object
+                .keys()
+                .map(|key| format!("`{key}`"))
+                .collect::<Vec<_>>()
+                .join("、");
+            return format!(
+                "（定位：{section}[{index}] 缺 `{field}`，实际带有 {}）",
+                if keys.is_empty() {
+                    "空对象".to_string()
+                } else {
+                    keys
+                }
+            );
+        }
+    }
+    String::new()
 }
 
 async fn map_request_error(stage: &str, process: &PluginProcess, error: RequestError) -> LoadError {
@@ -1258,6 +1309,80 @@ mod tests {
     use crate::manifest::ManifestTool;
     use ai_ide_protocol::PluginToolRisk;
     use std::process::Stdio;
+
+    /// 真插件回归：仓库里的 `demo-plugin-system/plugins/demo-hello` 必须能装载。
+    ///
+    /// 这条测试盯的是「插件作者写对了、宿主却判协议违规」这一类事故。它的价值在于
+    /// 用的是**真文件**（真清单 + 真 index.mjs），而不是测试里手搓的替身脚本——
+    /// 替身只回显宿主想看的字段，永远抓不到「插件回 commands[{id}]、宿主只认 name」。
+    #[tokio::test]
+    async fn demo_plugin_in_repo_passes_handshake() {
+        if !node_ready() {
+            return;
+        }
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../demo-plugin-system/plugins/demo-hello");
+        if !dir.join("index.mjs").exists() {
+            return;
+        }
+        let raw: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("plugin.json")).expect("读 demo 清单"),
+        )
+        .expect("解析 demo 清单");
+        let validated = crate::manifest::validate(&dir, &raw).expect("demo 清单应通过校验");
+
+        let host = Host::new();
+        let loaded = host
+            .load(LoadSpec {
+                plugin_id: "demo-hello",
+                install_dir: &dir,
+                validated: &validated,
+                requested: validated.manifest.capabilities.clone(),
+                granted: validated.manifest.capabilities.clone(),
+                workspace: json!({ "name": "demo", "rootPath": dir }),
+            })
+            .await
+            .expect("demo 插件应装载成功");
+
+        assert_eq!(loaded.handshake.name.as_deref(), Some("demo-hello"));
+        assert_eq!(loaded.handshake.commands[0].name, "greet");
+        assert_eq!(loaded.tools.len(), 6, "六个工具都要注册");
+        host.unload("demo-hello").await;
+    }
+
+    /// 命令项用清单口径的 `id` 时，握手解析不该 6106。
+    ///
+    /// 这条回归对应真实事故：demo 插件握手回包写 `commands: [{id, title}]`，
+    /// 清单校验放行、握手报 `missing field name`，把一个「清单写对了」的包判成协议违规。
+    #[test]
+    fn handshake_command_accepts_id_alias() {
+        let reply = json!({
+            "pluginApi": { "major": 1, "minor": 0 },
+            "name": "demo",
+            "version": "1.0.0",
+            "tools": [{ "name": "echo" }],
+            "commands": [{ "id": "greet", "title": "打个招呼" }],
+        });
+        let handshake: Handshake = serde_json::from_value(reply).expect("id 应能解析为 name");
+        assert_eq!(handshake.commands[0].name, "greet");
+        assert_eq!(handshake.commands[0].title.as_deref(), Some("打个招呼"));
+    }
+
+    /// 真正缺字段时，错误里要指出是哪个数组的第几项。
+    #[test]
+    fn handshake_error_locates_offending_item() {
+        let reply = json!({
+            "pluginApi": { "major": 1, "minor": 0 },
+            "tools": [{ "name": "echo" }],
+            "commands": [{ "title": "没有名字" }],
+        });
+        let error = serde_json::from_value::<Handshake>(reply.clone()).expect_err("缺 name 应报错");
+        let hint = locate_handshake_field(&reply, &error);
+        assert!(
+            hint.contains("commands[0]") && hint.contains("`title`"),
+            "定位线索不足：{hint}"
+        );
+    }
 
     /// 最小的工具调用替身：把 `params` 原样回显，并带上收到的方法名。
     const ECHO_TOOL: &str = r#"
