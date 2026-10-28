@@ -294,6 +294,10 @@ function installHarness(): Harness {
     onPluginLog: () => () => undefined,
     onPluginProgress: () => () => undefined,
     onPluginStateChanged: () => () => undefined,
+    onPluginView: () => () => undefined,
+    onViewportState: () => () => undefined,
+    openExternalViewport: () => Promise.resolve({ reused: false }),
+
     onLspDiagnostics: () => () => undefined
   }
 

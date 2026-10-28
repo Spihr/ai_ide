@@ -136,7 +136,9 @@ function installHarness(): Harness {
                 input_schema: { type: 'object' }
               }
             ],
-            commands: [{ name: 'hello', title: '打招呼', description: '打个招呼', risk: 'read' }]
+            commands: [{ name: 'hello', title: '打招呼', description: '打个招呼', risk: 'read' }],
+            // 第 3 刀只做视图宿主，详情夹具先给空视图列表；第 4 刀接线后此处补真实声明。
+            views: []
           }
           return detail
         }

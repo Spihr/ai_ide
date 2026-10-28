@@ -12,11 +12,12 @@
 import { app, BrowserWindow, dialog, ipcMain, safeStorage } from 'electron'
 import { dirname, join } from 'node:path'
 
-import { Methods, type HelloResult } from '@ai-ide/shared-types'
+import { Methods, type HelloResult, type PluginStatusResult } from '@ai-ide/shared-types'
 import { createCoreLogSink, type CoreLogSink } from './core-log-file'
 import { CoreRpcError, CoreSupervisor } from './core-supervisor'
 import { CredentialVault } from './credentials'
 import { checkRendererCall } from './policy'
+import { ViewportHost, ViewportSpawnError } from './viewport-host'
 import {
   extractDeletedProviderId,
   extractUpsertedKey,
@@ -30,6 +31,7 @@ import {
   type CoreLogChunk,
   type CoreStatus,
   type CredentialStatus,
+  type ExternalViewportResult,
   type PingBenchmarkResult
 } from '../shared/ipc'
 
@@ -49,6 +51,12 @@ if (userDataOverride && userDataOverride.trim().length > 0) {
 let supervisor: CoreSupervisor | null = null
 let mainWindow: BrowserWindow | null = null
 let vault: CredentialVault | null = null
+/**
+ * 外部视口进程表（docs/24 §5.4）。
+ *
+ * 懒建：单测与「只看不打开视口」的场景不该因为模块里有 `new` 就多一份状态。
+ */
+let viewportHost: ViewportHost | null = null
 
 let currentStatus: CoreStatus = {
   state: 'idle',
@@ -149,11 +157,17 @@ function formatCoreLogNotification(params: unknown): string {
 // 密钥托管（docs/02 §6.3）
 // ---------------------------------------------------------------------------
 
-/** 插件可观测事件（P5 切片七）：插件遥测专用的三条通道。 */
+/**
+ * 插件事件 → 专用通道（P5 切片七 / docs/24 第 4 刀）。
+ *
+ * 四条同属「宿主内部通道」：不按 `event` 信封解，各自一条 IPC 道。`plugin.view`
+ * 也走这里——它只带三个标识，收到后渲染侧自己去 `plugin.call` 取数。
+ */
 function pluginEventChannel(method: string): string | null {
   if (method === Methods.event.pluginLog) return IpcChannels.pluginLog
   if (method === Methods.event.pluginProgress) return IpcChannels.pluginProgress
   if (method === Methods.event.pluginStateChanged) return IpcChannels.pluginStateChanged
+  if (method === Methods.event.pluginView) return IpcChannels.pluginView
   return null
 }
 
@@ -193,6 +207,7 @@ function eventChannel(method: string): string | null {
     case Methods.event.pluginLog:
     case Methods.event.pluginProgress:
     case Methods.event.pluginStateChanged:
+    case Methods.event.pluginView:
       return pluginEventChannel(method)
     default:
       return isAiEvent(method) ? IpcChannels.aiEvent : null
@@ -416,6 +431,80 @@ function toRendererError(method: string, error: unknown): unknown {
   )
 }
 
+/**
+ * 确保插件声明的外部视口就绪（docs/24 §5.4）。
+ *
+ * 路径来源是**内核**而不是渲染进程：
+ *
+ * 1. `plugin.status` 拿 `install_dir` 与 `views[].external.program`；
+ * 2. 主进程把相对路径拼成绝对路径、过围栏、限扩展名、查文件存在；
+ * 3. 用数组参数 `spawn`，不经 shell。
+ *
+ * 渲染侧只递 `pluginId + viewId`，因此「渲染进程被攻破」最多能让用户重复点开
+ * 自己已经装过的插件窗口，变不成「拿 IDE 当启动器执行任意 exe」。
+ */
+async function spawnExternalViewport(
+  pluginId: unknown,
+  viewId: unknown
+): Promise<ExternalViewportResult> {
+  if (typeof pluginId !== 'string' || pluginId.trim().length === 0) {
+    throw new Error('pluginId 必须是非空字符串')
+  }
+  if (typeof viewId !== 'string' || viewId.trim().length === 0) {
+    throw new Error('viewId 必须是非空字符串')
+  }
+
+  const id = pluginId.trim()
+  const status = (await requireSupervisor().request(Methods.plugin.status, {
+    plugin_id: id
+  })) as PluginStatusResult
+
+  const view = (status.views ?? []).find((item) => item.id === viewId.trim())
+  if (!view) {
+    throw new Error(`插件 ${id} 没有声明视图 ${viewId}`)
+  }
+  if (!view.external) {
+    throw new Error('该视图只有描述树，不需要外部进程')
+  }
+
+  try {
+    const spawned = await requireViewportHost().spawnViewport({
+      pluginId: id,
+      viewId: view.id,
+      // 内核不回安装目录（老内核）时不猜路径：`install_missing` 会走到
+      // 「请重新安装插件」，比按 `<data_dir>/plugins/<id>` 猜错目录安全。
+      installDir: status.plugin.install_dir ?? '',
+      program: view.external.program,
+      protocol: view.external.protocol
+    })
+    return { reused: spawned.reused }
+  } catch (error) {
+    if (error instanceof ViewportSpawnError) {
+      // 原因码跟着文案走：面板按 `code=` 分流到「重新安装」/「查看插件日志」，
+      // 只给一句「启动失败」等于把排查成本推给用户。
+      // `cause` 保留原始错误（eslint preserve-caught-error）：渲染侧只按 `code=`
+      // 分流，但主进程日志里还得能看见 stack。
+      throw new Error(`${error.message}（code=${error.code}）`, { cause: error })
+    }
+    throw error
+  }
+}
+
+function requireViewportHost(): ViewportHost {
+  if (!viewportHost) {
+    viewportHost = new ViewportHost({
+      // 视口退出要回到面板（docs/24 §5.3）：用户关窗或进程崩溃后，
+      // 按钮不能一直停在「已打开」。主窗口已经销毁（IDE 正在退）时静默丢弃，
+      // 那时候没人会看这条提示。
+      onExit: (info) => {
+        if (!mainWindow || mainWindow.isDestroyed()) return
+        mainWindow.webContents.send(IpcChannels.viewportStateChanged, info)
+      }
+    })
+  }
+  return viewportHost
+}
+
 function registerIpc(): void {
   ipcMain.handle(IpcChannels.coreStatus, async (): Promise<CoreStatus> => currentStatus)
 
@@ -491,6 +580,12 @@ function registerIpc(): void {
       broadcastCredentialStatus()
       return credentialStatus()
     }
+  )
+
+  ipcMain.handle(
+    IpcChannels.pluginSpawnExternalView,
+    async (_event, pluginId: unknown, viewId: unknown): Promise<ExternalViewportResult> =>
+      spawnExternalViewport(pluginId, viewId)
   )
 
   ipcMain.handle(IpcChannels.pickWorkspace, async (): Promise<string | null> => {
@@ -607,6 +702,8 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', (event) => {
+  // 视口进程不随 IDE 退出（用户可能正看着模型，§5.3），这里只清空外壳的进程表。
+  viewportHost?.dispose()
   if (!supervisor?.isRunning) return
   event.preventDefault()
   const instance = supervisor

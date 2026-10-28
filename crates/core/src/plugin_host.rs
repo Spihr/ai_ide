@@ -53,13 +53,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use ai_ide_plugin::events::{
-    progress_payload, state_changed_payload, PLUGIN_LOG, PLUGIN_PROGRESS, PLUGIN_STATE_CHANGED,
+    progress_payload, state_changed_payload, view_refresh_payload, PLUGIN_LOG, PLUGIN_PROGRESS,
+    PLUGIN_STATE_CHANGED, PLUGIN_VIEW,
 };
 use ai_ide_plugin::host::Host;
 use ai_ide_plugin::host_api::{
     HostApi, HostApiError, LLM_CHAT_CAPABILITY, LLM_CHAT_METHOD, LOG_METHOD, NET_FETCH_CAPABILITY,
-    NET_FETCH_METHOD, PROGRESS_CAPABILITY, PROGRESS_METHOD,
+    NET_FETCH_METHOD, PROGRESS_CAPABILITY, PROGRESS_METHOD, VIEW_REFRESH_METHOD,
 };
+use ai_ide_plugin::manifest::is_valid_view_id;
 use ai_ide_store::{audit_actor, audit_kind, NewAuditEvent, Store};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -563,6 +565,19 @@ impl FsHostApi {
             PLUGIN_STATE_CHANGED,
             state_changed_payload(plugin_id, state),
         );
+    }
+
+    /// 把一次「视图该重拉了」推给外壳窗口（`plugin.view`，docs/24 §4.5）。
+    ///
+    /// 只走 `emit_shell`，**不分发给订阅了事件的插件**：一条刷新的意义只在
+    /// 「用户眼前的那个视图脏了」，插件自己写过什么它自己清楚；把它塞进
+    /// `plugin/event` 队列只会让订阅 `*` 的插件被别人的重绘无谓唤醒，还可能
+    /// 在队列满时挤掉一条真正有用的事件。
+    ///
+    /// `rev` 由插件给，宿主不校验单调性：这里只是个传话筒，判新旧是渲染侧的
+    /// 事（它手上才有上一次的 `rev`）。
+    pub fn announce_shell_view(&self, plugin_id: &str, view_id: &str, rev: u64) {
+        self.emit_shell(PLUGIN_VIEW, view_refresh_payload(plugin_id, view_id, rev));
     }
 
     /// 装上写侧审批裁决方（`AppState` 接线 / 单测注入）。
@@ -1764,6 +1779,42 @@ impl HostApi for FsHostApi {
                 // 一条订阅都没有时也照推（`delivered` 为 0 只是「没插件要」）。
                 self.emit_shell(PLUGIN_PROGRESS, payload);
                 tracing::debug!(plugin_id, forwarded, "插件进度");
+                Ok(())
+            }
+            VIEW_REFRESH_METHOD => {
+                // 形状按清单里 `views[].id` 的同一套规则判（`is_valid_view_id`）：
+                // 宿主并不持有清单，判不了「这个 id 是不是你自己声明的」，但能判
+                // 「它长得像不像一个视图 id」。剩下的交给渲染侧——它只对当前激活
+                // 的那个视图响应，报一个不存在的 id 最多是白喊一嗓子，进不了任何
+                // 数据面。
+                let view_id = params
+                    .get("viewId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !is_valid_view_id(view_id) {
+                    return Err(HostApiError::new(
+                        HostApiError::INVALID_PARAMS,
+                        "host/view.refresh 需要合法 viewId（^[a-z][a-z0-9_-]{0,31}$）",
+                    ));
+                }
+                // `rev` 可省（省了按 0 处理，等于「我这一版就是第 0 版」）；给了就
+                // 必须是无符号整数——收下 -1 之后再去猜它想表达什么，只会让渲染侧
+                // 的新旧比较出现一个说不清的负号。
+                let rev = match params.get("rev") {
+                    None | Some(Value::Null) => 0,
+                    Some(value) => match value.as_u64() {
+                        Some(rev) => rev,
+                        None => {
+                            return Err(HostApiError::new(
+                                HostApiError::INVALID_PARAMS,
+                                "host/view.refresh 的 rev 必须是非负整数",
+                            ))
+                        }
+                    },
+                };
+                let payload = view_refresh_payload(plugin_id, view_id, rev);
+                self.emit_shell(PLUGIN_VIEW, payload);
+                tracing::debug!(plugin_id, view_id, rev, "插件视图刷新");
                 Ok(())
             }
             _ => Err(HostApiError::method_not_found(method)),
@@ -3301,6 +3352,94 @@ mod tests {
         assert_eq!(taken[0].1["pluginId"], json!("demo"));
         assert_eq!(taken[0].1["level"], json!("info"));
         assert_eq!(taken[0].1["message"], json!("hi"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `host/view.refresh` 不需要能力，转成 `plugin.view`，载荷只有三键。
+    ///
+    /// 与进度那条测试同一个着眼点：载荷由宿主重拼，插件塞的 `content` 只能消失；
+    /// 身份由宿主认定，`pluginId` 伪造不进来。区别是不设能力闸门——刷新的最坏
+    /// 后果是多一次 `plugin.call`，而那次调用自己还要过闸门。
+    #[test]
+    fn view_refresh_is_forwarded_as_plugin_view() {
+        let root = sandbox("view-refresh-fwd");
+        let api = api_with(&root, &[]);
+        let shell = Arc::new(RecordingShell::default());
+        api.set_shell_events(shell.clone());
+
+        api.notify(
+            "demo",
+            "host/view.refresh",
+            &json!({
+                "viewId": "outline",
+                "rev": 7,
+                "content": "秘密文件内容",
+                "pluginId": "forged",
+            }),
+        )
+        .expect("视图刷新不需要能力");
+
+        let seen = shell.taken();
+        assert_eq!(seen.len(), 1, "外壳窗口应收到一条：{seen:?}");
+        assert_eq!(seen[0].0, PLUGIN_VIEW);
+        let payload = &seen[0].1;
+        assert_eq!(
+            payload,
+            &json!({ "pluginId": "demo", "viewId": "outline", "rev": 7 }),
+            "载荷只该有三个标识键"
+        );
+
+        // 省略 `rev` 按 0 处理：插件没版本号时也不该被拒。
+        api.notify("demo", "host/view.refresh", &json!({ "viewId": "outline" }))
+            .expect("rev 可省");
+        let seen = shell.taken();
+        assert_eq!(seen.last().map(|item| item.1["rev"].clone()), Some(json!(0)));
+
+        // 内核侧也能直接推（`announce_shell_view`）。
+        api.announce_shell_view("demo", "outline", 8);
+        assert_eq!(
+            shell.taken().last().cloned(),
+            Some((PLUGIN_VIEW.to_string(), json!({
+                "pluginId": "demo",
+                "viewId": "outline",
+                "rev": 8
+            })))
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 畸形 `viewId` / `rev` 一律 -32602，且一个字都不投。
+    #[test]
+    fn view_refresh_rejects_malformed_params() {
+        let root = sandbox("view-refresh-bad");
+        let api = api_with(&root, &[]);
+        let shell = Arc::new(RecordingShell::default());
+        api.set_shell_events(shell.clone());
+
+        for params in [
+            json!({}),
+            json!({ "viewId": "" }),
+            json!({ "viewId": "Bad/ID" }),
+            json!({ "viewId": "9lives" }),
+            json!({ "viewId": "a".repeat(33) }),
+        ] {
+            let err = api
+                .notify("demo", "host/view.refresh", &params)
+                .expect_err("非法 viewId");
+            assert_eq!(err.code, HostApiError::INVALID_PARAMS, "{params}");
+        }
+
+        let err = api
+            .notify(
+                "demo",
+                "host/view.refresh",
+                &json!({ "viewId": "outline", "rev": -1 }),
+            )
+            .expect_err("负 rev");
+        assert_eq!(err.code, HostApiError::INVALID_PARAMS);
+        assert!(shell.taken().is_empty(), "畸形参数不得外泄：{:?}", shell.taken());
 
         std::fs::remove_dir_all(&root).ok();
     }

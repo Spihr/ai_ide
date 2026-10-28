@@ -14,13 +14,16 @@ import {
   type CoreLogChunk,
   type CoreStatus,
   type CredentialStatus,
+  type ExternalViewportResult,
   type LspDiagnosticsEvent,
   type PingBenchmarkResult,
   type PluginLogEvent,
   type PluginProgressEvent,
   type PluginStateChangedEvent,
+  type PluginViewRefreshEvent,
   type TerminalDataEvent,
   type TerminalExitEvent,
+  type ViewportStateEvent,
   type WorkspaceChangedEvent,
   type WorkspaceIndexedEvent
 } from '../shared/ipc'
@@ -144,6 +147,29 @@ const api: AiIdeApi = {
       ipcRenderer.removeListener(IpcChannels.pluginStateChanged, handler)
     }
   },
+
+  onPluginView: (listener: (event: PluginViewRefreshEvent) => void): (() => void) => {
+    const handler = (_event: IpcRendererEvent, payload: PluginViewRefreshEvent): void =>
+      listener(payload)
+    ipcRenderer.on(IpcChannels.pluginView, handler)
+    return () => {
+      ipcRenderer.removeListener(IpcChannels.pluginView, handler)
+    }
+  },
+
+  onViewportState: (listener: (event: ViewportStateEvent) => void): (() => void) => {
+    const handler = (_event: IpcRendererEvent, payload: ViewportStateEvent): void =>
+      listener(payload)
+    ipcRenderer.on(IpcChannels.viewportStateChanged, handler)
+    return () => {
+      ipcRenderer.removeListener(IpcChannels.viewportStateChanged, handler)
+    }
+  },
+
+  // 外部视口（docs/24 §5.4）：渲染侧只交出 `pluginId + viewId`，路径解析与 spawn
+  // 全在主进程。这里是「收窄 API」最典型的一处——传路径的接口根本不存在。
+  openExternalViewport: (pluginId: string, viewId: string): Promise<ExternalViewportResult> =>
+    ipcRenderer.invoke(IpcChannels.pluginSpawnExternalView, pluginId, viewId),
 
   onLspDiagnostics: (listener: (event: LspDiagnosticsEvent) => void): (() => void) => {
     const handler = (_event: IpcRendererEvent, payload: LspDiagnosticsEvent): void => listener(payload)

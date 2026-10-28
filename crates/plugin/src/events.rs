@@ -37,6 +37,13 @@ pub const PLUGIN_LOG: &str = "plugin.log";
 /// 插件长任务进度（由 `host/progress` 转成）。
 /// 载荷 `{pluginId,token,message,percent,truncated}`，见 [`progress_payload`]。
 pub const PLUGIN_PROGRESS: &str = "plugin.progress";
+/// 插件视图需要重拉（由 `host/view.refresh` 转成，docs/24 §4.5）。
+///
+/// 载荷 `{pluginId,viewId,rev}`，见 [`view_refresh_payload`]。这是**纯提示**：
+/// 事件本身不带任何视图数据，收件方拿着 `viewId` 自己走 `plugin.call` 去取，
+/// 那条路照样过闸门、过审计。于是「插件想让我重画」这件事既拿不到额外信息面，
+/// 也没法把事件队列当成搬运通道刷满。
+pub const PLUGIN_VIEW: &str = "plugin.view";
 
 /// `host/progress` 单条消息的字符上限。
 ///
@@ -115,6 +122,18 @@ pub fn session_payload(session_id: &str) -> Value {
 /// 所以「伪造别人挂掉」这条路在协议层就不存在。
 pub fn state_changed_payload(plugin_id: &str, state: &str) -> Value {
     json!({ "pluginId": plugin_id, "state": state })
+}
+
+/// `plugin.view` 的载荷：`{pluginId,viewId,rev}`。
+///
+/// 三个键全是**标识**，没有一个能装内容：`pluginId` 由宿主按进程句柄覆盖
+/// （插件自报的值到不了这里），`viewId` 是清单里声明的那个 id，`rev` 是插件
+/// 自己的单调计数，只用来让渲染侧判「这一帧比手上的新吗」。
+///
+/// 没有 `truncated` 标记：`viewId` 超长就是畸形参数（见 `host/view.refresh`
+/// 的校验），静默截断反而会把它指到一个不存在的视图上——那比报错更难查。
+pub fn view_refresh_payload(plugin_id: &str, view_id: &str, rev: u64) -> Value {
+    json!({ "pluginId": plugin_id, "viewId": view_id, "rev": rev })
 }
 
 /// `plugin.progress` 的载荷：`{pluginId,token,message,percent,truncated}`。

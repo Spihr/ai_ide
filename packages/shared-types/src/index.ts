@@ -364,6 +364,8 @@ export type { PluginGrantParams } from "./generated/PluginGrantParams";
 export type { PluginGrantResult } from "./generated/PluginGrantResult";
 export type { PluginRevokeParams } from "./generated/PluginRevokeParams";
 export type { PluginRevokeResult } from "./generated/PluginRevokeResult";
+export type { PluginViewSummary } from "./generated/PluginViewSummary";
+export type { PluginViewExternal } from "./generated/PluginViewExternal";
 
 // ---- 插件可观测事件（P5 切片七）----
 //
@@ -411,6 +413,19 @@ import type { PluginState } from "./generated/PluginState";
 export interface PluginStateChangedEvent {
   pluginId: string;
   state: PluginState;
+}
+
+/**
+ * `plugin.view` 载荷（docs/24 §4.5）。
+ *
+ * 三个字段全是标识，**没有视图数据**：数据仍走 `plugin.call`，那条路有闸门、
+ * 配额与审计。`rev` 是插件自报的单调值，渲染侧靠它丢弃重复通知——不依赖时钟，
+ * 所以插件连发几次刷新也只会有一次真正落地。
+ */
+export interface PluginViewRefreshEvent {
+  pluginId: string;
+  viewId: string;
+  rev: number;
 }
 
 // ---- 协议常量（与 Rust 侧保持一致的运行时镜像）----
@@ -601,6 +616,10 @@ export const Methods = {
     pluginLog: "plugin.log",
     pluginProgress: "plugin.progress",
     pluginStateChanged: "plugin.state_changed",
+    // 插件视图刷新（docs/24 §4.5，`crates/plugin/src/events.rs::PLUGIN_VIEW`）。
+    // 与上面三条同属宿主内部通道；载荷只有 `{pluginId,viewId,rev}` 三个标识，
+    // 视图内容仍由渲染侧走 `plugin.call` 去取。
+    pluginView: "plugin.view",
   },
 } as const;
 

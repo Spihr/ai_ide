@@ -40,9 +40,12 @@
 
 import { useEffect, useState } from 'react'
 
+import type { PluginStatusResult, PluginViewSummary } from '@ai-ide/shared-types'
+
 import {
   describeRevokeImpact,
   isKeyCapability,
+  pluginApi,
   pluginCapabilityLabel,
   pluginIssueKindLabel,
   pluginStateLabel,
@@ -73,12 +76,52 @@ import {
   unloadPlugin,
   usePlugins
 } from '../plugin-store'
+import {
+  PLUGIN_VIEW_FIXTURE,
+  PLUGIN_VIEW_FIXTURE_COMMANDS
+} from '../plugin-view.fixture'
+import { parseView, type ViewAction } from '../plugin-view'
+import {
+  refreshPluginView,
+  selectPluginView,
+  syncPluginViews,
+  usePluginView
+} from '../plugin-view-store'
+import {
+  describeExternalViewError,
+  describeExternalViewExit,
+  describeExternalViewOpened,
+  hasExternalViewport
+} from '../plugin-external-view'
+import { PluginViewHost } from './PluginViewHost'
+
+/** 详情区二级 tab（docs/24 §7.3：工具 / 命令 / 视图）。 */
+type DetailTab = 'tools' | 'commands' | 'views'
+
+const DETAIL_TABS: readonly { id: DetailTab; label: string }[] = [
+  { id: 'tools', label: '工具' },
+  { id: 'commands', label: '命令' },
+  { id: 'views', label: '视图' }
+]
 
 export function PluginPanel(): React.JSX.Element {
   const state = usePlugins()
   const activity = usePluginActivity()
   /** 待确认的卸载：插件 id。 */
   const [confirming, setConfirming] = useState<string | null>(null)
+  /**
+   * 详情区二级 tab：工具 / 命令 / 视图（docs/24 §7.3）。
+   *
+   * 把 `pluginId` 一起存进来，是为了「切插件就回工具页」这件派生事——用
+   * `useEffect` 去 `setState` 会多打一轮渲染，也过不了 `set-state-in-effect`；
+   * 这里直接按「记录的 id 是不是当前选中」算出要显示的 tab。
+   */
+  const [tabState, setTabState] = useState<{ pluginId: string | null; tab: DetailTab }>({
+    pluginId: null,
+    tab: 'tools'
+  })
+  const detailTab: DetailTab = tabState.pluginId === state.selectedId ? tabState.tab : 'tools'
+  const setDetailTab = (tab: DetailTab): void => setTabState({ pluginId: state.selectedId, tab })
 
   // 进入面板时拉一次：插件可能在别的窗口/命令行里装过，缓存越久越可能过时。
   useEffect(() => {
@@ -589,36 +632,69 @@ export function PluginPanel(): React.JSX.Element {
                   </div>
                 </>
               )}
-              <h4 className="plugin-detail__title">工具（{detail.tools.length}）</h4>
-              {detail.tools.length === 0 ? (
-                <p className="panel__hint">清单没有声明工具，或安装目录里的清单已不可读。</p>
-              ) : (
-                <div className="ai-list">
-                  {detail.tools.map((tool) => (
-                    <div className="ai-list__item" key={tool.namespaced_name}>
-                      <span className="plugin-item__name">{tool.name}</span>
-                      <span className="ai-list__meta">
-                        <code>{tool.namespaced_name}</code> · {tool.risk} · {tool.description}
-                      </span>
+              <div
+                className="plugin-detail__tabs"
+                role="tablist"
+                aria-label="详情分区"
+                data-testid="plugin-detail-tabs"
+              >
+                {DETAIL_TABS.map((tab) => (
+                  <button
+                    key={tab.id}
+                    className={`plugin-detail__tab${detailTab === tab.id ? ' is-active' : ''}`}
+                    type="button"
+                    role="tab"
+                    aria-selected={detailTab === tab.id}
+                    data-testid={`plugin-detail-tab-${tab.id}`}
+                    onClick={() => setDetailTab(tab.id)}
+                  >
+                    {tab.label}
+                    {tab.id === 'views' ? `（${detail.views.length}）` : null}
+                  </button>
+                ))}
+              </div>
+
+              {detailTab === 'tools' ? (
+                <>
+                  <h4 className="plugin-detail__title">工具（{detail.tools.length}）</h4>
+                  {detail.tools.length === 0 ? (
+                    <p className="panel__hint">清单没有声明工具，或安装目录里的清单已不可读。</p>
+                  ) : (
+                    <div className="ai-list">
+                      {detail.tools.map((tool) => (
+                        <div className="ai-list__item" key={tool.namespaced_name}>
+                          <span className="plugin-item__name">{tool.name}</span>
+                          <span className="ai-list__meta">
+                            <code>{tool.namespaced_name}</code> · {tool.risk} · {tool.description}
+                          </span>
+                        </div>
+                      ))}
                     </div>
-                  ))}
-                </div>
-              )}
-              <h4 className="plugin-detail__title">命令（{detail.commands.length}）</h4>
-              {detail.commands.length === 0 ? (
-                <p className="panel__hint">没有声明命令。</p>
-              ) : (
-                <div className="ai-list">
-                  {detail.commands.map((command) => (
-                    <div className="ai-list__item" key={command.name}>
-                      <span className="plugin-item__name">{command.title}</span>
-                      <span className="ai-list__meta">
-                        <code>{command.name}</code> · {command.description ?? '（清单未给说明）'}
-                      </span>
+                  )}
+                </>
+              ) : null}
+
+              {detailTab === 'commands' ? (
+                <>
+                  <h4 className="plugin-detail__title">命令（{detail.commands.length}）</h4>
+                  {detail.commands.length === 0 ? (
+                    <p className="panel__hint">没有声明命令。</p>
+                  ) : (
+                    <div className="ai-list">
+                      {detail.commands.map((command) => (
+                        <div className="ai-list__item" key={command.name}>
+                          <span className="plugin-item__name">{command.title}</span>
+                          <span className="ai-list__meta">
+                            <code>{command.name}</code> · {command.description ?? '（清单未给说明）'}
+                          </span>
+                        </div>
+                      ))}
                     </div>
-                  ))}
-                </div>
-              )}
+                  )}
+                </>
+              ) : null}
+
+              {detailTab === 'views' ? <PluginViewSection detail={detail} /> : null}
             </>
           )}
         </div>
@@ -626,3 +702,253 @@ export function PluginPanel(): React.JSX.Element {
     </div>
   )
 }
+
+/**
+ * 详情区的「视图」页（docs/24 §7.3 第 4 刀）。
+ *
+ * 三件事：把 `plugin.status` 里声明的视图同步进 store、按用户点击拉取并渲染、
+ * 把按钮动作转成一次 `plugin.command`（**不在这里执行任何插件代码**，审批与
+ * 能力闸门都在内核）。
+ *
+ * 空态给一个「控件样例」入口：第 3 刀还没有真插件声明视图，没有这个入口，
+ * 宿主在界面上就是一段永远看不到的代码——V-4~V-7 也就无从目测。
+ */
+function PluginViewSection({ detail }: { detail: PluginStatusResult }): React.JSX.Element {
+  const viewState = usePluginView()
+  const [showFixture, setShowFixture] = useState(false)
+  const [busy, setBusy] = useState(false)
+  /** 命令回执：成功给正文前 200 字，失败给人话。 */
+  const [receipt, setReceipt] = useState<string | null>(null)
+  /** 外部视口开关的进行态：一个窗口起得慢，按下就得先禁用，免得连点起两个进程。 */
+  const [externalBusy, setExternalBusy] = useState(false)
+  /** 外部视口回执（复用 / 新建 / 失败原因），与命令回执分开放，避免互相覆盖。 */
+  const [externalNotice, setExternalNotice] = useState<string | null>(null)
+  /**
+   * 本面板开过、且尚未退出视口的那**一个**视图 id。
+   *
+   * 存 id 而不是布尔：换个视图这个值自然失效，不需要在 effect 里 setState 复位
+   * （那会多渲染一轮）。也只是按钮文案的状态，不是真相来源——接管别人起的实例时
+   * 外壳收不到退出事件，这里会一直显示「运行中」，所以文案只说「运行中」。
+   */
+  const [runningViewId, setRunningViewId] = useState<string | null>(null)
+
+  const pluginId = detail.plugin.id
+  const views = detail.views
+  const commandNames = detail.commands.map((command) => command.name)
+  // 只有**当前选中**的视图才谈得上「打开视口」：tab 上不挂这个入口，
+  // 否则用户会以为点一下 tab 就顺手起了进程。
+  const activeView = views.find((item) => item.id === viewState.activeViewId) ?? null
+  /** 按钮文案用：存 id 的好处就在这一行，换个视图自动失效。 */
+  const externalRunning = activeView !== null && runningViewId === activeView.id
+
+  // `views` 是 `plugin.status` 的原样搬运：详情重拉一次就同步一次，
+  // 插件被重装/改清单后这里能跟着变。
+  useEffect(() => {
+    syncPluginViews(pluginId, views)
+  }, [pluginId, views])
+
+  // 点进「视图」就是想看内容，第一个视图自动选中并拉取。
+  useEffect(() => {
+    const first = views[0]
+    if (first === undefined) return
+    if (viewState.pluginId !== pluginId) return
+    if (viewState.activeViewId !== null) return
+    void selectPluginView(pluginId, first)
+  }, [pluginId, views, viewState.pluginId, viewState.activeViewId])
+
+  // 视口进程退出：只认「当前这个插件 + 当前这个视图」，别的视图开着又被关掉
+  // 不该在本文里冒一条提示（用户切回来会莫名其妙）。
+  useEffect(() => {
+    // `?.`：preload 与渲染进程版本不齐（开发期热重载）时宁可少一条提示，
+    // 也不要因为一个可选订阅把整个插件面板炸掉。
+    const off = window.aiide.onViewportState?.((event) => {
+      if (event.pluginId !== pluginId) return
+      if (activeView === null || event.viewId !== activeView.id) return
+      setExternalNotice(describeExternalViewExit(activeView.title, event.exitCode))
+      setExternalBusy(false)
+      setRunningViewId(null)
+    })
+    return () => off?.()
+  }, [pluginId, activeView])
+
+  /**
+   * 打开当前视图的外部视口（docs/24 §5.4）。
+   *
+   * 递出去的只有 `pluginId + viewId`：路径解析、围栏校验、spawn 全在主进程。
+   * 渲染侧拿不到管道名，也就没法绕开宿主直接往视口里塞帧。
+   */
+  async function openExternalViewport(view: PluginViewSummary): Promise<void> {
+    setExternalBusy(true)
+    setExternalNotice(null)
+    try {
+      const result = await window.aiide.openExternalViewport(pluginId, view.id)
+      setExternalNotice(describeExternalViewOpened(view.title, result.reused))
+      setRunningViewId(view.id)
+    } catch (error) {
+      setExternalNotice(describeExternalViewError(error))
+      setRunningViewId(null)
+    } finally {
+      setExternalBusy(false)
+    }
+  }
+
+  async function runAction(action: ViewAction): Promise<void> {
+    setBusy(true)
+    setReceipt(null)
+    try {
+      const result = await pluginApi.command(pluginId, action.command, action.args)
+      const body = result.content.trim()
+      setReceipt(
+        result.truncated
+          ? `${body.slice(0, 200)}…（回执已按 64 KB 截断）`
+          : body === ''
+            ? `命令 ${action.command} 已执行，无输出。`
+            : body.slice(0, 200)
+      )
+      // 命令往往就是改数据再让视图刷新：rev 变没变由插件说了算，这里只重拉一次。
+      void refreshPluginView()
+    } catch (error) {
+      setReceipt(describeActionError(error))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (views.length === 0 || showFixture) {
+    const fixture = parseView(PLUGIN_VIEW_FIXTURE)
+    return (
+      <div data-testid="plugin-view-empty">
+        <h4 className="plugin-detail__title">视图（0）</h4>
+        <p className="panel__hint">
+          {views.length === 0
+            ? '清单没有声明视图：这个插件只提供工具与命令，界面由宿主现有面板承载。'
+            : '下面是宿主内置的控件样例（不是这个插件的内容），用来确认控件渲染与限界生效。'}
+        </p>
+        <div className="ai-row">
+          <button
+            className="ai-button ai-button--tiny"
+            type="button"
+            data-testid="plugin-view-toggle-fixture"
+            onClick={() => setShowFixture((prev) => !prev)}
+          >
+            {showFixture ? '收起控件样例' : '查看控件样例'}
+          </button>
+        </div>
+        {showFixture ? (
+          <>
+            <p className="panel__hint">
+              样例故意带了一条超长文本、一条 <code>javascript:</code> 单元格与一个未声明的按钮命令：
+              截断、降级、禁用三种处理都该在下面看得见。
+            </p>
+            <PluginViewHost
+              view={fixture}
+              commands={PLUGIN_VIEW_FIXTURE_COMMANDS}
+              onAction={() => setReceipt('控件样例不接动作：它没有对应的插件命令。')}
+            />
+          </>
+        ) : null}
+        {receipt === null ? null : (
+          <div className="ai-result" data-testid="plugin-view-receipt">
+            {receipt}
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  return (
+    <div data-testid="plugin-view-section">
+      <div className="ai-row plugin-view__head">
+        {views.map((item) => (
+          <button
+            key={item.id}
+            className={`ai-button ai-button--tiny${
+              viewState.activeViewId === item.id ? ' ai-button--primary' : ''
+            }`}
+            type="button"
+            data-testid={`plugin-view-tab-${item.id}`}
+            title={item.entry === '' ? undefined : `数据来源：${item.entry}`}
+            onClick={() => void selectPluginView(pluginId, item)}
+          >
+            {item.title}
+          </button>
+        ))}
+        <button
+          className="ai-button ai-button--tiny"
+          type="button"
+          data-testid="plugin-view-refresh"
+          disabled={viewState.status === 'loading'}
+          onClick={() => void refreshPluginView()}
+        >
+          {viewState.status === 'loading' ? '刷新中…' : '刷新'}
+        </button>
+      </div>
+
+      {activeView !== null && hasExternalViewport(activeView) ? (
+        <div className="ai-row" data-testid="plugin-view-external">
+          <button
+            className="ai-button ai-button--tiny"
+            type="button"
+            data-testid="plugin-view-open-external"
+            disabled={externalBusy}
+            title={`要在独立窗口里查看：${activeView.external?.program ?? ''}`}
+            onClick={() => void openExternalViewport(activeView)}
+          >
+            {externalBusy
+              ? '正在打开视口…'
+              : externalRunning
+                ? `视口运行中（${activeView.title}）`
+                : `在视口中打开「${activeView.title}」`}
+          </button>
+          <span className="panel__hint">外部进程由宿主启动，参数只走管道，不经 shell。</span>
+        </div>
+      ) : null}
+
+      {externalNotice === null ? null : (
+        <div className="ai-result" data-testid="plugin-view-external-notice">
+          {externalNotice}
+        </div>
+      )}
+
+      {viewState.status === 'loading' ? (
+        <p className="panel__hint">正在向插件要视图…</p>
+      ) : null}
+
+      {viewState.error === null ? null : (
+        <div className="ai-result ai-result--bad" data-testid="plugin-view-error">
+          {viewState.error}
+        </div>
+      )}
+
+      {viewState.view === null ? null : (
+        <PluginViewHost
+          view={viewState.view}
+          commands={commandNames}
+          busy={busy}
+          onAction={(action) => void runAction(action)}
+        />
+      )}
+
+      {receipt === null ? null : (
+        <div className="ai-result" data-testid="plugin-view-receipt">
+          {receipt}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * 按钮动作失败的人话。
+ *
+ * `3001` 是**正常路径**：`risk=write` 的插件命令执行前要过审批，视图里的按钮
+ * 只是发起方，不是审批人。这一条不翻译成「插件坏了」。
+ */
+function describeActionError(error: unknown): string {
+  const text = error instanceof Error ? error.message : String(error)
+  if (text.includes('3001') || text.includes('未被放行')) {
+    return '这条命令需要审批才能执行：视图里的按钮只负责发起，审批入口在命令面板里（下一步接入）。'
+  }
+  return text.trim() === '' ? '命令执行失败（内核未给原因）。' : text
+}
+

@@ -1559,6 +1559,48 @@ button {
   color: #9aa3b0;
 }
 
+/*
+ * 详情区二级 tab（工具 / 命令 / 视图，docs/24 §7.3）。
+ * 样式与 `.plugin-view__tab` 同一套：两个 tab 条会上下相邻（面板 tab + 视图 tab），
+ * 视觉上必须能分辨层级，所以这里底边线更重、字号略大。
+ */
+.plugin-detail__tabs {
+  display: flex;
+  gap: 2px;
+  flex-wrap: wrap;
+  margin: 8px 0 2px;
+  border-bottom: 1px solid var(--border);
+}
+
+.plugin-detail__tab {
+  padding: 5px 12px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.plugin-detail__tab:hover {
+  color: var(--text);
+}
+
+.plugin-detail__tab.is-active {
+  border-bottom-color: var(--accent);
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* 视图页顶部：视图切换与刷新按钮同一行，过长时换行而不是把按钮挤扁。 */
+.plugin-view__head {
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin: 6px 0;
+}
+
 /* ---------- 命令面板（P5 · FR-1.7） ---------- */
 
 .palette-overlay {
@@ -1937,6 +1979,376 @@ button {
 
 .plugin-activity .panel__hint {
   padding: 8px;
+}
+
+/* ---------- 插件声明视图（docs/24 §7.3 第 3 刀） ---------- */
+
+/*
+ * 宿主只负责「把数据摆整齐」：不引入任何插件侧的图片/字体/主题变量，
+ * 免得一个插件的视图能靠 CSS 影响整个面板。
+ * 深度补偿用左侧竖线而不是缩进，避免 16 层嵌套把内容挤成一条缝。
+ */
+.plugin-view {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.plugin-view__title {
+  margin-bottom: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.plugin-view__row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.plugin-view__row > * {
+  flex: 1 1 160px;
+  min-width: 0;
+}
+
+.plugin-view__column {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.plugin-view__group {
+  margin: 0;
+  padding: 8px 10px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.plugin-view__group-title {
+  padding: 0 4px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.plugin-view__text {
+  margin: 0;
+  color: var(--text);
+  line-height: 1.55;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+.plugin-view__text.is-tainted {
+  color: var(--muted);
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 11px;
+}
+
+.plugin-view__stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--panel-2);
+}
+
+.plugin-view__stat-label {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.plugin-view__stat-value {
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.plugin-view__stat-value.is-tainted {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.plugin-view__table-wrap {
+  overflow: auto;
+  max-height: 260px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.plugin-view__table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+
+.plugin-view__table th,
+.plugin-view__table td {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+  white-space: nowrap;
+}
+
+.plugin-view__table th {
+  position: sticky;
+  top: 0;
+  background: var(--panel-2);
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.plugin-view__table tr.is-tainted td {
+  color: var(--muted);
+}
+
+.plugin-view__list,
+.plugin-view__tree,
+.plugin-view__tree-children {
+  margin: 0;
+  padding-left: 14px;
+  list-style: none;
+}
+
+.plugin-view__list {
+  padding-left: 0;
+}
+
+.plugin-view__list-item {
+  padding: 3px 0;
+  border-bottom: 1px solid rgba(44, 51, 63, 0.6);
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.plugin-view__list-item:last-child {
+  border-bottom: none;
+}
+
+/* 子层用竖线表达层级：比逐层缩进更省横向空间 */
+.plugin-view__tree-children {
+  margin-top: 2px;
+  border-left: 1px solid var(--border);
+}
+
+.plugin-view__progress {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.plugin-view__progress-bar {
+  flex: 1;
+  min-width: 0;
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(120, 130, 145, 0.25);
+  overflow: hidden;
+}
+
+.plugin-view__progress-fill {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+
+.plugin-view__progress-value {
+  flex: none;
+  color: var(--muted);
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 11px;
+}
+
+.plugin-view__tabs {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.plugin-view__tab-strip {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  border-bottom: 1px solid var(--border);
+}
+
+.plugin-view__tab {
+  padding: 4px 10px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.plugin-view__tab:hover {
+  color: var(--text);
+}
+
+.plugin-view__tab.is-active {
+  border-bottom-color: var(--accent);
+  color: var(--text);
+}
+
+.plugin-view__tab-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.plugin-view__field {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 3px 0;
+}
+
+.plugin-view__field-label {
+  flex: none;
+  min-width: 72px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.plugin-view__field-value {
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 11px;
+}
+
+.plugin-view__field-note {
+  color: var(--warn);
+  font-size: 10px;
+  opacity: 0.85;
+}
+
+.plugin-view__checkbox {
+  accent-color: var(--accent);
+}
+
+.plugin-view__slider {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+}
+
+.plugin-view__slider input[type='range'] {
+  flex: 1;
+  min-width: 0;
+  accent-color: var(--accent);
+}
+
+.plugin-view__slider-value {
+  flex: none;
+  width: 48px;
+  color: var(--muted);
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 11px;
+  text-align: right;
+}
+
+.plugin-view__select {
+  flex: 1;
+  min-width: 0;
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 11px;
+}
+
+.plugin-view__color {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.plugin-view__color input[type='color'] {
+  width: 28px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+}
+
+.plugin-view__button {
+  align-self: flex-start;
+}
+
+.plugin-view__unknown,
+.plugin-view__node-error {
+  padding: 6px 8px;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  word-break: break-word;
+}
+
+.plugin-view__node-error {
+  border-color: rgba(255, 107, 107, 0.4);
+  color: var(--bad);
+}
+
+.plugin-view__error {
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 107, 107, 0.4);
+  border-radius: 6px;
+  color: var(--bad);
+  font-size: 12px;
+}
+
+.plugin-view__error p {
+  margin: 4px 0 0;
+  font-size: 11px;
+  word-break: break-word;
+}
+
+.plugin-view__truncated {
+  margin: 0;
+  padding: 4px 8px;
+  border-radius: 4px;
+  background: rgba(240, 180, 41, 0.12);
+  color: var(--warn);
+  font-size: 10px;
+}
+
+.plugin-view__diag {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.plugin-view__diag summary {
+  cursor: pointer;
+  user-select: none;
+}
+
+.plugin-view__diag ul {
+  margin: 4px 0 0;
+  padding-left: 14px;
+  max-height: 140px;
+  overflow: auto;
+}
+
+.plugin-view__diag li {
+  padding: 1px 0;
+  word-break: break-all;
+  line-height: 1.5;
 }
 
 /*

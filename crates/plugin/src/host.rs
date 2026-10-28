@@ -1445,6 +1445,7 @@ mod tests {
             allowed_models: Vec::new(),
             max_tokens: 0,
             timeout_ms: 30_000,
+            views: Vec::new(),
         }
     }
 

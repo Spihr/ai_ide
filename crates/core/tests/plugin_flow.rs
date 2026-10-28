@@ -390,6 +390,67 @@ fn install_list_status_and_uninstall_round_trip() {
 }
 
 #[test]
+fn status_exposes_declared_views_verbatim() {
+    let data = TempDataDir::new("plugin-views-status");
+    let packages = TempDataDir::new("plugin-views-status-pkg");
+    let mut core = Core::spawn(&data.root);
+
+    // 一个纯描述视图 + 一个带外部视口的视图：这两条形状覆盖面板要渲染的两种分支。
+    let mut manifest = legal_manifest("demo", "1.0.0");
+    manifest["views"] = json!([
+        {
+            "id": "details",
+            "title": "资产详情",
+            "location": "pluginPanel.detail",
+            "entry": "echo"
+        },
+        {
+            "id": "viewport",
+            "title": "3D 视口",
+            "location": "pluginPanel.detail",
+            "entry": "echo",
+            "refresh": ["file.saved"],
+            "external": { "program": "viewport.exe", "protocol": "asset3d.session/1" }
+        }
+    ]);
+    let package = write_package(&packages.root, "demo", &manifest, "index.mjs");
+    // 第 1 刀的校验要求 program 指向包内真实存在的 `.exe`。
+    std::fs::write(package.join("viewport.exe"), b"MZ").expect("写视口程序");
+
+    core.ok(
+        "plugin.install",
+        json!({ "path": package.to_string_lossy() }),
+    );
+
+    let detail = core.ok("plugin.status", json!({ "plugin_id": "demo" }));
+    let views = detail["views"].as_array().expect("views 是数组");
+    assert_eq!(views.len(), 2, "两个视图应原样透出：{detail}");
+
+    assert_eq!(views[0]["id"], json!("details"));
+    assert_eq!(views[0]["title"], json!("资产详情"));
+    assert_eq!(views[0]["location"], json!("pluginPanel.detail"));
+    assert_eq!(
+        views[0]["entry"],
+        json!("echo"),
+        "entry 是插件内原始工具名，不是 plugin__demo__echo"
+    );
+    assert_eq!(
+        views[0]["refresh"],
+        json!([]),
+        "未声明 refresh 时给空数组（不是缺字段），前端可直接 includes"
+    );
+    assert!(
+        views[0].get("external").is_none(),
+        "没有外部视口的视图不该带 external 字段：{detail}"
+    );
+
+    assert_eq!(views[1]["id"], json!("viewport"));
+    assert_eq!(views[1]["refresh"], json!(["file.saved"]));
+    assert_eq!(views[1]["external"]["program"], json!("viewport.exe"));
+    assert_eq!(views[1]["external"]["protocol"], json!("asset3d.session/1"));
+}
+
+#[test]
 fn upgrade_with_new_capability_flips_state_to_needs_grant() {
     let data = TempDataDir::new("plugin-upgrade");
     let packages = TempDataDir::new("plugin-upgrade-pkg");

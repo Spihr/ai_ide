@@ -64,6 +64,37 @@ pub const MAX_MODEL_ENTRY_LEN: usize = 160;
 /// `crates/core`，后者不依赖前者的「信任」——校验通过不等于运行期不再看。
 pub const MAX_TOKENS_CEILING: u64 = 8192;
 
+/// 一份清单最多声明几个视图（`views`，docs/24 §4.1）。
+///
+/// 视图声明随 `plugin.status` 下发（ADR-15），条数就是 `status` 的固定开销：
+/// 不设上限等于让一个插件把状态响应撑成正比于自己的野心。8 个够表达「主视图 +
+/// 若干次级视图」，再多读者也翻不过来。
+pub const MAX_VIEWS: usize = 8;
+
+/// 视图标题的字符数上限（`views[].title`）。
+pub const MAX_VIEW_TITLE_LEN: usize = 48;
+
+/// 首版唯一允许的挂载位置（docs/24 §4.1 取舍 2）。
+///
+/// 渲染端侧栏是固定枚举，动态视图只能挂到 `PluginPanel` 详情区做二级 tab；
+/// 放开第二个值就等于要改外壳枚举，所以这里写成单元素白名单而不是宽松校验。
+pub const VIEW_LOCATIONS: &[&str] = &["pluginPanel.detail"];
+
+/// 视图刷新事件的白名单（`views[].refresh`）。
+///
+/// 与 `subscriptions` 不同：这里不订阅事件载荷，只表达「这些事件发生时请重拉一次
+/// `entry`」。所以名单必须是宿主确实会广播的那几个，写错一个就是永不刷新。
+pub const VIEW_REFRESH_EVENTS: &[&str] = &["workspace.changed", "file.saved", "session.ended"];
+
+/// 外部视口协议的宿主白名单（`views[].external.protocol`，ADR-17）。
+///
+/// 协议版本号由插件与视口进程约定，但**由宿主认可**：不在表里的协议说明这版 IDE
+/// 不认识它的会话格式，装上了也只会连不上。首版仅 asset3d。
+pub const VIEW_EXTERNAL_PROTOCOLS: &[&str] = &["asset3d.session/1"];
+
+/// 外部视口可执行文件必须的扩展名（`views[].external.program`）。
+pub const VIEW_EXTERNAL_SUFFIX: &str = ".exe";
+
 /// 能力白名单——**这张表就是权限模型本身**（docs/14 §7.1）。
 ///
 /// 不在表里的能力一律拒载。理由不是「还没实现所以先拦着」，而是「未知能力无法被
@@ -142,6 +173,12 @@ pub struct Manifest {
     #[serde(skip_serializing_if = "is_zero")]
     pub max_tokens: u64,
     pub timeout_ms: u64,
+    /// 声明式视图（docs/24 §4.1）。
+    ///
+    /// 空数组是绝大多数包常态，所以序列化时整个字段省略：落库 JSON 与改造前
+    /// 逐字一致，老包的 `manifest_json` 不用迁移。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub views: Vec<ManifestView>,
 }
 
 /// `skip_serializing_if` 用：`maxTokens` 不声明时不出现在序列化结果里。
@@ -183,6 +220,37 @@ pub struct ManifestCommand {
     /// 入参 JSON Schema（清单里的 `args`），缺省等于「不吃入参」。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub args: Option<Value>,
+}
+
+/// 清单里的一个视图声明（docs/24 §4.1）。
+///
+/// 视图只描述「挂在哪、标题叫什么、用哪个工具取内容」，内容本身不进清单：
+/// 清单是安装期的静态文件，往里塞数据等于绕开插件进程与闸门（ADR-15）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManifestView {
+    pub id: String,
+    pub title: String,
+    /// 挂载位置，首版仅 `pluginPanel.detail`（见 [`VIEW_LOCATIONS`]）。
+    pub location: String,
+    /// 取内容的工具名，必须是本包 `tools[]` 里 `risk=read` 的那一个。
+    pub entry: String,
+    /// 触发重拉的事件名（见 [`VIEW_REFRESH_EVENTS`]），空表示只在打开时拉一次。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub refresh: Vec<String>,
+    /// 外部视口可执行文件；不声明就只渲染只读描述树（ADR-16）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external: Option<ManifestExternal>,
+}
+
+/// 视图配套的外部视口（`views[].external`）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManifestExternal {
+    /// 包内相对路径的 `.exe`，安装时校验真实存在。
+    pub program: String,
+    /// 会话协议版本，须在 [`VIEW_EXTERNAL_PROTOCOLS`] 内。
+    pub protocol: String,
 }
 
 /// 校验通过的结果：规范化清单 + 归一化入口 + 非阻断告警。
@@ -257,6 +325,19 @@ impl Violation {
         }
     }
 
+    /// 包内相对路径越界（1002）。
+    ///
+    /// 与 `main` 的处理刻意不同：`main` 越界报 6107，因为它总归是「清单写坏了」；
+    /// 而 `external.program` 是**要被主进程 spawn 的路径**，越界意味着清单能把执行
+    /// 导向包外的任意可执行文件，性质是路径越狱而不是字段格式错，所以单独成码。
+    pub fn path_escape(path: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: ErrorCode::PATH_OUT_OF_WORKSPACE,
+            path: path.into(),
+            message: message.into(),
+        }
+    }
+
     pub fn to_json(&self) -> Value {
         json!({
             "code": self.code.as_i32(),
@@ -305,6 +386,7 @@ pub fn validate(root: &Path, raw: &Value) -> Result<ValidatedManifest, Vec<Viola
     let max_tokens = optional_max_tokens(obj, &mut errors);
     let tools = parse_tools(obj, &mut errors);
     let commands = parse_commands(obj, &mut errors);
+    let views = parse_views(obj, &mut errors);
 
     // ---------- 第二段：语义 ----------
     if let Some(id) = id.as_deref() {
@@ -510,6 +592,102 @@ pub fn validate(root: &Path, raw: &Value) -> Result<ValidatedManifest, Vec<Viola
         }
     }
 
+    // views：形状已保证四个必填字段是「非空字符串」，这里判各自的取值域。
+    // `entry` 与工具的对应关系放在第三段——它要读 `tools`，属于交叉。
+    if views.len() > MAX_VIEWS {
+        errors.push(Violation::manifest(
+            "$.views",
+            format!("views 最多 {MAX_VIEWS} 条，收到 {} 条", views.len()),
+        ));
+    }
+    for (index, view) in views.iter().enumerate() {
+        let base = format!("$.views[{index}]");
+        if !is_valid_view_id(&view.id) {
+            errors.push(Violation::manifest(
+                format!("{base}.id"),
+                format!(
+                    "视图 id {} 非法：须匹配 ^[a-z][a-z0-9_-]{{0,31}}$（小写字母开头，1–32 字符）",
+                    view.id
+                ),
+            ));
+        }
+        // 标题是给用户看的，长度按字符算而不是字节：中文标题 48 字节只有 16 个字。
+        // 控制字符单独拒——它们会让面板 tab 标题串行、错位。
+        let title_len = view.title.chars().count();
+        if title_len > MAX_VIEW_TITLE_LEN {
+            errors.push(Violation::manifest(
+                format!("{base}.title"),
+                format!("title 最多 {MAX_VIEW_TITLE_LEN} 字符，收到 {title_len} 字符"),
+            ));
+        }
+        if view.title.chars().any(|ch| ch.is_control()) {
+            errors.push(Violation::manifest(
+                format!("{base}.title"),
+                "title 不得包含控制字符",
+            ));
+        }
+        if !VIEW_LOCATIONS.contains(&view.location.as_str()) {
+            errors.push(Violation::manifest(
+                format!("{base}.location"),
+                format!(
+                    "未知挂载位置 {}；首版只支持 {}",
+                    view.location,
+                    VIEW_LOCATIONS.join(" / ")
+                ),
+            ));
+        }
+        for (slot, event) in view.refresh.iter().enumerate() {
+            if !VIEW_REFRESH_EVENTS.contains(&event.as_str()) {
+                errors.push(Violation::manifest(
+                    format!("{base}.refresh[{slot}]"),
+                    format!(
+                        "未知刷新事件 {event}；可选 {}",
+                        VIEW_REFRESH_EVENTS.join(" / ")
+                    ),
+                ));
+            }
+        }
+
+        let Some(external) = &view.external else {
+            continue;
+        };
+        let external_base = format!("{base}.external");
+        // program 是要被主进程 spawn 的路径，先过包根沙箱：越界直接 1002，
+        // 与 `main` 一样不在归一化失败后再叠一条「文件不存在」。
+        match normalize_package_path(&external.program, "external.program") {
+            Err(reason) => errors.push(Violation::path_escape(
+                format!("{external_base}.program"),
+                reason,
+            )),
+            Ok(normalized) => {
+                if !normalized
+                    .to_ascii_lowercase()
+                    .ends_with(VIEW_EXTERNAL_SUFFIX)
+                {
+                    errors.push(Violation::manifest(
+                        format!("{external_base}.program"),
+                        format!("可执行文件必须带 {VIEW_EXTERNAL_SUFFIX} 扩展名：{normalized}"),
+                    ));
+                } else if root.is_dir() && !root.join(&normalized).is_file() {
+                    errors.push(Violation::manifest(
+                        format!("{external_base}.program"),
+                        format!("external.program 指向的文件不存在：{normalized}"),
+                    ));
+                }
+            }
+        }
+        if !VIEW_EXTERNAL_PROTOCOLS.contains(&external.protocol.as_str()) {
+            errors.push(Violation::manifest(
+                format!("{external_base}.protocol"),
+                format!(
+                    "未知视口协议 {}；宿主只认 {}",
+                    external.protocol,
+                    VIEW_EXTERNAL_PROTOCOLS.join(" / ")
+                ),
+            ));
+        }
+    }
+
     // ---------- 第三段：交叉 ----------
     // 工具重名、与核心工具撞名、risk 与 capabilities 自相矛盾。
     let mut seen_tools: Vec<&str> = Vec::new();
@@ -571,6 +749,48 @@ pub fn validate(root: &Path, raw: &Value) -> Result<ValidatedManifest, Vec<Viola
             ));
         } else {
             seen_commands.push(command.name.as_str());
+        }
+    }
+
+    // 视图 ↔ 工具：`entry` 必须落在本包 `tools[]` 里，而且是 `risk=read` 的那一个。
+    //
+    // 「未声明」用 6108 而不是 6107：对作者来说这等价于「引用了一个不存在的工具」，
+    // 与工具撞名同属「指向了不该指的东西」；「指向写工具」才是清单自相矛盾（6107）。
+    // `tools` 形状不合法时不判——parse_tools 此时返回空表，逐条判会生出一串
+    // 「entry 不在 tools[] 中」的假错，把真正的类型错误埋掉。
+    let tools_shaped = obj.get("tools").map_or(true, Value::is_array);
+    let mut seen_views: Vec<&str> = Vec::new();
+    for (index, view) in views.iter().enumerate() {
+        let base = format!("$.views[{index}]");
+        if seen_views.contains(&view.id.as_str()) {
+            errors.push(Violation::manifest(
+                format!("{base}.id"),
+                format!("视图 id 在包内重复：{}", view.id),
+            ));
+        } else {
+            seen_views.push(view.id.as_str());
+        }
+        if !tools_shaped {
+            continue;
+        }
+        match tools.iter().find(|tool| tool.name == view.entry) {
+            None => errors.push(Violation::tool_conflict(
+                format!("{base}.entry"),
+                format!(
+                    "视图 {} 的 entry 工具 {} 未在本包 tools[] 中声明",
+                    view.id, view.entry
+                ),
+            )),
+            Some(tool) if !matches!(tool.risk, PluginToolRisk::Read) => {
+                errors.push(Violation::manifest(
+                    format!("{base}.entry"),
+                    format!(
+                        "视图 {} 的 entry 工具 {} 不是 risk=read：视图加载不得触发写盘或审批",
+                        view.id, view.entry
+                    ),
+                ));
+            }
+            Some(_) => {}
         }
     }
 
@@ -640,6 +860,7 @@ pub fn validate(root: &Path, raw: &Value) -> Result<ValidatedManifest, Vec<Viola
         allowed_models: normalized_models,
         max_tokens: max_tokens.unwrap_or(0),
         timeout_ms: timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
+        views,
     };
 
     Ok(ValidatedManifest {
@@ -1068,9 +1289,145 @@ fn parse_commands(obj: &Map<String, Value>, errors: &mut Vec<Violation>) -> Vec<
     commands
 }
 
+/// 视图声明的形状解析（docs/24 §4.1）。
+///
+/// 四个必填字段缺任何一个就**整条丢弃**，不推入半成品：语义段与交叉段都会再看
+/// 这些字段，留一条 id 为空的残项只会派生出「id 非法」「entry 不在 tools」这类
+/// 由同一个根因引起的假错。这条取舍与 `parse_commands` 里 `risk` 缺失即 `continue`
+/// 同源。
+fn parse_views(obj: &Map<String, Value>, errors: &mut Vec<Violation>) -> Vec<ManifestView> {
+    let Some(value) = obj.get("views") else {
+        return Vec::new();
+    };
+    let Value::Array(items) = value else {
+        errors.push(Violation::manifest("$.views", "views 必须是数组"));
+        return Vec::new();
+    };
+
+    let mut views = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let base = format!("$.views[{index}]");
+        let Some(view) = item.as_object() else {
+            errors.push(Violation::manifest(base, "views[] 每项必须是对象"));
+            continue;
+        };
+
+        let id = required_view_str(view, &base, "id", errors);
+        let title = required_view_str(view, &base, "title", errors);
+        let location = required_view_str(view, &base, "location", errors);
+        let entry = required_view_str(view, &base, "entry", errors);
+        // 缺字段时 `required_view_str` 已经报过，这里只是不继续装配。
+        let (Some(id), Some(title), Some(location), Some(entry)) = (id, title, location, entry)
+        else {
+            continue;
+        };
+
+        // `refresh` 可选；写了的每一项都必须是字符串，非字符串逐条报而不是整段丢弃，
+        // 否则一个笔误会让「事件名写错」这条更重要的信息一起消失。
+        let refresh = match view.get("refresh") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(events)) => {
+                let mut collected = Vec::with_capacity(events.len());
+                for (slot, event) in events.iter().enumerate() {
+                    match event {
+                        Value::String(name) => collected.push(name.clone()),
+                        _ => errors.push(Violation::manifest(
+                            format!("{base}.refresh[{slot}]"),
+                            "refresh 的每一项都必须是字符串",
+                        )),
+                    }
+                }
+                collected
+            }
+            Some(_) => {
+                errors.push(Violation::manifest(
+                    format!("{base}.refresh"),
+                    "refresh 必须是字符串数组",
+                ));
+                Vec::new()
+            }
+        };
+
+        // `external` 整体可选，但出现即要求 `program` 与 `protocol` 都在：
+        // 只给其中一个的配置无论缺哪边都跑不通（没 program 无处 spawn，
+        // 没 protocol 连上也不知道怎么说话），早点说清楚比运行期连不上强。
+        let external_base = format!("{base}.external");
+        let external = match view.get("external") {
+            None | Some(Value::Null) => None,
+            Some(Value::Object(section)) => {
+                let program = required_view_str(section, &external_base, "program", errors);
+                let protocol = required_view_str(section, &external_base, "protocol", errors);
+                match (program, protocol) {
+                    (Some(program), Some(protocol)) => Some(ManifestExternal { program, protocol }),
+                    _ => None,
+                }
+            }
+            Some(_) => {
+                errors.push(Violation::manifest(
+                    external_base,
+                    "external 必须是对象（含 program 与 protocol）",
+                ));
+                None
+            }
+        };
+
+        views.push(ManifestView {
+            id,
+            title,
+            location,
+            entry,
+            refresh,
+            external,
+        });
+    }
+    views
+}
+
+/// 视图段内的必填字符串字段：`required_str` 只处理顶层字段，这里要带下标路径。
+fn required_view_str(
+    section: &Map<String, Value>,
+    base: &str,
+    key: &str,
+    errors: &mut Vec<Violation>,
+) -> Option<String> {
+    let path = format!("{base}.{key}");
+    match section.get(key) {
+        None | Some(Value::Null) => {
+            errors.push(Violation::manifest(path, format!("缺少必填字段 {key}")));
+            None
+        }
+        Some(Value::String(value)) if !value.trim().is_empty() => Some(value.clone()),
+        Some(Value::String(_)) => {
+            errors.push(Violation::manifest(path, format!("{key} 不能为空")));
+            None
+        }
+        Some(_) => {
+            errors.push(Violation::manifest(path, format!("{key} 必须是字符串")));
+            None
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 语义判断（手写，不引正则：三个小函数比多一个依赖划算）
 // ---------------------------------------------------------------------------
+
+/// 视图 id：`^[a-z][a-z0-9_-]{0,31}$`（docs/24 §4.1 字段表）。
+///
+/// 不复用 [`is_valid_id`]：插件 id 允许首字符是数字、不允许下划线，视图 id 反过来。
+/// 两者形状相近但契约不同，共用一套宽松判定只会让其中一边的约束名存实亡。
+pub fn is_valid_view_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if !(1..=32).contains(&bytes.len()) {
+        return false;
+    }
+    if !bytes[0].is_ascii_lowercase() {
+        return false;
+    }
+    bytes.iter().all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_' || *byte == b'-'
+    })
+}
 
 /// `^[a-z0-9][a-z0-9-]{1,63}$`。
 pub fn is_valid_id(value: &str) -> bool {
@@ -1140,13 +1497,21 @@ fn parse_api_part(part: &str) -> Option<u32> {
 /// 这里是「包根沙箱」的第一道闸门：安装时还要用 canonicalize 复核一次，
 /// 两道都过才认为入口不会逃出插件目录（防的是软链接把 `main` 指到包外）。
 pub fn normalize_relative(raw: &str) -> Result<String, String> {
+    normalize_package_path(raw, "main")
+}
+
+/// `main` 与 `external.program` 共用的包内相对路径归一化；`field` 只影响错误文案。
+///
+/// 两条路径的沙箱规则必须**逐字相同**——`external.program` 会被主进程 spawn，
+/// 漏一条就等于给清单留了一个「指向包外任意 exe」的口子。
+fn normalize_package_path(raw: &str, field: &str) -> Result<String, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Err("main 不能为空".to_string());
+        return Err(format!("{field} 不能为空"));
     }
     let path = Path::new(trimmed);
     if path.is_absolute() {
-        return Err(format!("main 必须是包内相对路径，不得为绝对路径：{raw}"));
+        return Err(format!("{field} 必须是包内相对路径，不得为绝对路径：{raw}"));
     }
 
     let mut parts: Vec<String> = Vec::new();
@@ -1155,18 +1520,18 @@ pub fn normalize_relative(raw: &str) -> Result<String, String> {
             Component::CurDir => {}
             Component::Normal(segment) => parts.push(segment.to_string_lossy().into_owned()),
             Component::ParentDir => {
-                return Err(format!("main 不得包含 ..（会越出插件包根）：{raw}"));
+                return Err(format!("{field} 不得包含 ..（会越出插件包根）：{raw}"));
             }
             Component::RootDir | Component::Prefix(_) => {
                 return Err(format!(
-                    "main 必须是包内相对路径，不得带盘符 / 根目录前缀：{raw}"
+                    "{field} 必须是包内相对路径，不得带盘符 / 根目录前缀：{raw}"
                 ));
             }
         }
     }
 
     if parts.is_empty() {
-        return Err(format!("main 归一化后为空：{raw}"));
+        return Err(format!("{field} 归一化后为空：{raw}"));
     }
     Ok(parts.join("/"))
 }
@@ -1616,6 +1981,282 @@ mod tests {
         raw["maxTokens"] = json!(MAX_TOKENS_CEILING + 1);
         let errors = validate(&root, &raw).expect_err("超过 maxTokens 天花板必须拒载");
         assert!(errors.iter().any(|error| error.path == "$.maxTokens"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // -----------------------------------------------------------------------
+    // views（docs/24 §4.1、§8 V-1/V-2/V-3）
+    // -----------------------------------------------------------------------
+
+    /// 带一个完整视图的合法清单：`entry` 指向 `risk=read` 的 `repo_stats`。
+    fn view_manifest() -> Value {
+        let mut raw = legal_manifest();
+        raw["views"] = json!([{
+            "id": "main",
+            "title": "3D 资产",
+            "location": "pluginPanel.detail",
+            "entry": "repo_stats",
+            "refresh": ["workspace.changed", "file.saved"],
+            "external": { "program": "asset3d-gui.exe", "protocol": "asset3d.session/1" }
+        }]);
+        raw
+    }
+
+    /// V-1：没写 `views` 的老清单照旧装载，规范化结果是空表，且落库 JSON 一字不多。
+    ///
+    /// 「一字不多」是双向兼容的另一半：老包的 `manifest_json` 不该因为新字段而
+    /// 在下次 `plugin.status` 里突然多出一个 `"views":[]`。
+    #[test]
+    fn manifest_without_views_loads_with_empty_views() {
+        let root = temp_package("views-absent");
+        let validated = validate(&root, &legal_manifest()).expect("缺 views 不应报错");
+        assert!(validated.manifest.views.is_empty());
+        let json = validated.to_manifest_json();
+        assert!(
+            !json.contains("views"),
+            "空 views 不应出现在落库 JSON 里：{json}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 合法视图：四个必填字段 + refresh + external 全部落位。
+    #[test]
+    fn legal_view_is_parsed() {
+        let root = temp_package("views-legal");
+        std::fs::write(root.join("asset3d-gui.exe"), b"MZ").expect("写视口可执行文件");
+        let validated = validate(&root, &view_manifest()).expect("合法视图不应报错");
+        let view = &validated.manifest.views[0];
+        assert_eq!(view.id, "main");
+        assert_eq!(view.title, "3D 资产");
+        assert_eq!(view.location, "pluginPanel.detail");
+        assert_eq!(view.entry, "repo_stats");
+        assert_eq!(view.refresh, vec!["workspace.changed", "file.saved"]);
+        let external = view.external.as_ref().expect("external 应被解析");
+        assert_eq!(external.program, "asset3d-gui.exe");
+        assert_eq!(external.protocol, "asset3d.session/1");
+
+        let json = validated.to_manifest_json();
+        assert!(
+            json.contains("\"views\":[{\"id\":\"main\",\"title\":\"3D 资产\""),
+            "落库 JSON 用 camelCase 且保持字段顺序：{json}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// V-2：`entry` 指向未声明的工具 → 6108；指向 `risk=write` 的工具 → 6107。
+    #[test]
+    fn view_entry_must_be_a_declared_read_tool() {
+        let root = temp_package("views-entry");
+
+        let mut raw = view_manifest();
+        raw["views"][0]["entry"] = json!("view_render");
+        let errors = validate(&root, &raw).expect_err("entry 指向未声明工具必须拒载");
+        let violation = errors
+            .iter()
+            .find(|error| error.path == "$.views[0].entry")
+            .expect("应指向 entry 字段");
+        assert_eq!(
+            violation.code,
+            ErrorCode::PLUGIN_TOOL_CONFLICT,
+            "未声明的 entry 用 6108"
+        );
+
+        // 指向本包的写工具：工具是声明了的，但视图加载会触发审批，属清单自相矛盾。
+        let mut raw = view_manifest();
+        raw["views"][0]["entry"] = json!("write_note");
+        let errors = validate(&root, &raw).expect_err("entry 指向写工具必须拒载");
+        let violation = errors
+            .iter()
+            .find(|error| error.path == "$.views[0].entry")
+            .expect("应指向 entry 字段");
+        assert_eq!(
+            violation.code,
+            ErrorCode::PLUGIN_MANIFEST_INVALID,
+            "写工具当 entry 用 6107"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// V-3：`external.program` 越界 → 1002；非 `.exe` → 6107；文件不存在 → 6107。
+    #[test]
+    fn external_program_is_sandboxed() {
+        let root = temp_package("views-program");
+
+        // 越界：含 `..`。这是唯一按路径越狱（1002）处理的一档——它会被 spawn。
+        for program in ["../evil.exe", "..\\evil.exe", "C:/Windows/system32/cmd.exe"] {
+            let mut raw = view_manifest();
+            raw["views"][0]["external"]["program"] = json!(program);
+            let errors = validate(&root, &raw).expect_err("越界 program 必须拒载");
+            let violation = errors
+                .iter()
+                .find(|error| error.path == "$.views[0].external.program")
+                .expect("应指向 program 字段");
+            assert_eq!(
+                violation.code,
+                ErrorCode::PATH_OUT_OF_WORKSPACE,
+                "{program} 应按 1002 报"
+            );
+        }
+
+        // 扩展名：`.exe` 之外一律拒，包括不带扩展名。
+        for program in ["asset3d-gui.com", "asset3d-gui", "asset3d-gui.exe.bak"] {
+            let mut raw = view_manifest();
+            raw["views"][0]["external"]["program"] = json!(program);
+            let errors = validate(&root, &raw).expect_err("非 exe 必须拒载");
+            let violation = errors
+                .iter()
+                .find(|error| error.path == "$.views[0].external.program")
+                .expect("应指向 program 字段");
+            assert_eq!(
+                violation.code,
+                ErrorCode::PLUGIN_MANIFEST_INVALID,
+                "{program} 应按 6107 报"
+            );
+        }
+
+        // 存在性：合法相对路径但文件不在包里——「包不完整」，6107。
+        let mut raw = view_manifest();
+        raw["views"][0]["external"]["program"] = json!("bin/asset3d-gui.exe");
+        let errors = validate(&root, &raw).expect_err("缺失的 exe 必须拒载");
+        let violation = errors
+            .iter()
+            .find(|error| error.path == "$.views[0].external.program")
+            .expect("应指向 program 字段");
+        assert!(
+            violation.message.contains("不存在"),
+            "缺失与格式应能区分：{}",
+            violation.message
+        );
+
+        // 子目录里的 exe 要给过：只看最后一段扩展名，不限制层级。
+        std::fs::create_dir_all(root.join("bin")).expect("建子目录");
+        std::fs::write(root.join("bin/asset3d-gui.exe"), b"MZ").expect("写子目录 exe");
+        let mut raw = view_manifest();
+        raw["views"][0]["external"]["program"] = json!("bin/asset3d-gui.exe");
+        let validated = validate(&root, &raw).expect("子目录 exe 应通过");
+        assert_eq!(
+            validated.manifest.views[0]
+                .external
+                .as_ref()
+                .expect("external 应在")
+                .program,
+            "bin/asset3d-gui.exe"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 视图语义：id 形状 / title 长度与控制字符 / location / refresh / protocol / 条数。
+    #[test]
+    fn view_semantics_are_enforced() {
+        let root = temp_package("views-semantics");
+        std::fs::write(root.join("asset3d-gui.exe"), b"MZ").expect("写视口可执行文件");
+
+        let mut raw = view_manifest();
+        raw["views"][0]["id"] = json!("Main_View");
+        let errors = validate(&root, &raw).expect_err("id 首字符大写且含下划线必须拒");
+        assert!(errors.iter().any(|error| error.path == "$.views[0].id"));
+
+        // 48 字符是上限，按字符算：48 个汉字要能过，49 个不能过。
+        let mut raw = view_manifest();
+        raw["views"][0]["title"] = json!("视".repeat(MAX_VIEW_TITLE_LEN));
+        validate(&root, &raw).expect("48 个汉字应在上限内");
+        raw["views"][0]["title"] = json!("视".repeat(MAX_VIEW_TITLE_LEN + 1));
+        let errors = validate(&root, &raw).expect_err("49 个汉字必须拒");
+        assert!(errors.iter().any(|error| error.path == "$.views[0].title"));
+
+        let mut raw = view_manifest();
+        raw["views"][0]["title"] = json!("3D\u{7}资产");
+        let errors = validate(&root, &raw).expect_err("控制字符必须拒");
+        assert!(errors.iter().any(|error| error.path == "$.views[0].title"));
+
+        // location 首版只开一个值：侧栏枚举是固定的，多写的挂不上去。
+        let mut raw = view_manifest();
+        raw["views"][0]["location"] = json!("sidebar");
+        let errors = validate(&root, &raw).expect_err("未知挂载位置必须拒");
+        assert!(errors
+            .iter()
+            .any(|error| error.path == "$.views[0].location"));
+
+        let mut raw = view_manifest();
+        raw["views"][0]["refresh"] = json!(["workspace.changed", "file.deleted"]);
+        let errors = validate(&root, &raw).expect_err("未知刷新事件必须拒");
+        assert!(errors
+            .iter()
+            .any(|error| error.path == "$.views[0].refresh[1]"));
+
+        let mut raw = view_manifest();
+        raw["views"][0]["external"]["protocol"] = json!("asset3d.session/2");
+        let errors = validate(&root, &raw).expect_err("未知协议必须拒");
+        assert!(errors
+            .iter()
+            .any(|error| error.path == "$.views[0].external.protocol"));
+
+        // 条数上限：status 的固定开销要有界。
+        let mut raw = view_manifest();
+        let views: Vec<Value> = (0..=MAX_VIEWS)
+            .map(|index| {
+                json!({
+                    "id": format!("view{index}"),
+                    "title": "视图",
+                    "location": "pluginPanel.detail",
+                    "entry": "repo_stats"
+                })
+            })
+            .collect();
+        raw["views"] = json!(views);
+        let errors = validate(&root, &raw).expect_err("超过条数上限必须拒");
+        assert!(errors.iter().any(|error| error.path == "$.views"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 视图 id 包内唯一；`external` 出现即要求 `program` 与 `protocol` 成对。
+    #[test]
+    fn view_ids_are_unique_and_external_is_complete() {
+        let root = temp_package("views-cross");
+
+        let mut raw = view_manifest();
+        let second = raw["views"][0].clone();
+        raw["views"].as_array_mut().expect("数组").push(second);
+        let errors = validate(&root, &raw).expect_err("视图 id 重复必须拒");
+        assert!(errors.iter().any(|error| error.path == "$.views[1].id"));
+
+        let mut raw = view_manifest();
+        raw["views"][0]["external"] = json!({ "program": "asset3d-gui.exe" });
+        let errors = validate(&root, &raw).expect_err("缺 protocol 必须拒");
+        assert!(errors
+            .iter()
+            .any(|error| error.path == "$.views[0].external.protocol"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 视图段的形状错误不级联：`tools` 不是数组时不再逐条喊「entry 未声明」。
+    #[test]
+    fn view_shape_errors_do_not_cascade() {
+        let root = temp_package("views-shape");
+        std::fs::write(root.join("asset3d-gui.exe"), b"MZ").expect("写视口可执行文件");
+
+        let mut raw = view_manifest();
+        raw["views"] = json!({ "id": "main" });
+        let errors = validate(&root, &raw).expect_err("views 必须是数组");
+        assert_eq!(errors.len(), 1, "只应有一条形状错误：{errors:?}");
+        assert_eq!(errors[0].path, "$.views");
+
+        // tools 整体不是数组时，不该再逐条派生「entry 未声明工具」。
+        // 视图本身保持完整——这一条要排除的正是级联，而非视图形状错误。
+        let mut raw = view_manifest();
+        raw["tools"] = json!({ "name": "repo_stats" });
+        let errors = validate(&root, &raw).expect_err("tools 形状错必须拒");
+        assert!(
+            errors
+                .iter()
+                .all(|error| !error.path.starts_with("$.views")),
+            "tools 形状错时不应判 entry 交叉：{errors:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

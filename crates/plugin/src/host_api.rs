@@ -25,6 +25,16 @@ pub const PROGRESS_METHOD: &str = "host/progress";
 /// 命名沿用清单既有口径（`fs.read` / `search` / `workspace.info`）：取方法名去掉
 /// `host/` 的那一段，全小写、不加分隔符。授权仍是按插件一套，走 `plugin.grant`。
 pub const PROGRESS_CAPABILITY: &str = "progress";
+/// 插件 → 宿主的视图刷新提示方法名（docs/24 §4.5，转 `plugin.view` 事件）。
+///
+/// 通知帧，不等回包：插件只声明「我这个视图的内容变了」，不说变了什么。数据仍由
+/// 渲染侧拿 `viewId` 走 `plugin.call` 去取，那条路有闸门与审计。
+///
+/// **刻意不配能力名**：它既不读也不写，唯一的副作用是在用户眼前把某个已声明的
+/// 视图标脏；能造成的最坏情况是多一次 `plugin.call`，而那次调用自身还要过六步
+/// 闸门。反过来，如果按 `progress` 那样要求能力，清单里已声明的 `views[].refresh`
+/// 就变成「装了但永远刷不了」，反而是更难解释的坑。
+pub const VIEW_REFRESH_METHOD: &str = "host/view.refresh";
 /// 插件 → 宿主的出站网络方法名（P5 切片五）。
 pub const NET_FETCH_METHOD: &str = "host/net.fetch";
 /// 出站网络所需的能力名。授权粒度是「按域名」：能力 + 清单 `allowedDomains`

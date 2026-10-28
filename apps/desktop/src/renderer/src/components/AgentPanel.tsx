@@ -14,27 +14,16 @@
 
 import { useState } from 'react'
 
-import type { AgentMode, AgentRunStatus, ApprovalDecision, ApprovalRisk } from '@ai-ide/shared-types'
+import type { AgentMode, AgentRunStatus } from '@ai-ide/shared-types'
 
 import { useAi } from '../ai-store'
 import { decideApproval, startRun, stopRun, useAgent } from '../agent-store'
+import { ApprovalCard } from './ApprovalCard'
 
 const OUTCOME_TEXT: Record<AgentRunStatus, string> = {
   completed: '已完成',
   failed: '失败',
   cancelled: '已取消'
-}
-
-const RISK_TEXT: Record<ApprovalRisk, string> = { low: '低风险', medium: '中风险', high: '高风险' }
-
-/** 参数原文按 JSON 排版展示：调用的「原文」比任何摘要都可信。 */
-function formatArgs(args: unknown): string {
-  try {
-    const text = JSON.stringify(args, null, 2)
-    return text ?? String(args)
-  } catch {
-    return String(args)
-  }
 }
 
 export function AgentPanel(): React.JSX.Element {
@@ -43,10 +32,6 @@ export function AgentPanel(): React.JSX.Element {
   const [goal, setGoal] = useState('')
   const [mode, setMode] = useState<AgentMode>('agent')
   const [maxSteps, setMaxSteps] = useState('')
-  /** 每个询问的拒绝理由草稿，按 approval_id 分开存。 */
-  const [reasons, setReasons] = useState<Record<string, string>>({})
-  /** 正在展开「拒绝并说明」输入框的询问。 */
-  const [reasonOpen, setReasonOpen] = useState<string | null>(null)
 
   const start = (): void => {
     const parsed = Number(maxSteps.trim())
@@ -63,10 +48,6 @@ export function AgentPanel(): React.JSX.Element {
       // 否则他要凭记忆重打一遍。
       if (ok) setGoal('')
     })
-  }
-
-  const decide = (approvalId: string, decision: ApprovalDecision): void => {
-    void decideApproval(approvalId, decision, reasons[approvalId] ?? null)
   }
 
   return (
@@ -168,85 +149,13 @@ export function AgentPanel(): React.JSX.Element {
       ) : null}
 
       {agent.approvals.map((approval) => (
-        <div
-          className={`agent-approval agent-approval--${approval.risk}`}
+        <ApprovalCard
           key={approval.approvalId}
-          data-testid="agent-approval"
-        >
-          <div className="agent-approval__head">
-            <span className="agent-approval__risk">{RISK_TEXT[approval.risk]}</span>
-            <span className="agent-approval__tool">{approval.tool}</span>
-          </div>
-          <p className="agent-approval__reason">{approval.reason}</p>
-          <pre className="agent-approval__args">{formatArgs(approval.args)}</pre>
-          {approval.error !== null ? <div className="ai-result ai-result--bad">{approval.error}</div> : null}
-          <div className="ai-row">
-            <button
-              className="ai-button"
-              type="button"
-              data-testid="agent-allow-once"
-              disabled={approval.busy}
-              onClick={() => decide(approval.approvalId, 'allow_once')}
-            >
-              允许一次
-            </button>
-            <button
-              className="ai-button"
-              type="button"
-              data-testid="agent-allow-always"
-              disabled={approval.busy}
-              title="同一工具同一范围在本进程内不再重复询问"
-              onClick={() => decide(approval.approvalId, 'allow_always')}
-            >
-              始终允许
-            </button>
-            <button
-              className="ai-button ai-button--danger"
-              type="button"
-              data-testid="agent-deny"
-              disabled={approval.busy}
-              onClick={() => decide(approval.approvalId, 'deny')}
-            >
-              拒绝
-            </button>
-            <button
-              className="ai-button"
-              type="button"
-              data-testid="agent-deny-reason-toggle"
-              disabled={approval.busy}
-              onClick={() =>
-                setReasonOpen((current) => (current === approval.approvalId ? null : approval.approvalId))
-              }
-            >
-              拒绝并说明…
-            </button>
-          </div>
-          {reasonOpen === approval.approvalId ? (
-            <div className="ai-row">
-              <input
-                className="ai-input"
-                data-testid="agent-deny-reason"
-                value={reasons[approval.approvalId] ?? ''}
-                placeholder="为什么不行（会回灌给模型自纠）"
-                onChange={(event) =>
-                  setReasons((current) => ({ ...current, [approval.approvalId]: event.target.value }))
-                }
-              />
-              <button
-                className="ai-button ai-button--danger"
-                type="button"
-                data-testid="agent-deny-submit"
-                disabled={approval.busy}
-                onClick={() => {
-                  decide(approval.approvalId, 'deny_with_reason')
-                  setReasonOpen(null)
-                }}
-              >
-                提交拒绝
-              </button>
-            </div>
-          ) : null}
-        </div>
+          approval={approval}
+          onDecide={(decision, reason) => {
+            void decideApproval(approval.approvalId, decision, reason)
+          }}
+        />
       ))}
     </div>
   )

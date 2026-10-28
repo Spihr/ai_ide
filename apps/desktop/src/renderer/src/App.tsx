@@ -29,6 +29,7 @@ import { openInlineEdit } from './inline-edit-store'
 import { initSessions } from './session-store'
 import { initCoreLogEvents } from './core-log-store'
 import { initPluginActivityEvents } from './plugin-activity-store'
+import { initPluginViewEvents } from './plugin-view-store'
 import { resolveShortcut } from './shortcuts'
 import { toggleSymbolPicker } from './symbol-picker-store'
 import { initTerminalEvents, toggleTerminalPanel } from './terminal-store'
@@ -85,6 +86,12 @@ export function App() {
      */
     const offPluginActivity = initPluginActivityEvents()
     /*
+     * docs/24 §7.3 第 4 刀：插件视图刷新（`plugin:view`）也常驻。面板收起时插件
+     * 照样会推刷新，等展开再订阅只会让用户第一眼看到旧内容；事件只带三个标识，
+     * 真正取数仍走 `plugin.call`。
+     */
+    const offPluginView = initPluginViewEvents()
+    /*
      * P5 切片八：内核日志（stderr + `core.log` 通知）同样常驻。这条订阅必须
      * 最早挂上——内核启动失败的那几行恰好落在窗口刚建好的瞬间，晚一步订阅，
      * 用户点开状态栏只会看到一句 `failed`，上下文全在磁盘里。
@@ -99,6 +106,7 @@ export function App() {
       offWorkspace()
       offTerminal()
       offPluginActivity()
+      offPluginView()
       offCoreLog()
       offGit()
       disposeAi()

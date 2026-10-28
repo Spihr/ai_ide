@@ -65,6 +65,7 @@ use ai_ide_protocol::dto::{
     PluginReloadParams, PluginReloadResult, PluginRevokeParams, PluginRevokeResult, PluginState,
     PluginStatusParams, PluginStatusResult, PluginSummary, PluginToolRisk, PluginToolSummary,
     PluginUninstallParams, PluginUninstallResult, PluginUnloadParams, PluginUnloadResult,
+    PluginViewExternal, PluginViewSummary,
 };
 use ai_ide_protocol::{ErrorCode, ErrorObject, Request};
 use ai_ide_store::{audit_kind, plugin_status, NewPlugin, PluginRecord, Store, StoreError};
@@ -308,9 +309,13 @@ pub async fn status(peer: &Peer, state: &AppState, req: &Request) {
     // 因此详情页回读安装目录里的 plugin.json。回读失败不影响「插件存在」这个事实，
     // 只是工具/命令列表为空——面板仍能看到版本与授权状态。
     let installed_manifest = read_installed_manifest(&record.install_dir);
-    let (tools, commands) = match &installed_manifest {
-        Some(manifest) => (tools_of(&plugin_id, manifest), commands_of(manifest)),
-        None => (Vec::new(), Vec::new()),
+    let (tools, commands, views) = match &installed_manifest {
+        Some(manifest) => (
+            tools_of(&plugin_id, manifest),
+            commands_of(manifest),
+            views_of(manifest),
+        ),
+        None => (Vec::new(), Vec::new(), Vec::new()),
     };
     let requested = capabilities_of(&record);
     let summary = summary_from_record(&record, &requested, &granted);
@@ -321,6 +326,7 @@ pub async fn status(peer: &Peer, state: &AppState, req: &Request) {
             plugin: summary,
             tools,
             commands,
+            views,
         },
     )
     .await;
@@ -2439,6 +2445,9 @@ fn summary_from_record(
         // 「刚装好」与「崩过 N 次、可能还要崩」。
         restarts: record.restarts.max(0) as u32,
         last_error: record.last_error.clone(),
+        // 空串按「没有」处理：一个空的安装目录路径拿去做围栏比对，会退化成
+        // 「只要 program 拼出来是绝对路径就放行」，那正是要防的情形。
+        install_dir: (!record.install_dir.trim().is_empty()).then(|| record.install_dir.clone()),
     }
 }
 
@@ -2497,6 +2506,29 @@ fn commands_of(manifest: &manifest::Manifest) -> Vec<PluginCommandSummary> {
             risk: command.risk,
             path_field: command.path_field.clone(),
             args: command.args.clone(),
+        })
+        .collect()
+}
+
+/// 视图声明转对外描述（docs/24 §4.1）。
+///
+/// 原样搬运，不做过滤：`location` 的取值域、`entry` 的 `risk=read` 约束、
+/// 视图 id 唯一、`program` 的包内路径与存在性，全部在安装期由
+/// `manifest.rs` 校验过（第 1 刀），详情页再判一遍只会出现两套结论。
+fn views_of(manifest: &manifest::Manifest) -> Vec<PluginViewSummary> {
+    manifest
+        .views
+        .iter()
+        .map(|view| PluginViewSummary {
+            id: view.id.clone(),
+            title: view.title.clone(),
+            location: view.location.clone(),
+            entry: view.entry.clone(),
+            refresh: view.refresh.clone(),
+            external: view.external.as_ref().map(|external| PluginViewExternal {
+                program: external.program.clone(),
+                protocol: external.protocol.clone(),
+            }),
         })
         .collect()
 }

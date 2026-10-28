@@ -2,6 +2,7 @@
 import type { PluginCommandSummary } from "./PluginCommandSummary";
 import type { PluginSummary } from "./PluginSummary";
 import type { PluginToolSummary } from "./PluginToolSummary";
+import type { PluginViewSummary } from "./PluginViewSummary";
 
 /**
  * `plugin.status` 响应结果。
@@ -18,4 +19,8 @@ tools: Array<PluginToolSummary>,
 /**
  * 声明的命令（未加载时为空数组）。
  */
-commands: Array<PluginCommandSummary>, };
+commands: Array<PluginCommandSummary>, 
+/**
+ * 声明的视图（未加载或老包未声明时为空数组）。docs/24 §4.1。
+ */
+views: Array<PluginViewSummary>, };

@@ -11,6 +11,7 @@ import type {
   PluginLogEvent,
   PluginProgressEvent,
   PluginStateChangedEvent,
+  PluginViewRefreshEvent,
   TerminalDataEvent,
   TerminalExitEvent,
   WorkspaceChangedEvent,
@@ -22,6 +23,7 @@ export type {
   PluginLogEvent,
   PluginProgressEvent,
   PluginStateChangedEvent,
+  PluginViewRefreshEvent,
   TerminalDataEvent,
   TerminalExitEvent,
   WorkspaceChangedEvent,
@@ -90,13 +92,37 @@ export const IpcChannels = {
    */
   pluginStateChanged: 'plugin:state-changed',
   /**
+   * 主进程 → 渲染进程：插件视图需要重拉（`plugin.view`，docs/24 §4.5）。
+   *
+   * 与上文三条遥测同一条思路：单独成道，不混进 `ai:event`。载荷只有
+   * `{pluginId,viewId,rev}`，渲染侧拿它判「是不是当前这个视图、是不是更新的
+   * rev」，命中才去走一次 `plugin.call`——事件本身不搬视图数据。
+   */
+  pluginView: 'plugin:view',
+  /**
+   * 确保插件声明的外部视口进程已启动（invoke，docs/24 §5.4）。
+   *
+   * 与 `coreRequest` 分开，是因为它**不是** RPC 方法：它是外壳自己的进程管辖。
+   * 参数只有 `pluginId + viewId`，安装目录与 `program` 由主进程回内核 `plugin.status`
+   * 查——渲染进程递进来的任何路径都不该被当成「要启动哪个 exe」的依据。
+   */
+  pluginSpawnExternalView: 'plugin:spawn-external-view',
+  /**
    * 主进程 → 渲染进程：语言服务的诊断批次（`lsp.diagnostics`）。
    *
    * 单独开一条通道的理由与终端 / 插件事件一致：诊断是**服务器主动推**的，一次
    * 编辑就可能来一批（含「问题消失了」的空批次），塞进 `ai:event` 会让对话面板
    * 跟着无谓唤醒。订阅方只有渲染侧的 `lsp-store`。
    */
-  lspDiagnostics: 'lsp:diagnostics'
+  lspDiagnostics: 'lsp:diagnostics',
+  /**
+   * 主进程 → 渲染进程：外部视口进程退出（docs/24 §5.3）。
+   *
+   * 这条通道**不来自内核**：视口是外壳 `spawn` 的，退出码只有主进程看得见。
+   * 走独立通道而不是 `ai:event`，是因为它不是内核通知，混进去会让「哪些事件
+   * 来自内核」这条边界变糊。
+   */
+  viewportStateChanged: 'viewport:state-changed'
 } as const
 
 export type CoreState = 'idle' | 'starting' | 'ready' | 'failed' | 'stopped'
@@ -168,6 +194,30 @@ export interface AiEvent {
   params: unknown
 }
 
+/** 外部视口就绪结果（docs/24 §5.4）。 */
+export interface ExternalViewportResult {
+  /**
+   * `true` 表示复用了上一轮仍在运行的视口进程。
+   *
+   * 管道名不往渲染侧传：它是宿主与视口之间的握手凭据，渲染进程拿到了也只能
+   * 干一件事——绕过内核直接往视口发帧。
+   */
+  reused: boolean
+}
+
+/**
+ * 外部视口进程退出事件（docs/24 §5.3「视口崩溃 → 面板显示视口已关闭」）。
+ *
+ * 只发 `exited`，没有 `opened`：打开是渲染进程自己发起的，它本来就知道；
+ * 再补一帧 `opened` 只会让「谁先到」这件事多一个竞态。
+ */
+export interface ViewportStateEvent {
+  pluginId: string
+  viewId: string
+  /** `null` 表示进程被信号终止或启动失败，拿不到退出码。 */
+  exitCode: number | null
+}
+
 /** 渲染进程可见的 API 形状（由 preload 注入到 `window.aiide`）。 */
 export interface AiIdeApi {
   getCoreStatus: () => Promise<CoreStatus>
@@ -217,12 +267,32 @@ export interface AiIdeApi {
   /** 订阅插件状态迁移（`plugin.state_changed`），返回取消订阅函数。 */
   onPluginStateChanged: (listener: (event: PluginStateChangedEvent) => void) => () => void
   /**
+   * 订阅插件视图刷新（`plugin.view`），返回取消订阅函数。
+   *
+   * 只转交 `{pluginId,viewId,rev}`：去重与取数都在渲染侧的 `plugin-view-store`，
+   * preload 一旦开始加工，两侧就会各有一套「什么算新」的口径。
+   */
+  onPluginView: (listener: (event: PluginViewRefreshEvent) => void) => () => void
+  /**
+   * 订阅外部视口进程退出，返回取消订阅函数。
+   *
+   * 面板据此把按钮从「视口已打开」退回「打开视口」，并说明是正常关窗还是崩溃。
+   */
+  onViewportState: (listener: (event: ViewportStateEvent) => void) => () => void
+  /**
    * 订阅语言服务诊断（`lsp.diagnostics`），返回取消订阅函数。
    *
    * 载荷里的 `range` 是 **1-based** 行列、`severity` 是枚举字符串，转换与打点都在
    * 渲染侧 `lsp-store` / `lsp-markers` 完成——preload 只转交，不改写载荷。
    */
   onLspDiagnostics: (listener: (event: LspDiagnosticsEvent) => void) => () => void
+  /**
+   * 确保插件的外部视口进程就绪（已就绪则复用，不重复起进程）。
+   *
+   * 失败时抛出 `Error`，`message` 末尾带 `code:` 前缀的原因码（`program_escape`
+   * / `pipe_timeout` 等），面板据此决定是「重新安装插件」还是「查看插件日志」。
+   */
+  openExternalViewport: (pluginId: string, viewId: string) => Promise<ExternalViewportResult>
 }
 
 // ---------------------------------------------------------------------------

@@ -3492,6 +3492,17 @@ pub struct PluginSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub last_error: Option<String>,
+    /// 安装目录绝对路径（`/` 分隔）。docs/24 §5.4。
+    ///
+    /// 只给外壳用来做「外部视口可执行文件必须在这个目录里」的围栏：`views[].external.program`
+    /// 是清单里的**相对**路径，主进程必须先拼成绝对路径再判它在不在安装目录内。
+    /// 让外壳自己去猜 `<data_dir>/plugins/<id>` 会把「安装布局」变成一份隐式契约，
+    /// 内核改一次目录结构，逃逸校验就悄悄失效——所以路径从内核给。
+    ///
+    /// 这不构成额外信息面：同一台机器上跑着的渲染进程本来就能读工作区文件。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub install_dir: Option<String>,
 }
 
 /// 一个插件工具的对外描述。
@@ -3539,6 +3550,46 @@ pub struct PluginCommandSummary {
     pub args: Option<serde_json::Value>,
 }
 
+/// 一个插件视图的对外描述（docs/24 §4.1）。
+///
+/// 只描述「挂在哪、标题叫什么、用哪个工具取内容」，**内容本身不进这里**：
+/// 面板拿到 summary 后按 `entry` 走 `plugin.call` 拉数据，仍要过状态 / 授权 /
+/// 路径 / 配额四关（ADR-15）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginViewSummary {
+    /// 插件内原始视图 id（同一插件内唯一，与工具名空间无关）。
+    pub id: String,
+    /// 面板标题。
+    pub title: String,
+    /// 挂载位置，首版仅 `pluginPanel.detail`。原样透传，前端不硬编码位置常量。
+    pub location: String,
+    /// 取内容的工具名——**插件内原始名**，不是 `plugin__x__y` 全名，
+    /// 因为面板调用走 `plugin.call`（参数是 pluginId + 原始工具名）。
+    pub entry: String,
+    /// 触发重拉的事件名；空数组表示只在面板打开时拉一次。
+    ///
+    /// 这里不用 `skip_serializing_if`（与 `PluginCommandSummary` 的 Option 字段不同）：
+    /// 空数组是常态，前端 `includes()` 直接可用，省掉一层 `undefined` 分支。
+    #[serde(default)]
+    pub refresh: Vec<String>,
+    /// 外部视口可执行文件；缺省表示该视图只渲染只读描述树（ADR-16）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub external: Option<PluginViewExternal>,
+}
+
+/// 视图配套的外部视口（`views[].external`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PluginViewExternal {
+    /// 包内相对路径的 `.exe`。**不能直接 spawn**：主进程仍要规范化、
+    /// 校验留在插件安装目录内、校验扩展名（docs/24 §5.4）。
+    pub program: String,
+    /// 会话协议版本（首版仅 `1`）。
+    pub protocol: String,
+}
+
 /// `plugin.list` 参数：无（保留空对象，便于将来加过滤条件而不破坏兼容）。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -3570,6 +3621,9 @@ pub struct PluginStatusResult {
     pub tools: Vec<PluginToolSummary>,
     /// 声明的命令（未加载时为空数组）。
     pub commands: Vec<PluginCommandSummary>,
+    /// 声明的视图（未加载或老包未声明时为空数组）。docs/24 §4.1。
+    #[serde(default)]
+    pub views: Vec<PluginViewSummary>,
 }
 
 /// `plugin.install` 参数。
@@ -4680,10 +4734,12 @@ mod tests {
             tool_count: 0,
             restarts: 0,
             last_error: None,
+            install_dir: None,
         };
         let json = serde_json::to_value(&summary).unwrap();
         assert!(json.get("description").is_none(), "{json}");
         assert!(json.get("last_error").is_none(), "{json}");
+        assert!(json.get("install_dir").is_none(), "{json}");
         assert_eq!(json["state"], serde_json::json!("disabled"));
         assert_eq!(
             serde_json::from_value::<PluginSummary>(json).unwrap(),

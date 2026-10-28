@@ -35,6 +35,8 @@
 
 import {
   Methods,
+  type PluginCallParams,
+  type PluginCallResult,
   type PluginCommandParams,
   type PluginCommandResult,
   type PluginGrantParams,
@@ -355,6 +357,20 @@ export const pluginApi = {
       command,
       ...(args === undefined ? {} : { args })
     } satisfies PluginCommandParams) as Promise<PluginCommandResult>,
+
+  /**
+   * 调用插件声明的工具（视图描述就走这条，docs/24 §4.5）。
+   *
+   * 与 `plugin.command` 的区别沿用内核定义：`method` 是**工具名**（不是命令名），
+   * 不带审批、有独立的配额与能力闸门；返回正文已按 64 KB 字符边界截断，
+   * `truncated` 为真时视图描述必然不完整，调用方要按「拒渲染」处理而不是硬解析。
+   */
+  call: (pluginId: string, method: string, params?: unknown): Promise<PluginCallResult> =>
+    window.aiide.request(Methods.plugin.call, {
+      plugin_id: pluginId,
+      method,
+      ...(params === undefined ? {} : { params })
+    } satisfies PluginCallParams) as Promise<PluginCallResult>,
 
   revoke: (pluginId: string, capabilities: string[]): Promise<PluginRevokeResult> =>
     window.aiide.request(Methods.plugin.revoke, {

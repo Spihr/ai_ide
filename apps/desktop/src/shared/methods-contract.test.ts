@@ -224,6 +224,25 @@ describe('协议常量', () => {
     })
   })
 
+  /*
+   * docs/24 §7.3 第 4 刀：`plugin.view` 与另外三条同属「宿主内部通道」——
+   * 不参与 `methods::event` 握手，但同样是跨进程字面量，一样会拼错。
+   * 这里单独钉一组，四条一起比，谁改成驼峰或漏个下划线都会红。
+   */
+  it('插件内部通道与 Rust events 常量逐字一致', () => {
+    expect({
+      log: Methods.event.pluginLog,
+      progress: Methods.event.pluginProgress,
+      stateChanged: Methods.event.pluginStateChanged,
+      view: Methods.event.pluginView
+    }).toEqual({
+      log: 'plugin.log',
+      progress: 'plugin.progress',
+      stateChanged: 'plugin.state_changed',
+      view: 'plugin.view'
+    })
+  })
+
   it('已实现方法清单与 Rust IMPLEMENTED 一致', () => {
     expect([...IMPLEMENTED_METHODS]).toEqual([
       'core.hello',
