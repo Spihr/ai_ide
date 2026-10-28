@@ -30,7 +30,14 @@
 //!
 //! 写盘用「同目录临时文件 → `fsync` → `rename`」：`rename` 在同卷上是替换语义
 //! （Windows 走 `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`），掉电最多丢掉这次
-//! 写入，绝不会给用户留半个文件。
+//! 写入，绝不会给用户留半个文件。这条路径只服务**整文件替换**；`append` /
+//! `offset` 两种分片写在原文件上就地落笔（见 [`WriteMode`]），因为替换语义
+//! 恰恰会丢掉「已经写进去的那半截」。
+//!
+//! 大文件靠**分片**而不是放宽帧上限：`host/fs.read` 认 `offset`，`host/fs.write`
+//! 认 `append` / `offset`，单帧仍是 1 MiB（`crates/plugin/src/loader.rs` 的
+//! `FRAME_LIMIT_BYTES`）。插件按回包里的 `bytes` 推进偏移循环即可，宿主这边
+//! 不需要「一次把 100 MB 读进内存」的能力，也不该有。
 //!
 //! 每次调用（含被拒、被驳回与超配额）都落一行 `plugin.host_call` 审计。审计是
 //! 异步写的：这条路径跑在插件 stdout 的帧泵里，同步 `await` 一次写库会堵住该
@@ -40,7 +47,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -64,7 +71,19 @@ use crate::plugin_llm::{self, ChatPlan, LlmChannel, LlmPolicy, ProviderChannel};
 use crate::plugin_net::{self, FetchPlan, NetTransport, ReqwestTransport};
 
 /// `host/fs.read` 的默认读取上限（64 KB）。
+///
+/// 这是**单次窗口**而不是文件总长：传 `offset` 就能接着往下读（见
+/// [`FsHostApi::fs_read`]）。窗口上限保持不变，因为回包要走 1 MiB 的单帧；
+/// `encoding: base64` 有 4/3 膨胀，一次窗口留在 ~720 KiB 以内才装得下。
 pub const DEFAULT_READ_BYTES: u64 = 64 * 1024;
+/// `host/fs.read` 单次窗口的**硬上限**（512 KiB）。
+///
+/// `maxBytes` 传再大也只到这里，理由和 §7.4 的 `net.fetch` 同一条：回包要走
+/// 1 MiB 的单帧，`encoding: base64` 有 4/3 膨胀，512 KiB 编成 base64 约 683 KB，
+/// 加上 JSON 的键与转义仍在预算内。不给这个闸门的话，一次「传个 10 MB 试试」
+/// 就能把插件自己顶出帧上限被踢下线——插件读到的是「进程没了」，而不是可读的错误。
+/// 超出窗口的字节靠 `offset` 接着读，`truncated` / `eof` 会如实告诉调用方还剩没剩。
+pub const MAX_READ_WINDOW_BYTES: u64 = 512 * 1024;
 /// `host/search.content` 的默认命中条数上限。
 pub const DEFAULT_SEARCH_RESULTS: usize = 50;
 /// 单次工具调用允许的宿主调用次数（docs/14 §8.4）。
@@ -819,12 +838,32 @@ impl FsHostApi {
             .unwrap_or_else(|_| abs.display().to_string().replace('\\', "/"))
     }
 
+    /// `host/fs.read`：整文件或按 `offset` 分片读取。
+    ///
+    /// `offset` 是**字节偏移**，缺省 0——不传就是原来的「从头读」，老调用方的
+    /// 回包在既有字段上一字不差，只是多了 `offset` / `size` / `eof` 三个描述
+    /// 位置的字段。`maxBytes` 仍是单次窗口，不是文件总长：读大文件就按回包的
+    /// `bytes` 推进 offset 循环。
+    ///
+    /// 越界口径：`offset == size` 合法（回空内容，等于 EOF）；`offset > size` 是
+    /// 参数错误。这样「照 `bytes` 往前推」的循环永远不会踩到错误，而一个明显
+    /// 写错的偏移（比如拿字符数当字节数）会当场报出来，不会静默返回空串。
     fn fs_read(&self, abs: &Path, params: &Value) -> Result<Value, HostApiError> {
         let max_bytes = match params.get("maxBytes") {
             None | Some(Value::Null) => DEFAULT_READ_BYTES,
             Some(value) => value.as_u64().filter(|n| *n > 0).ok_or_else(|| {
                 HostApiError::invalid_params("maxBytes 必须是大于 0 的整数（字节）")
             })?,
+        };
+        // 窗口硬上限：`maxBytes` 只是「我一次想要多少」，能不能装进一帧由宿主定。
+        // 夹住而不是报错，是因为调用方本来就该按回包的 `bytes` 推进 `offset`，
+        // 夹到上限对它只是「这一片小一点」，不是错误。
+        let max_bytes = max_bytes.min(MAX_READ_WINDOW_BYTES);
+        let offset = match params.get("offset") {
+            None | Some(Value::Null) => 0,
+            Some(value) => value
+                .as_u64()
+                .ok_or_else(|| HostApiError::invalid_params("offset 必须是不小于 0 的整数（字节）"))?,
         };
         // 二进制资产（FBX / GLB / 图片）没法走 `from_utf8_lossy`：占位符会毁掉字节。
         // 写侧早有 `base64`，读侧缺它就只能「读不了自己写的文件」，因此对齐同一套口径。
@@ -845,7 +884,18 @@ impl FsHostApi {
                 format!("{} 是目录，不能按文件读取", self.display_path(abs)),
             ));
         }
-        let file = File::open(abs).map_err(|err| io_error(abs, &err))?;
+        let size = meta.len();
+        if offset > size {
+            return Err(HostApiError::invalid_params(format!(
+                "offset {offset} 超出文件长度（{} 字节）",
+                size
+            )));
+        }
+        let mut file = File::open(abs).map_err(|err| io_error(abs, &err))?;
+        if offset > 0 {
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|err| io_error(abs, &err))?;
+        }
         // 多读 1 字节：靠「读到了第 max+1 个字节」判定被截断，比先 stat 再读更准
         // （文件可能在 stat 与 read 之间长大）。
         let mut buffer = Vec::new();
@@ -860,12 +910,18 @@ impl FsHostApi {
         } else {
             String::from_utf8_lossy(&buffer).to_string()
         };
+        let read = buffer.len() as u64;
         Ok(json!({
             "path": self.display_path(abs),
             "content": content,
             "encoding": encoding,
-            "bytes": buffer.len(),
+            "bytes": read,
             "truncated": truncated,
+            // 分片读的定位信息：`size` 是整文件长度，`eof` 表示这一片已经读到末尾。
+            // 不传 offset 的老调用方拿到的仍是 offset:0 的旧语义（只是多了三个字段）。
+            "offset": offset,
+            "size": size,
+            "eof": offset.saturating_add(read) >= size,
         }))
     }
 
@@ -1138,23 +1194,44 @@ impl FsHostApi {
         }
     }
 
-    /// `host/fs.write`：临时文件 → `fsync` → `rename`。
+    /// 解析 `host/fs.write` 的落盘方式：缺省整文件替换，`append:true` 追加，
+    /// `offset` 定位覆写。
     ///
-    /// `rename` 只在同卷上原子，所以临时文件必须落在**目标同目录**；先 `fsync`
-    /// 是为了让「rename 成功」真的等于「内容已经落盘」，否则掉电后可能留下一个
-    /// 名字对、内容为空的文件——比半个文件更难查。
-    ///
-    /// 参数解码与「目标是目录」的检查都在审批之前做完（见 [`Self::write_payload`]
-    /// 与 `call` 里的写侧闸门），进到这里的只剩「真的要落盘」这一件事。
-    fn fs_write(&self, abs: &Path, bytes: &[u8], existed: bool) -> Result<Value, HostApiError> {
-        let display = self.display_path(abs);
-        let parent = abs.parent().ok_or_else(|| {
-            HostApiError::new(HostApiError::IO, format!("{display} 没有可写入的父目录"))
-        })?;
-        // 目录不存在就补建：v1 没有 `fs.mkdir`，不补建的话插件连新建目录下的
-        // 第一个文件都写不了。范围已经过路径闸门，建目录不会越出工作区。
-        std::fs::create_dir_all(parent).map_err(|err| write_error(&display, &err))?;
+    /// 两件事必须在**审批之前**定下来：① 参数合法性（`append` 得是布尔、
+    /// `offset` 得是非负整数、两者不能同时给）；② 具体写哪一段。审批卡片是给
+    /// 用户看的，让他为一次注定失败的写入点「允许」是纯打扰。
+    fn write_mode(params: &Value) -> Result<WriteMode, HostApiError> {
+        let append = match params.get("append") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(flag)) => *flag,
+            Some(_) => return Err(HostApiError::invalid_params("append 必须是布尔值")),
+        };
+        let offset = match params.get("offset") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(value.as_u64().ok_or_else(|| {
+                HostApiError::invalid_params("offset 必须是不小于 0 的整数（字节）")
+            })?),
+        };
+        match (append, offset) {
+            // 「追加到末尾」和「写到第 N 字节」是两个位置，同时给必有一个是错的。
+            // 这里不猜，直接拒：猜错的代价是把分片写歪，而且很难反查。
+            (true, Some(_)) => Err(HostApiError::invalid_params(
+                "append 与 offset 不能同时给出：追加写末尾，offset 写指定位置",
+            )),
+            (true, None) => Ok(WriteMode::Append),
+            (false, Some(offset)) => Ok(WriteMode::At(offset)),
+            (false, None) => Ok(WriteMode::Replace),
+        }
+    }
 
+    /// 整文件替换：临时文件 → `fsync` → `rename`（落点见函数级注释）。
+    fn write_replace(
+        &self,
+        parent: &Path,
+        abs: &Path,
+        bytes: &[u8],
+        display: &str,
+    ) -> Result<(), HostApiError> {
         let seq = self.temps.fetch_add(1, Ordering::Relaxed) + 1;
         let temp = parent.join(format!(
             "{WRITE_TEMP_PREFIX}-{}-{seq}.tmp",
@@ -1167,17 +1244,56 @@ impl FsHostApi {
         })();
         if let Err(err) = written {
             remove_temp(&temp);
-            return Err(write_error(&display, &err));
+            return Err(write_error(display, &err));
         }
         if let Err(err) = std::fs::rename(&temp, abs) {
             // 失败就别把临时文件留给用户：否则工作区里会慢慢堆出
             // `.aiide-write-*.tmp`，而且 `fs.list` 会把它们当正常文件报出去。
             remove_temp(&temp);
-            return Err(write_error(&display, &err));
+            return Err(write_error(display, &err));
         }
+        Ok(())
+    }
+
+    /// `host/fs.write`：整文件替换走「临时文件 → `fsync` → `rename`」，
+    /// `append` / `offset` 两种分片写在原文件上就地落笔。
+    ///
+    /// `rename` 只在同卷上原子，所以临时文件必须落在**目标同目录**；先 `fsync`
+    /// 是为了让「rename 成功」真的等于「内容已经落盘」，否则掉电后可能留下一个
+    /// 名字对、内容为空的文件——比半个文件更难查。这条路径**只服务替换**：
+    /// 分片写的前提是保住文件里已有的字节，而 rename 一份新文件恰好会把它们丢掉。
+    ///
+    /// 参数解码与「目标是目录」的检查都在审批之前做完（见 [`Self::write_payload`]、
+    /// [`Self::write_mode`] 与 `call` 里的写侧闸门），进到这里的只剩「真的要落盘」。
+    fn fs_write(
+        &self,
+        abs: &Path,
+        bytes: &[u8],
+        existed: bool,
+        mode: WriteMode,
+    ) -> Result<Value, HostApiError> {
+        let display = self.display_path(abs);
+        let parent = abs.parent().ok_or_else(|| {
+            HostApiError::new(HostApiError::IO, format!("{display} 没有可写入的父目录"))
+        })?;
+        // 目录不存在就补建：v1 没有 `fs.mkdir`，不补建的话插件连新建目录下的
+        // 第一个文件都写不了。范围已经过路径闸门，建目录不会越出工作区。
+        std::fs::create_dir_all(parent).map_err(|err| write_error(&display, &err))?;
+
+        // `offset` 是这一片实际落笔的位置；`size` 是写完之后整文件的长度；
+        // `padded` 说明为了够到 offset 在尾部补了多少个 0（见 `write_in_place`）。
+        let (offset, size, padded) = match mode {
+            WriteMode::Replace => {
+                self.write_replace(parent, abs, bytes, &display)?;
+                (0, bytes.len() as u64, 0)
+            }
+            WriteMode::Append => write_in_place(abs, bytes, None, &display)?,
+            WriteMode::At(offset) => write_in_place(abs, bytes, Some(offset), &display)?,
+        };
 
         // 插件写盘也是「保存」：其它订阅了 `file.saved` 的插件应当同样感知到，
         // 不能只有编辑器那条路径会发事件。载荷只有路径，不带正文。
+        // 分片写每片都会发一次——订阅方要按 `size` 自己判断这一片是否写完。
         self.publish_event(
             ai_ide_plugin::events::FILE_SAVED,
             ai_ide_plugin::events::file_saved_payload(&display),
@@ -1187,6 +1303,9 @@ impl FsHostApi {
             "path": display,
             "bytes": bytes.len(),
             "created": !existed,
+            "offset": offset,
+            "size": size,
+            "padded": padded,
         }))
     }
 
@@ -1420,7 +1539,7 @@ impl HostApi for FsHostApi {
         // 先问用户、再发现参数畸形，等于拿审批弹窗当校验器，白打扰一次；
         // 而路径必须更早过闸门，否则弹窗就成了「这个路径敏不敏感」的探测器。
         let mut scope_key: Option<String> = None;
-        let mut write_payload: Option<(Vec<u8>, bool)> = None;
+        let mut write_payload: Option<(Vec<u8>, bool, WriteMode)> = None;
         if method == "host/fs.write" {
             if let Some(path) = abs.as_deref() {
                 let display = self.display_path(path);
@@ -1434,6 +1553,9 @@ impl HostApi for FsHostApi {
                     err
                 };
                 let bytes = Self::write_payload(params).map_err(deny)?;
+                // 分片写的参数（append / offset）同样在审批前定死：审批卡片上
+                // 「允许写这个文件」应该是最后一次询问，不该写完才发现参数打架。
+                let mode = Self::write_mode(params).map_err(deny)?;
                 if path.is_dir() {
                     return Err(deny(HostApiError::new(
                         HostApiError::IO,
@@ -1443,7 +1565,7 @@ impl HostApi for FsHostApi {
                 let key = write_scope_key(path);
                 self.approve_write(plugin_id, method, &display, &key, &call_id)?;
                 scope_key = Some(key);
-                write_payload = Some((bytes, path.exists()));
+                write_payload = Some((bytes, path.exists(), mode));
             }
         }
 
@@ -1489,7 +1611,7 @@ impl HostApi for FsHostApi {
             (Some(path), "host/fs.list") => self.fs_list(path),
             (Some(path), "host/fs.stat") => self.fs_stat(path),
             (Some(path), "host/fs.write") => match write_payload {
-                Some((bytes, existed)) => self.fs_write(path, &bytes, existed),
+                Some((bytes, existed, mode)) => self.fs_write(path, &bytes, existed, mode),
                 // 走不到：写侧的 payload 在上面的闸门里已经备好。
                 None => Err(HostApiError::new(
                     HostApiError::METHOD_NOT_FOUND,
@@ -1798,6 +1920,70 @@ fn canonicalize_lenient(path: &Path) -> PathBuf {
         }
     }
     normalize_lexically(path)
+}
+
+/// `host/fs.write` 的落盘方式。
+///
+/// 缺省是 [`WriteMode::Replace`]，和 v1 的语义完全一致（整文件换掉、原子）。
+/// 另外两种是给**大文件分片**用的：先 `append` 若干片、或按 `offset` 各写各的
+/// 区段，多次调用拼成一个完整文件。它们不能复用 `rename`（那会丢掉前一帧写进
+/// 去的内容），所以是就地写，代价是单次失败可能留半截——但半截文件恰好是
+/// `offset` 能修的东西：下一片从已知偏移接着写就是了。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteMode {
+    /// 整文件替换：临时文件 → `fsync` → `rename`。
+    Replace,
+    /// 追加到当前文件末尾（文件不存在则创建）。
+    Append,
+    /// 从第 N 字节起覆写；文件比 N 短就先补零拉长，比 N+len 长则保留尾部。
+    At(u64),
+}
+
+/// 分片写：`append`（写末尾）与 `offset`（定位写）共用同一条路径。
+///
+/// 返回 `(落笔起点, 写完后文件长度, 为够到起点补的零字节数)`。
+///
+/// 三件必须处理的事：
+/// - **目标不存在**：`create(true)` 建出来，`append` 自然就是「写第一片」；
+/// - **父目录缺失**：调用方（`fs_write`）已经补建，这里只管文件；
+/// - **半截文件**：目标比 `offset` 短时用 `set_len` 补零而不是 `seek` 过末尾
+///   直接写——Windows 上后者会留一段落在「有效数据长度」之外的洞，读回来虽然
+///   也是 0，但备份/复制工具的行为不一致；`set_len` 是确定的。
+fn write_in_place(
+    abs: &Path,
+    bytes: &[u8],
+    at: Option<u64>,
+    display: &str,
+) -> Result<(u64, u64, u64), HostApiError> {
+    let mut file = File::options()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(abs)
+        .map_err(|err| write_error(display, &err))?;
+    let before = file
+        .metadata()
+        .map_err(|err| write_error(display, &err))?
+        .len();
+    // 不给 offset 就是追加：起点等于当前长度，正好是「写到末尾」。
+    let start = at.unwrap_or(before);
+    let mut padded = 0;
+    if start > before {
+        file.set_len(start)
+            .map_err(|err| write_error(display, &err))?;
+        padded = start - before;
+    }
+    file.seek(SeekFrom::Start(start))
+        .map_err(|err| write_error(display, &err))?;
+    file.write_all(bytes)
+        .map_err(|err| write_error(display, &err))?;
+    // 就地写没有 rename 兜底，`fsync` 是唯一能保证「回包说写成功 = 真落盘」的动作。
+    file.sync_all().map_err(|err| write_error(display, &err))?;
+    let size = file
+        .metadata()
+        .map(|meta| meta.len())
+        .unwrap_or_else(|_| start.saturating_add(bytes.len() as u64));
+    Ok((start, size, padded))
 }
 
 /// 写盘失败的错误码：父目录不存在给 1004，其余（权限、占用、跨卷）给 1005。
@@ -2397,6 +2583,340 @@ mod tests {
         )
         .expect("合法请求应写入");
         assert_eq!(approver.asked().len(), 1, "只有通过校验的那次才该去审批");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 分片读：`offset` 从文件中间开窗，回包给出能续读的三个字段。
+    ///
+    /// 这条用例同时钉住「不传 offset 时旧行为不变」：同一次调用里先做一遍老式
+    /// 全量读，字段值必须和分片前完全一致。
+    #[test]
+    fn fs_read_window_follows_offset() {
+        let root = sandbox("read-offset");
+        // 0..=255 的字节序列：窗口边界差一个字节都能立刻看出来。
+        let raw: Vec<u8> = (0u16..256).map(|byte| byte as u8).collect();
+        std::fs::write(root.join("blob.bin"), &raw).expect("写二进制");
+        let api = api_with(&root, &["fs.read"]);
+
+        // 旧行为：不传 offset，从 0 读满，回包描述位置的三字段落在初值上。
+        let legacy = api
+            .call("demo", "host/fs.read", &json!({ "path": "blob.bin" }))
+            .expect("老调用方必须继续可用");
+        assert_eq!(legacy["bytes"], 256);
+        assert_eq!(legacy["eof"], true);
+        assert_eq!(legacy["offset"], 0);
+        assert_eq!(legacy["size"], 256);
+
+        // 中途开窗：第 100 字节起读 50 个。
+        let middle = api
+            .call(
+                "demo",
+                "host/fs.read",
+                &json!({ "path": "blob.bin", "encoding": "base64", "offset": 100, "maxBytes": 50 }),
+            )
+            .expect("中途读应成功");
+        assert_eq!(middle["offset"], 100);
+        assert_eq!(middle["bytes"], 50);
+        assert_eq!(middle["size"], 256);
+        assert_eq!(middle["eof"], false, "还有后续，不该声称读完了");
+        let decoded = BASE64
+            .decode(middle["content"].as_str().unwrap_or(""))
+            .expect("回包必须是合法 base64");
+        assert_eq!(decoded, &raw[100..150], "窗口必须正好是 [100,150)");
+
+        // 尾窗：窗口比剩余字节多，回包只报实际读到的长度。
+        let tail = api
+            .call(
+                "demo",
+                "host/fs.read",
+                &json!({ "path": "blob.bin", "encoding": "base64", "offset": 250, "maxBytes": 64 }),
+            )
+            .expect("尾窗应成功");
+        assert_eq!(tail["bytes"], 6);
+        assert_eq!(tail["eof"], true);
+        assert_eq!(tail["truncated"], false, "读到文件末尾不算被窗口截断");
+        let decoded = BASE64
+            .decode(tail["content"].as_str().unwrap_or(""))
+            .expect("回包必须是合法 base64");
+        assert_eq!(decoded, &raw[250..], "尾窗不能多给也不能少给");
+
+        // offset 恰好等于文件长度 = EOF：空内容但不是错误，续读循环不会卡住。
+        let end = api
+            .call(
+                "demo",
+                "host/fs.read",
+                &json!({ "path": "blob.bin", "offset": 256 }),
+            )
+            .expect("offset==size 属于合法 EOF");
+        assert_eq!(end["bytes"], 0);
+        assert_eq!(end["eof"], true);
+        assert_eq!(end["truncated"], false);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 越界的 `offset` 是参数错误，不能静默返回空串——否则分片读会「悄悄少读一段」。
+    #[test]
+    fn fs_read_rejects_offset_past_eof() {
+        let root = sandbox("read-offset-oob");
+        std::fs::write(root.join("small.txt"), "abc").expect("写文件");
+        let api = api_with(&root, &["fs.read"]);
+
+        let past = api
+            .call(
+                "demo",
+                "host/fs.read",
+                &json!({ "path": "small.txt", "offset": 4 }),
+            )
+            .expect_err("超过文件长度必须拒");
+        assert_eq!(past.code, HostApiError::INVALID_PARAMS);
+        assert!(past.message.contains("offset 4"), "报错要说清是哪个偏移");
+
+        let negative = api
+            .call(
+                "demo",
+                "host/fs.read",
+                &json!({ "path": "small.txt", "offset": -1 }),
+            )
+            .expect_err("负数偏移必须拒");
+        assert_eq!(negative.code, HostApiError::INVALID_PARAMS);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `maxBytes` 撞窗口硬上限时夹住而不是报错：回包要装进 1 MiB 单帧，
+    /// 夹到 512 KiB 后 base64 约 683 KB 仍在预算内；剩余字节靠 `offset` 接着读。
+    #[test]
+    fn fs_read_clamps_window_to_frame_budget() {
+        let root = sandbox("read-window-clamp");
+        let total = MAX_READ_WINDOW_BYTES + 1024;
+        let blob: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        std::fs::write(root.join("big.bin"), &blob).expect("写文件");
+        let api = api_with(&root, &["fs.read"]);
+
+        // 要 4 MiB：一次响应装不进一帧，宿主夹到硬上限，但仍然如实报「还没读完」。
+        let head = api
+            .call(
+                "demo",
+                "host/fs.read",
+                &json!({ "path": "big.bin", "encoding": "base64", "maxBytes": 4 * 1024 * 1024 }),
+            )
+            .expect("超上限的 maxBytes 应夹住而不是拒");
+        assert_eq!(head["bytes"], MAX_READ_WINDOW_BYTES);
+        assert_eq!(head["truncated"], true, "夹窗等于「还有后续」");
+        assert_eq!(head["eof"], false);
+        let encoded = head["content"].as_str().expect("base64 字符串");
+        assert!(
+            encoded.len() < 700 * 1024,
+            "512 KiB 的 base64 必须留在帧预算内，实际 {}",
+            encoded.len()
+        );
+
+        // 顺着 offset 把尾巴读回来，拼起来要和不分片完全一致。
+        let tail = api
+            .call(
+                "demo",
+                "host/fs.read",
+                &json!({
+                    "path": "big.bin",
+                    "encoding": "base64",
+                    "offset": head["bytes"],
+                    "maxBytes": 4 * 1024 * 1024,
+                }),
+            )
+            .expect("读尾巴");
+        assert_eq!(tail["bytes"], 1024);
+        assert_eq!(tail["eof"], true);
+        assert_eq!(tail["truncated"], false);
+        let mut joined = BASE64.decode(encoded).expect("解第一片");
+        joined.extend(BASE64.decode(tail["content"].as_str().unwrap()).expect("解第二片"));
+        assert_eq!(joined, blob, "分片拼回来必须与源文件一致");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 分片写：`append` 连写三片，拼出来的字节必须和一次写完完全一致。
+    #[test]
+    fn fs_write_append_concatenates_chunks() {
+        let root = sandbox("write-append");
+        let api = api_with(&root, &["fs.write"]);
+        api.set_write_approver(StubApprover::answering(Some(WriteApproval::AllowAlways)));
+
+        // 第一片写向还不存在的文件：`created` 必须为真，指明「这次是新建」。
+        let first = api
+            .call(
+                "demo",
+                "host/fs.write",
+                &json!({ "path": "blob.bin", "content": "AAA", "append": true }),
+            )
+            .expect("append 到不存在的文件应创建");
+        assert_eq!(first["created"], true);
+        assert_eq!(first["offset"], 0, "第一片落笔在 0");
+        assert_eq!(first["size"], 3);
+
+        let second = api
+            .call(
+                "demo",
+                "host/fs.write",
+                &json!({ "path": "blob.bin", "content": "BBB", "append": true }),
+            )
+            .expect("第二片应追加");
+        assert_eq!(second["created"], false);
+        assert_eq!(second["offset"], 3, "追加起点 = 当前文件长度");
+        assert_eq!(second["size"], 6);
+
+        // base64 分片同样走 append：字节解码发生在 payload 阶段，位置语义不变。
+        let third = api
+            .call(
+                "demo",
+                "host/fs.write",
+                &json!({ "path": "blob.bin", "content": BASE64.encode("CCC"), "encoding": "base64", "append": true }),
+            )
+            .expect("第三片应追加");
+        assert_eq!(third["offset"], 6);
+        assert_eq!(third["size"], 9);
+
+        let joined = std::fs::read(root.join("blob.bin")).expect("读回拼好的文件");
+        assert_eq!(joined, b"AAABBBCCC", "分片拼接必须与整写等价");
+        assert!(temp_files(&root).is_empty(), "分片写不该留临时文件");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 定位写：`offset` 就地覆写，且能收拾半截文件（补零 / 保留尾部）。
+    #[test]
+    fn fs_write_at_offset_patches_existing_bytes() {
+        let root = sandbox("write-offset");
+        let api = api_with(&root, &["fs.write"]);
+        api.set_write_approver(StubApprover::answering(Some(WriteApproval::AllowAlways)));
+
+        api.call(
+            "demo",
+            "host/fs.write",
+            &json!({ "path": "blob.bin", "content": "abcdef" }),
+        )
+        .expect("先写一个完整文件");
+
+        // 从第 3 字节改 3 个：前半段与后半段都得原样留着。
+        let patch = api
+            .call(
+                "demo",
+                "host/fs.write",
+                &json!({ "path": "blob.bin", "content": "XYZ", "offset": 3 }),
+            )
+            .expect("定位写应成功");
+        assert_eq!(patch["offset"], 3);
+        assert_eq!(patch["size"], 6, "等长覆写不改总长");
+        assert_eq!(patch["padded"], 0);
+        assert_eq!(std::fs::read(root.join("blob.bin")).unwrap(), b"abcXYZ");
+
+        // 越过末尾：半截文件留着的洞要补零补齐，读回来的长度是可预测的。
+        let beyond = api
+            .call(
+                "demo",
+                "host/fs.write",
+                &json!({ "path": "blob.bin", "content": "Z", "offset": 10 }),
+            )
+            .expect("越过末尾应补零而不是报错");
+        assert_eq!(beyond["offset"], 10);
+        assert_eq!(beyond["padded"], 4, "第 6..10 字节是补出来的");
+        assert_eq!(beyond["size"], 11);
+        assert_eq!(
+            std::fs::read(root.join("blob.bin")).unwrap(),
+            b"abcXYZ\0\0\0\0Z",
+            "补零段必须是 0x00，尾部要保留"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 不传 `append` / `offset` 时必须还是 v1 的整文件替换：覆盖更长的旧内容后
+    /// 不能留尾巴，也不能留临时文件。
+    #[test]
+    fn fs_write_without_mode_still_replaces_whole_file() {
+        let root = sandbox("write-replace");
+        let api = api_with(&root, &["fs.write"]);
+        api.set_write_approver(StubApprover::answering(Some(WriteApproval::AllowAlways)));
+
+        api.call(
+            "demo",
+            "host/fs.write",
+            &json!({ "path": "note.txt", "content": "0123456789" }),
+        )
+        .expect("先写长内容");
+        let replaced = api
+            .call(
+                "demo",
+                "host/fs.write",
+                &json!({ "path": "note.txt", "content": "hey" }),
+            )
+            .expect("替换应成功");
+        assert_eq!(replaced["offset"], 0);
+        assert_eq!(replaced["size"], 3);
+        assert_eq!(replaced["padded"], 0);
+        assert_eq!(
+            std::fs::read_to_string(root.join("note.txt")).unwrap(),
+            "hey",
+            "替换必须把旧内容整段丢掉"
+        );
+        assert!(temp_files(&root).is_empty(), "替换不该留临时文件");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `append` 与 `offset` 互斥；类型不对也要当场拒，且不惊动审批、不落盘。
+    #[test]
+    fn write_mode_rejects_conflicting_or_malformed_params() {
+        let root = sandbox("write-mode-params");
+        let api = api_with(&root, &["fs.write"]);
+        let approver = StubApprover::answering(Some(WriteApproval::AllowOnce));
+        api.set_write_approver(approver.clone());
+
+        let both = api
+            .call(
+                "demo",
+                "host/fs.write",
+                &json!({ "path": "x.txt", "content": "x", "append": true, "offset": 1 }),
+            )
+            .expect_err("append 与 offset 互斥");
+        assert_eq!(both.code, HostApiError::INVALID_PARAMS);
+
+        let bad_append = api
+            .call(
+                "demo",
+                "host/fs.write",
+                &json!({ "path": "x.txt", "content": "x", "append": "yes" }),
+            )
+            .expect_err("append 必须是布尔");
+        assert_eq!(bad_append.code, HostApiError::INVALID_PARAMS);
+
+        let bad_offset = api
+            .call(
+                "demo",
+                "host/fs.write",
+                &json!({ "path": "x.txt", "content": "x", "offset": -3 }),
+            )
+            .expect_err("offset 必须是非负整数");
+        assert_eq!(bad_offset.code, HostApiError::INVALID_PARAMS);
+
+        assert!(approver.asked().is_empty(), "参数打架就不该问用户");
+        assert!(!root.join("x.txt").exists(), "被拒的写不该留下文件");
+
+        // 三个合法形态各自映射到对的落盘方式，缺省仍是替换。
+        assert_eq!(
+            FsHostApi::write_mode(&json!({})).expect("空参数"),
+            WriteMode::Replace
+        );
+        assert_eq!(
+            FsHostApi::write_mode(&json!({ "offset": 0 })).expect("offset 0"),
+            WriteMode::At(0),
+            "offset 0 是显式定位写，不是「没传」"
+        );
+        assert_eq!(
+            FsHostApi::write_mode(&json!({ "append": true })).expect("append"),
+            WriteMode::Append
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
