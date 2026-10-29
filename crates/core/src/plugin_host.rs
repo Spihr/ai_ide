@@ -147,6 +147,32 @@ pub enum WriteApproval {
     Reject,
 }
 
+/// 命令审批闸门的放行口径（docs/14 §8.3 的 `allow` / `approve` 两档）。
+///
+/// 分成两档不是为了措辞：审计要靠它区分「这条命令命中过免问规则、用户没被问」
+/// 与「用户这一次点了允许」。混成一档之后，「导出被批准了几次」与「用户到底
+/// 被打扰过几次」就再也对不上账。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandGate {
+    /// 命中「总是允许」规则：没打扰用户，也没有新的审批回执。
+    AllowedByRule,
+    /// 用户当次批准（`AllowOnce` / `AllowAlways`）。
+    Approved,
+}
+
+/// 命令审批未通过的两种「拒」：用户明确拒绝（`reject`）与闸门判拒（`deny`）。
+///
+/// 两者都回 3001，但对账价值完全不同：`reject` 说明用户看过并否掉了，
+/// `deny` 说明审批链压根没走到用户面前（无审批器 / 无工作区 / 超时）。
+/// 合成一种写进审计，排查时永远分不清「用户不肯」与「根本没人问」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandDenial {
+    /// 用户点了拒绝。
+    Rejected,
+    /// 审批链判拒：无审批器、无工作区、无运行时或等待超时。
+    Denied,
+}
+
 /// 一次写侧审批请求。
 ///
 /// `scope_key` 是**规范化绝对路径**（正斜杠、Windows 下统一小写），它同时是
@@ -213,6 +239,46 @@ pub fn write_scope_key(abs: &Path) -> String {
         key.to_ascii_lowercase()
     } else {
         key
+    }
+}
+
+/// 命令「总是允许」键的前缀。
+///
+/// 命令键与写侧的**文件键同池**存放（一张集合管两类免问），靠这个前缀区分：
+/// 装载和覆盖时要把两类分开处理——文件键要吃 [`write_scope_key`] 的归一，
+/// 命令键已经是拼好的成品，再归一一次会把插件名与命令名一起改坏。
+pub const COMMAND_SCOPE_PREFIX: &str = "plugin.command:";
+
+/// 命令「总是允许」的落键：`plugin.command:<plugin_id>:<command>[:<path>]`。
+///
+/// 带路径时，路径段必须与写侧同口径（[`write_scope_key`]）：docs/14 §10.2 要求
+/// 按规范化绝对路径记账。理由在插件场景下尤其硬——相对路径由插件自己给出，
+/// `a/../b` 与 `b` 指向同一个文件却拼出两个键，「总是允许」的覆盖范围就被
+/// 插件拿走了。
+pub fn command_scope_key(plugin_id: &str, command: &str, path: Option<&str>) -> String {
+    match path {
+        Some(path) => format!(
+            "{COMMAND_SCOPE_PREFIX}{plugin_id}:{command}:{}",
+            write_scope_key(Path::new(path))
+        ),
+        None => format!("{COMMAND_SCOPE_PREFIX}{plugin_id}:{command}"),
+    }
+}
+
+/// 人类可读的绝对路径：剥掉 Windows verbatim 前缀，分隔符保持原样。
+///
+/// `canonicalize` 在 Windows 上给的是 `\\?\C:\...`。它确实是绝对路径，但不该
+/// 出现在审计与审批界面里：同一目录下「带前缀」与「不带前缀」两种写法会拼出
+/// 两个免问键，用户批准过一次还会被再问一次。UNC 路径要还原成 `\\server\share`，
+/// 不能只把 `\\?\` 一剪了事。
+fn plain_abs(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) => rest.to_string(),
+        None => text.to_string(),
     }
 }
 
@@ -590,12 +656,38 @@ impl FsHostApi {
     /// 用一份完整的「总是允许」集合覆盖当前集合（装载 / 撤销后刷新用）。
     ///
     /// 覆盖而不是追加：撤销一条规则后必须能真的忘掉，追加语义做不到这一点。
+    ///
+    /// 只覆盖**文件键**，命令键（[`COMMAND_SCOPE_PREFIX`] 开头）原样保留：写侧
+    /// 装载与命令侧装载是两个独立时机，任何一边刷新都不该顺手把另一边清空——
+    /// 清空的后果是「用户已经点过总是允许，重启后又开始弹窗」。
     pub fn seed_write_always(&self, keys: Vec<String>) {
         if let Ok(mut slot) = self.write_always.write() {
-            *slot = keys
-                .into_iter()
-                .map(|key| write_scope_key(Path::new(&key)))
+            let mut next: HashSet<String> = slot
+                .iter()
+                .filter(|key| key.starts_with(COMMAND_SCOPE_PREFIX))
+                .cloned()
                 .collect();
+            next.extend(keys.into_iter().map(|key| write_scope_key(Path::new(&key))));
+            *slot = next;
+        }
+    }
+
+    /// 用一份完整的命令「总是允许」集合覆盖当前已有的命令键。
+    ///
+    /// 与 [`Self::seed_write_always`] 对称：命令键是成品（[`command_scope_key`]），
+    /// 不再过路径归一；文件键原样保留。
+    pub fn seed_command_always(&self, keys: Vec<String>) {
+        if let Ok(mut slot) = self.write_always.write() {
+            let mut next: HashSet<String> = slot
+                .iter()
+                .filter(|key| !key.starts_with(COMMAND_SCOPE_PREFIX))
+                .cloned()
+                .collect();
+            next.extend(
+                keys.into_iter()
+                    .filter(|key| key.starts_with(COMMAND_SCOPE_PREFIX)),
+            );
+            *slot = next;
         }
     }
 
@@ -993,10 +1085,15 @@ impl FsHostApi {
     }
 
     /// 命令侧路径闸门（P5 切片二）：把清单 `pathField` 指的那个入参取出来过
-    /// [`Self::resolve`]，返回展示路径。
+    /// [`Self::resolve`]，返回**规范化绝对路径**（正斜杠）。
     ///
     /// 与 `host/fs.*` 共用同一个 `resolve`——不能给命令开一条更宽的路径检查，
     /// 否则「用命令绕过 fs.write 的路径闸门」就是现成的漏洞。
+    ///
+    /// 返回值不是展示路径：它既要当「总是允许」的落键，又要进审计。docs/14 §10.2
+    /// 明确要求按**规范化绝对路径**记账——相对路径是插件可控的（`./a/../b` 与 `b`
+    /// 同一个文件），拿它当记忆键，用户「总是允许」的范围会被插件操纵。需要给人看
+    /// 的相对路径由 [`Self::display_path`] 另算。
     pub fn command_path(
         &self,
         args: &Value,
@@ -1007,7 +1104,7 @@ impl FsHostApi {
         };
         match raw {
             Value::Null => Ok(None),
-            Value::String(text) => self.resolve(text).map(|abs| Some(self.display_path(&abs))),
+            Value::String(text) => self.resolve(text).map(|abs| Some(plain_abs(&abs))),
             _ => Err(HostApiError::invalid_params(format!(
                 "{path_field} 必须是字符串路径"
             ))),
@@ -1019,6 +1116,10 @@ impl FsHostApi {
     /// 只有 `risk=write` 的命令走这里（读命令不该弹窗，否则命令面板会变成
     /// 「点一次弹一次」的灾难）。沿用写侧的「总是允许」集合，但落键换成
     /// `plugin.command:<plugin>:<command>[:<path>]`，粒度是命令而不是文件。
+    ///
+    /// 返回值区分「命中规则直接放行」与「用户当次批准」：调用方要按两种口径写
+    /// 成功审计（`allow` / `approve`，docs/14 §8.3）。失败侧一并返回 [`CommandDenial`]，
+    /// 让调用方能分开记 `reject` 与 `deny`。
     pub fn approve_command(
         &self,
         plugin_id: &str,
@@ -1026,9 +1127,9 @@ impl FsHostApi {
         command: &str,
         path: Option<&str>,
         scope_key: &str,
-    ) -> Result<(), HostApiError> {
+    ) -> Result<CommandGate, (CommandDenial, HostApiError)> {
         if self.is_write_always(scope_key) {
-            return Ok(());
+            return Ok(CommandGate::AllowedByRule);
         }
         let request = CommandApprovalRequest {
             plugin_id: plugin_id.to_string(),
@@ -1036,9 +1137,23 @@ impl FsHostApi {
             path: path.map(str::to_string),
             scope_key: scope_key.to_string(),
         };
-        let decision = self
-            .approver_snapshot()
-            .and_then(|approver| approver.decide_command(&request));
+        let approver = self.approver_snapshot();
+        // 审批链是否真的接通，事后只能靠这条日志对账：`None` 在这里等于
+        // 「命令会被判 3001，但用户根本没被问过」，排查时最容易看错的就是这一档。
+        tracing::debug!(
+            plugin_id = %plugin_id,
+            command = %command,
+            scope_key = %scope_key,
+            hooked = approver.is_some(),
+            "命令进入审批闸门"
+        );
+        let decision = approver.and_then(|approver| approver.decide_command(&request));
+        tracing::debug!(
+            plugin_id = %plugin_id,
+            command = %command,
+            decision = ?decision,
+            "命令审批有结论"
+        );
         let call_id = format!("host-{}", self.calls.fetch_add(1, Ordering::Relaxed) + 1);
         // 审计的 target 取「哪个文件」而不是「哪条命令」：命令名在 summary 里，
         // 而审批的争议点永远是「它想动我哪个文件」。没声明路径时才退回命令名。
@@ -1071,7 +1186,7 @@ impl FsHostApi {
                     &call_id,
                     DECISION_APPROVE,
                 ));
-                Ok(())
+                Ok(CommandGate::Approved)
             }
             Some(WriteApproval::AllowOnce) => {
                 self.audit(command_audit(
@@ -1083,9 +1198,10 @@ impl FsHostApi {
                     &call_id,
                     DECISION_APPROVE,
                 ));
-                Ok(())
+                Ok(CommandGate::Approved)
             }
-            Some(WriteApproval::Reject) | None => {
+            // 用户点名拒绝：他看过、也否了。
+            Some(WriteApproval::Reject) => {
                 self.audit(command_audit(
                     plugin_id,
                     method,
@@ -1095,7 +1211,26 @@ impl FsHostApi {
                     &call_id,
                     DECISION_REJECT,
                 ));
-                Err(HostApiError::tool_not_allowed(method, scope_key))
+                Err((
+                    CommandDenial::Rejected,
+                    HostApiError::tool_not_allowed(method, scope_key),
+                ))
+            }
+            // 没有审批器 / 没有工作区 / 超时：谁都没被问过，这不是 reject。
+            None => {
+                self.audit(command_audit(
+                    plugin_id,
+                    method,
+                    command,
+                    path,
+                    scope_key,
+                    &call_id,
+                    DECISION_DENY,
+                ));
+                Err((
+                    CommandDenial::Denied,
+                    HostApiError::tool_not_allowed(method, scope_key),
+                ))
             }
         }
     }

@@ -176,6 +176,19 @@ impl AgentHub {
             .unwrap_or(true)
     }
 
+    /// 取某个运行的取消旗标（没注册过这个运行就是 `None`）。
+    ///
+    /// 与 [`Self::is_stopped`] 的差别只在「查不到」的含义上：那个默认值是 `true`
+    /// （保守：不知道就等于已停），而这个如实回答「没有旗标可盯」。审批里两种
+    /// 语义都要用——**插件宿主**（`plugin-host`）的询问发生在任何运行之外，
+    /// 本来就没有 run 可注册，拿 `is_stopped` 一查就是「已停止」，审批会被秒拒，
+    /// 用户连弹窗都看不到。
+    pub fn cancelled_flag(&self, run_id: &str) -> Option<Arc<AtomicBool>> {
+        self.runs()
+            .get(run_id)
+            .map(|entry| Arc::clone(&entry.cancelled))
+    }
+
     /// 阻断全部在途运行（进程退出前调用）；返回被阻断的条数。
     pub fn cancel_all(&self) -> usize {
         let runs = self.runs();
@@ -941,6 +954,12 @@ impl PeerDecider {
 #[async_trait]
 impl Decider for PeerDecider {
     async fn decide(&self, request: &ApprovalRequest) -> Option<ApprovalReply> {
+        debug!(
+            run_id = %self.run_id,
+            tool = %request.tool,
+            path = ?request.path,
+            "审批询问进入裁决者"
+        );
         // 覆盖表先判，且**拒绝优先**：口径与协议注释一致（`deny_tools` 优先于
         // `allow_tools`）。覆盖表只作用于「本来要问一声」的调用——闸门的硬拒
         // （越界路径、敏感路径、高危命令）根本不会走到这里，翻不动。
@@ -982,11 +1001,18 @@ impl Decider for PeerDecider {
             .await;
 
         // 一边等用户点，一边盯着取消旗标：用户按「停止」之后，不该再等满超时。
+        //
+        // 没有旗标就不盯（插件宿主那条：询问发生在任何运行之外，`is_stopped`
+        // 对它会答「已停止」，照搬就是秒拒）。等不到回执仍有闸门超时兜底。
+        let cancel_flag = self.hub.cancelled_flag(&self.run_id);
         let reply = loop {
             tokio::select! {
                 reply = &mut rx => break reply.ok(),
                 _ = tokio::time::sleep(CANCEL_POLL) => {
-                    if self.hub.is_stopped(&self.run_id) {
+                    let stopped = cancel_flag
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(Ordering::SeqCst));
+                    if stopped {
                         debug!(approval_id = %approval_id, "运行已停止，审批按判拒收手");
                         break None;
                     }
@@ -1020,10 +1046,15 @@ fn approval_args(request: &ApprovalRequest) -> serde_json::Value {
 ///
 /// 判断依据是「这一步会造成什么后果」：跑命令不可预知 → 高；会改工作区内容 → 中；
 /// 只读 → 低。认不出来的工具一律按「中」——不知道的事不做乐观假设。
+///
+/// 插件两侧（`fs.write` 写盘、`fs.write.command` 命令）显式列出：它们的档位其实
+/// 与兜底同为「中」，但一旦兜底值将来变严或变松，插件审批卡片会跟着静默漂移，
+/// 而宿主侧的闸门是按清单 `risk` 判的——两边口径必须能各自独立钉住。
 fn risk_of(tool: &str) -> ApprovalRisk {
     match tool {
         "run_command" => ApprovalRisk::High,
         "write" | "edit" | "create" | "apply_diff" => ApprovalRisk::Medium,
+        "fs.write" | "fs.write.command" => ApprovalRisk::Medium,
         "read" | "list" | "grep" => ApprovalRisk::Low,
         _ => ApprovalRisk::Medium,
     }
@@ -1235,6 +1266,14 @@ mod tests {
         assert_eq!(risk_of("write"), ApprovalRisk::Medium);
         assert_eq!(risk_of("read"), ApprovalRisk::Low);
         assert_eq!(risk_of("some_future_tool"), ApprovalRisk::Medium);
+    }
+
+    /// 插件两侧的档位不靠兜底：命令审批若哪天被兜底改成「高」，卡片会从
+    /// 「写工作区」变成「跑命令」的口气，与清单 `risk=write` 对不上。
+    #[test]
+    fn plugin_approval_tools_have_pinned_severity() {
+        assert_eq!(risk_of("fs.write"), ApprovalRisk::Medium);
+        assert_eq!(risk_of("fs.write.command"), ApprovalRisk::Medium);
     }
 
     #[test]

@@ -80,7 +80,10 @@ use crate::plugin_audit::{
     self, PluginAuditRow, ACTION_CALL, ACTION_COMMAND, ACTION_GRANT, ACTION_LOAD, ACTION_RELOAD,
     ACTION_REVOKE, ACTION_UNLOAD,
 };
-use crate::plugin_host::{DECISION_ALLOW, DECISION_DENY, DECISION_ERROR};
+use crate::plugin_host::{
+    command_scope_key, CommandDenial, CommandGate, DECISION_ALLOW, DECISION_APPROVE, DECISION_DENY,
+    DECISION_ERROR, DECISION_REJECT,
+};
 use crate::session_api::store_of;
 use crate::state::AppState;
 
@@ -1627,14 +1630,6 @@ fn needs_approval(risk: PluginToolRisk) -> bool {
     matches!(risk, PluginToolRisk::Write | PluginToolRisk::Exec)
 }
 
-/// 「总是允许」的落键：命令粒度，带具体路径时再细一层。
-fn command_scope_key(plugin_id: &str, command: &str, path: Option<&str>) -> String {
-    match path {
-        Some(path) => format!("plugin.command:{plugin_id}:{command}:{path}"),
-        None => format!("plugin.command:{plugin_id}:{command}"),
-    }
-}
-
 /// 宿主闸门错误（1002 / 1003 / 3001 / -32602）原样转成协议错误。
 ///
 /// 不重新组织文案：路径与审批的文案里已经带了「哪个路径、哪个 scope」，重写一遍
@@ -1995,31 +1990,77 @@ pub async fn command(peer: &Peer, state: &AppState, req: &Request) {
     }
 
     // 闸门 ⑧：审批（3001）。只对 write / exec 弹，且「总是允许」按命令粒度记住。
+    //
+    // 这一次是否被用户当场批准，要带到成功审计里（`approve` 而不是 `allow`）：
+    // docs/14 §8.3 用 decision 区分「用户批过」与「无需打扰」。少了这个标记，
+    // 「导出被批准过几次」在审计里就永远查不出来。
+    let mut approved_by_user = false;
     if needs_approval(summary.risk) {
         let scope_key = command_scope_key(&plugin_id, &command_name, path.as_deref());
-        if let Err(err) = state.plugin_host().approve_command(
-            &plugin_id,
-            ai_ide_protocol::methods::plugin::COMMAND,
-            &command_name,
-            path.as_deref(),
-            &scope_key,
-        ) {
-            let err = host_error(err);
-            audit_command(
-                state,
-                &req.id,
-                &plugin_id,
-                &command_name,
-                DECISION_DENY,
-                CommandAuditNotes {
-                    code: Some(err.code.as_i32()),
-                    path: path.as_deref(),
-                    risk: Some(summary.risk),
-                    ..Default::default()
-                },
+        // 审批是**同步**等回执的（写侧在帧泵线程上等得起），而这里是 async 上下文。
+        // 直接阻塞 worker 会把运行时线程钉住，闸门 `handle.spawn` 出去的「问用户」
+        // 那一半就再也排不上号：现象是审批框不弹、命令干等到超时才报 3001。
+        // 所以挪到阻塞线程池上等，把 worker 空出来跑闸门任务。
+        let host = state.plugin_host().clone();
+        let gate_plugin = plugin_id.clone();
+        let gate_command = command_name.clone();
+        let gate_path = path.clone();
+        let gate_scope = scope_key.clone();
+        let gated = tokio::task::spawn_blocking(move || {
+            host.approve_command(
+                &gate_plugin,
+                ai_ide_protocol::methods::plugin::COMMAND,
+                &gate_command,
+                gate_path.as_deref(),
+                &gate_scope,
             )
-            .await;
-            return peer.respond_error(&req.id, &err).await;
+        })
+        .await;
+        let approval = match gated {
+            Ok(result) => result,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    plugin_id = %plugin_id,
+                    "命令审批任务异常结束，按拒绝处理"
+                );
+                Err((
+                    CommandDenial::Denied,
+                    ai_ide_plugin::HostApiError::new(
+                        ai_ide_plugin::HostApiError::TOOL_NOT_ALLOWED,
+                        "审批通道异常结束，命令未执行",
+                    ),
+                ))
+            }
+        };
+        match approval {
+            Ok(CommandGate::Approved) => approved_by_user = true,
+            // 命中「总是允许」：用户这次没被问，成功审计按 `allow` 记。
+            Ok(CommandGate::AllowedByRule) => {}
+            Err((denial, err)) => {
+                // 用户点了拒绝（`reject`）与审批链判拒（`deny`）分开记：合成一条，
+                // 事后就分不清「用户不肯」与「根本没人问他」。
+                let decision = match denial {
+                    CommandDenial::Rejected => DECISION_REJECT,
+                    CommandDenial::Denied => DECISION_DENY,
+                };
+                let err = host_error(err);
+                audit_command(
+                    state,
+                    &req.id,
+                    &plugin_id,
+                    &command_name,
+                    decision,
+                    CommandAuditNotes {
+                        code: Some(err.code.as_i32()),
+                        path: path.as_deref(),
+                        risk: Some(summary.risk),
+                        ..Default::default()
+                    },
+                )
+                .await;
+                return peer.respond_error(&req.id, &err).await;
+            }
         }
     }
 
@@ -2066,7 +2107,12 @@ pub async fn command(peer: &Peer, state: &AppState, req: &Request) {
         &req.id,
         &plugin_id,
         &command_name,
-        DECISION_ALLOW,
+        // 用户当次批过记 `approve`，命中「总是允许」或读命令记 `allow`。
+        if approved_by_user {
+            DECISION_APPROVE
+        } else {
+            DECISION_ALLOW
+        },
         CommandAuditNotes {
             path: path.as_deref(),
             risk: Some(summary.risk),
@@ -2556,6 +2602,7 @@ fn store_error(err: StoreError) -> ErrorObject {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin_host::write_scope_key;
     use ai_ide_plugin::{HostApi, HostApiError};
     use ai_ide_store::NewPlugin;
 
@@ -3420,7 +3467,12 @@ mod tests {
         let other = command_scope_key("demo-plugin", "deploy", Some("C:/ws/b.txt"));
         assert_ne!(file, other, "换文件必须重新审批");
         assert_ne!(file, bare, "带路径的授权不能复用到无路径的命令");
-        assert!(file.ends_with("C:/ws/a.txt"));
+        // 路径段与写侧同口径（反斜杠折正斜杠、Windows 折小写）：拿 `write_scope_key`
+        // 自己当标尺，免得断言里再抄一份大小写规则。
+        assert!(
+            file.ends_with(&write_scope_key(Path::new("C:/ws/a.txt"))),
+            "路径段必须与写侧同口径：{file}"
+        );
 
         assert_ne!(
             command_scope_key("demo-plugin", "deploy", None),

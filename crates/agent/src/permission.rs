@@ -255,6 +255,42 @@ pub enum Grant {
     Approved(ApprovalReply),
 }
 
+/// 审批没走通时的两种口径。
+///
+/// 分开的理由是审计：docs/14 §8.3 要求「用户否了」记 `reject`、「没人问 / 问不出
+/// 结果」记 `deny`。靠错误文本做字符串匹配太脆，不如在这里就把语义带出来。
+#[derive(Debug)]
+pub enum ApprovalRefusal {
+    /// 用户明确点了拒绝（`deny` / `deny_with_reason`）。
+    Denied { message: String },
+    /// 不是用户表态：裁决者缺失、超时、没给答复，或闸门自己判拒。
+    Unavailable(AgentError),
+}
+
+impl ApprovalRefusal {
+    /// 是否属于「用户看过并否了」。
+    pub fn is_user_denial(&self) -> bool {
+        matches!(self, Self::Denied { .. })
+    }
+
+    /// 折回统一的拒绝错误：`3001`，文案与原口径保持一致。
+    fn into_error(self, tool: &str) -> AgentError {
+        match self {
+            Self::Denied { message } => refused(tool, message),
+            Self::Unavailable(err) => err,
+        }
+    }
+}
+
+impl std::fmt::Display for ApprovalRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Denied { message } => f.write_str(message),
+            Self::Unavailable(err) => write!(f, "{err}"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------- 免问落盘
 
 /// 一条「总是允许」记录：**范围键 + 工具名 + 作用域**。
@@ -459,6 +495,22 @@ impl PermissionGate {
         self.ask_with_root(ctx.root, call, reason).await
     }
 
+    /// 免问范围由调用方指定的一次审批。
+    ///
+    /// 文件写侧的免问粒度是「工具 + 父目录」，[`scope_of`] 已经够用；插件命令
+    /// 侧的粒度是「插件 + 命令 + 规范化绝对路径」（docs/14 §10.2）。父目录粒度
+    /// 会把「同一目录下另一个文件」也算成已批准，所以由调用方把范围键递进来。
+    pub async fn request_approval_scoped(
+        &self,
+        root: &Path,
+        call: &ToolCall<'_>,
+        reason: impl Into<String>,
+        scope: String,
+    ) -> Result<Grant, ApprovalRefusal> {
+        self.ask_with_root_scoped(root, call, reason.into(), Some(scope))
+            .await
+    }
+
     /// [`Self::ask`] 的本体：只认工作区根，不关心调用方从哪里来。
     async fn ask_with_root(
         &self,
@@ -466,8 +518,21 @@ impl PermissionGate {
         call: &ToolCall<'_>,
         reason: String,
     ) -> Result<Grant, AgentError> {
+        self.ask_with_root_scoped(root, call, reason, None)
+            .await
+            .map_err(|refusal| refusal.into_error(call.tool_name()))
+    }
+
+    /// [`Self::ask_with_root`] 的本体；`scope` 为 `None` 时按 [`scope_of`] 现算。
+    async fn ask_with_root_scoped(
+        &self,
+        root: &Path,
+        call: &ToolCall<'_>,
+        reason: String,
+        scope: Option<String>,
+    ) -> Result<Grant, ApprovalRefusal> {
         let tool = call.tool_name();
-        let scope = scope_of(call);
+        let scope = scope.unwrap_or_else(|| scope_of(call));
 
         // `allow_always` 只在本次进程内生效：命中就免问，重启即失效。
         if self
@@ -487,28 +552,31 @@ impl PermissionGate {
         };
 
         let Some(decider) = self.decider.as_ref() else {
-            return Err(refused(
+            return Err(ApprovalRefusal::Unavailable(refused(
                 tool,
                 "没有可用的审批通道（裁决者缺失），按拒绝处理".to_string(),
-            ));
+            )));
         };
 
         let answer = match tokio::time::timeout(self.timeout, decider.decide(&request)).await {
             Ok(answer) => answer,
             Err(_) => {
-                return Err(refused(
+                return Err(ApprovalRefusal::Unavailable(refused(
                     tool,
                     format!(
                         "审批超时（{}ms 内未获答复），按拒绝处理",
                         self.timeout.as_millis()
                     ),
-                ))
+                )))
             }
         };
 
         match answer {
             // 没答复 = 没许可。
-            None => Err(refused(tool, "审批未给出答复，按拒绝处理".to_string())),
+            None => Err(ApprovalRefusal::Unavailable(refused(
+                tool,
+                "审批未给出答复，按拒绝处理".to_string(),
+            ))),
             Some(reply) => match reply.decision {
                 // 只放行这一次：不落任何记录，下次照样问。
                 ApprovalDecision::AllowOnce => Ok(Grant::Approved(reply)),
@@ -528,14 +596,15 @@ impl PermissionGate {
                     }
                     Ok(Grant::Approved(reply))
                 }
-                ApprovalDecision::Deny => Err(refused(tool, "审批被拒绝（deny）".to_string())),
+                ApprovalDecision::Deny => Err(ApprovalRefusal::Denied {
+                    message: "审批被拒绝（deny）".to_string(),
+                }),
                 // 原因原文留在错误里，回灌给模型自纠。
                 ApprovalDecision::DenyWithReason => {
                     let reason = reply.reason.as_deref().unwrap_or("未附原因");
-                    Err(refused(
-                        tool,
-                        format!("审批被拒绝（deny_with_reason）：{reason}"),
-                    ))
+                    Err(ApprovalRefusal::Denied {
+                        message: format!("审批被拒绝（deny_with_reason）：{reason}"),
+                    })
                 }
             },
         }
