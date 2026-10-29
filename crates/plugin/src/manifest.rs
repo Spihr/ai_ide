@@ -569,13 +569,14 @@ pub fn validate(root: &Path, raw: &Value) -> Result<ValidatedManifest, Vec<Viola
                 tool.name
             ));
         }
-        if let Some(field) = tool.path_field.as_deref() {
-            if field.trim().is_empty() {
-                errors.push(Violation::manifest(
-                    format!("$.tools[{index}].pathField"),
-                    "pathField 不能为空字符串",
-                ));
-            }
+        if tool.path_field.is_some() {
+            check_path_field(
+                &mut errors,
+                &format!("$.tools[{index}]"),
+                tool.path_field.as_deref(),
+                Some(&tool.parameters),
+                "parameters",
+            );
         }
     }
 
@@ -594,6 +595,16 @@ pub fn validate(root: &Path, raw: &Value) -> Result<ValidatedManifest, Vec<Viola
                 format!("$.commands[{index}].title"),
                 "title 不能为空",
             ));
+        }
+        // 命令与工具同口径：pathField 必须对得上 args 里的 string 字段。
+        if command.path_field.is_some() {
+            check_path_field(
+                &mut errors,
+                &format!("$.commands[{index}]"),
+                command.path_field.as_deref(),
+                command.args.as_ref(),
+                "args",
+            );
         }
     }
 
@@ -718,29 +729,30 @@ pub fn validate(root: &Path, raw: &Value) -> Result<ValidatedManifest, Vec<Viola
         }
         // 能力缺失只在 capabilities 形状合法时判，避免一条类型错误生出两条交叉错误；
         // 白名单不通过仍要判（见上），否则错一条能力就能把这条矛盾一起藏掉。
-        if capabilities.is_some() {
-            match tool.risk {
-                PluginToolRisk::Read => {}
-                PluginToolRisk::Write => {
-                    if !normalized_caps.iter().any(|cap| cap == "fs.write") {
-                        errors.push(Violation::manifest(
-                            format!("$.tools[{index}].risk"),
-                            format!(
-                                "工具 {} 声明 risk=write 但未申请 fs.write——清单自相矛盾",
-                                tool.name
-                            ),
-                        ));
-                    }
-                }
-                PluginToolRisk::Exec => {
+        // `exec` 例外：它压根没有落地档位，跟能力申请写得对不对无关，必须无条件拒。
+        match tool.risk {
+            PluginToolRisk::Read => {}
+            PluginToolRisk::Write => {
+                if capabilities.is_some()
+                    && !normalized_caps.iter().any(|cap| cap == "fs.write")
+                {
                     errors.push(Violation::manifest(
                         format!("$.tools[{index}].risk"),
                         format!(
-                            "工具 {} 声明 risk=exec，而宿主不提供 shell.exec：该档位无法落地",
+                            "工具 {} 声明 risk=write 但未申请 fs.write——清单自相矛盾",
                             tool.name
                         ),
                     ));
                 }
+            }
+            PluginToolRisk::Exec => {
+                errors.push(Violation::manifest(
+                    format!("$.tools[{index}].risk"),
+                    format!(
+                        "工具 {} 声明 risk=exec，而宿主不提供 shell.exec：该档位无法落地",
+                        tool.name
+                    ),
+                ));
             }
         }
     }
@@ -754,6 +766,33 @@ pub fn validate(root: &Path, raw: &Value) -> Result<ValidatedManifest, Vec<Viola
             ));
         } else {
             seen_commands.push(command.name.as_str());
+        }
+        // 命令的 risk 与能力也必须对得上：宿主按清单自报的档位决定是否弹审批，
+        // 若允许「声明 write 却不申请 fs.write」，命令就能靠回退档位绕过闸门。
+        match command.risk {
+            PluginToolRisk::Read => {}
+            PluginToolRisk::Write => {
+                if capabilities.is_some()
+                    && !normalized_caps.iter().any(|cap| cap == "fs.write")
+                {
+                    errors.push(Violation::manifest(
+                        format!("$.commands[{index}].risk"),
+                        format!(
+                            "命令 {} 声明 risk=write 但未申请 fs.write——清单自相矛盾",
+                            command.name
+                        ),
+                    ));
+                }
+            }
+            PluginToolRisk::Exec => {
+                errors.push(Violation::manifest(
+                    format!("$.commands[{index}].risk"),
+                    format!(
+                        "命令 {} 声明 risk=exec，而宿主不提供 shell.exec：该档位无法落地",
+                        command.name
+                    ),
+                ));
+            }
         }
     }
 
@@ -1248,7 +1287,7 @@ fn parse_commands(obj: &Map<String, Value>, errors: &mut Vec<Violation>) -> Vec<
 
         // 命令与工具同一套 risk 口径：`write` 会在执行前弹审批（3001）。
         // 命令没有 `exec` 档位——宿主不提供 `shell.exec`，写 `exec` 的命令
-        // 无法落地，语义校验阶段会把它当矛盾报出来（见 `validate` 的语义段）。
+        // 无法落地，交叉校验阶段会无条件把它当清单错误报出来（见 `validate` 第三段）。
         let Some(risk) = parse_risk(command, &base, errors) else {
             continue;
         };
@@ -1292,6 +1331,72 @@ fn parse_commands(obj: &Map<String, Value>, errors: &mut Vec<Violation>) -> Vec<
         });
     }
     commands
+}
+
+/// `pathField` 与入参 schema 的对应关系（工具与命令同一套口径）。
+///
+/// 路径闸门在宿主里靠「按这个名字从入参里取值」定位目标文件：名字写错，
+/// 或声明了却是个 number，闸门既取不到路径也无法规范化，只能退化成
+/// 「看不见路径的写」——这正是 §8 要堵的静默降级，所以必须在安装期就拒。
+///
+/// `schema_label` 只影响报错文案：工具侧是 `parameters`，命令侧是 `args`。
+fn check_path_field(
+    errors: &mut Vec<Violation>,
+    base: &str,
+    declared: Option<&str>,
+    schema: Option<&Value>,
+    schema_label: &str,
+) {
+    let Some(field) = declared else {
+        return;
+    };
+    let path = format!("{base}.pathField");
+    if field.trim().is_empty() {
+        errors.push(Violation::manifest(path, "pathField 不能为空字符串"));
+        return;
+    }
+    // 命令的 `args` 是可选的：声明了 pathField 却没给入参 schema、
+    // 或给的 schema 被形状段判掉，都意味着闸门取不到这个字段。
+    let Some(Value::Object(schema)) = schema else {
+        errors.push(Violation::manifest(
+            path,
+            format!(
+                "声明了 pathField = {field}，但缺少 {schema_label}.properties —— 闸门取不到该路径参数"
+            ),
+        ));
+        return;
+    };
+    let Some(property) = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get(field))
+    else {
+        errors.push(Violation::manifest(
+            path,
+            format!("pathField = {field} 不在 {schema_label}.properties 中 —— 闸门取不到该路径参数"),
+        ));
+        return;
+    };
+    let Value::Object(property) = property else {
+        errors.push(Violation::manifest(
+            path,
+            format!("{schema_label}.properties.{field} 必须是对象（JSON Schema 子集）"),
+        ));
+        return;
+    };
+    // 只认 `type: "string"`：`type` 缺省或写成 `["string","null"]` 都不放行，
+    // 宁可让作者补一个明确的 string，也不要在闸门里做隐式兼容。
+    if property.get("type").and_then(Value::as_str) != Some("string") {
+        errors.push(Violation::manifest(
+            path,
+            format!(
+                "pathField = {field} 的入参类型必须是 string，收到 {}",
+                property
+                    .get("type")
+                    .map_or_else(|| "未声明 type".to_string(), |ty| format!("{ty}"))
+            ),
+        ));
+    }
 }
 
 /// 视图声明的形状解析（docs/24 §4.1）。
@@ -1584,7 +1689,10 @@ mod tests {
                     "description": "写笔记",
                     "risk": "write",
                     "pathField": "path",
-                    "parameters": { "type": "object", "properties": {} }
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "path": { "type": "string" } }
+                    }
                 }
             ],
             "commands": [{ "id": "greet", "title": "打个招呼" }],
@@ -1686,6 +1794,130 @@ mod tests {
         assert!(errors
             .iter()
             .all(|error| error.code == ErrorCode::PLUGIN_MANIFEST_INVALID));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 命令没有 `exec` 档位：声明了就在安装期硬拒，而不是回退成 read 静默放行。
+    #[test]
+    fn command_exec_risk_is_rejected_at_install() {
+        let root = temp_package("cmd-exec");
+        let mut raw = legal_manifest();
+        raw["commands"] = json!([
+            { "name": "greet", "title": "打个招呼" },
+            { "name": "run_shell", "title": "起进程", "risk": "exec" }
+        ]);
+        let errors = validate(&root, &raw).expect_err("exec 命令必须拒装");
+        let paths: Vec<&str> = errors.iter().map(|error| error.path.as_str()).collect();
+        assert!(
+            paths.contains(&"$.commands[1].risk"),
+            "exec 命令未报出：{paths:?}"
+        );
+        assert!(
+            errors.iter().any(|error| {
+                error.path == "$.commands[1].risk" && error.message.contains("shell.exec")
+            }),
+            "报错文案应点明宿主不提供 shell.exec：{errors:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 命令的 `risk=write` 必须与 `fs.write` 成对：缺了就是清单自相矛盾。
+    #[test]
+    fn command_write_requires_fs_write_capability() {
+        let root = temp_package("cmd-write");
+        let mut raw = legal_manifest();
+        raw["capabilities"] = json!(["fs.read"]);
+        raw["commands"] = json!([
+            { "name": "greet", "title": "打个招呼" },
+            { "name": "save_all", "title": "全部保存", "risk": "write" }
+        ]);
+        let errors = validate(&root, &raw).expect_err("write 命令缺 fs.write 必须拒装");
+        let paths: Vec<&str> = errors.iter().map(|error| error.path.as_str()).collect();
+        assert!(
+            paths.contains(&"$.commands[1].risk"),
+            "命令 risk 与能力矛盾未报出：{paths:?}"
+        );
+
+        // 补上 fs.write 就该过——同一条命令不该因为别的原因再红。
+        raw["capabilities"] = json!(["fs.read", "fs.write"]);
+        validate(&root, &raw).expect("申请 fs.write 后 write 命令应通过");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `pathField` 必须真的指向 `args.properties` 里的 string 字段。
+    #[test]
+    fn command_path_field_must_match_args_schema() {
+        let root = temp_package("cmd-path");
+
+        // ① 字段不在 properties 里：闸门取不到路径。
+        let mut missing = legal_manifest();
+        missing["commands"] = json!([{
+            "name": "open", "title": "打开", "risk": "read", "pathField": "path",
+            "args": { "type": "object", "properties": { "target": { "type": "string" } } }
+        }]);
+        let errors = validate(&root, &missing).expect_err("pathField 指向不存在的字段必须拒装");
+        assert!(
+            errors.iter().any(|error| error.path == "$.commands[0].pathField"),
+            "字段不存在未报出：{errors:?}"
+        );
+
+        // ② 字段在，但类型不是 string。
+        let mut wrong_type = legal_manifest();
+        wrong_type["commands"] = json!([{
+            "name": "open", "title": "打开", "risk": "read", "pathField": "path",
+            "args": { "type": "object", "properties": { "path": { "type": "integer" } } }
+        }]);
+        let errors = validate(&root, &wrong_type).expect_err("pathField 类型不是 string 必须拒装");
+        assert!(
+            errors.iter().any(|error| {
+                error.path == "$.commands[0].pathField" && error.message.contains("string")
+            }),
+            "类型错误未报出：{errors:?}"
+        );
+
+        // ③ 声明了 pathField 却完全没给 args。
+        let mut no_args = legal_manifest();
+        no_args["commands"] = json!([{
+            "name": "open", "title": "打开", "risk": "read", "pathField": "path"
+        }]);
+        let errors = validate(&root, &no_args).expect_err("有 pathField 无 args 必须拒装");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.path == "$.commands[0].pathField"),
+            "缺 args 未报出：{errors:?}"
+        );
+
+        // ④ 对得上就放行，且解析结果能原样带出。
+        let mut ok = legal_manifest();
+        ok["commands"] = json!([{
+            "name": "open", "title": "打开", "risk": "read", "pathField": "path",
+            "args": { "type": "object", "properties": { "path": { "type": "string" } } }
+        }]);
+        let validated = validate(&root, &ok).expect("pathField 合法应通过");
+        assert_eq!(
+            validated.manifest.commands[0].path_field.as_deref(),
+            Some("path")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 工具侧同一条口径：`pathField` 也必须落在 `parameters.properties` 且为 string。
+    #[test]
+    fn tool_path_field_must_match_parameters_schema() {
+        let root = temp_package("tool-path");
+        let mut raw = legal_manifest();
+        raw["tools"][1]["parameters"] = json!({
+            "type": "object",
+            "properties": { "path": { "type": "integer" } }
+        });
+        let errors = validate(&root, &raw).expect_err("工具 pathField 类型不符必须拒装");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.path == "$.tools[1].pathField"),
+            "工具侧 pathField 未校验：{errors:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
