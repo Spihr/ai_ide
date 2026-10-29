@@ -943,11 +943,15 @@ function PluginViewSection({ detail }: { detail: PluginStatusResult }): React.JS
  *
  * `3001` 是**正常路径**：`risk=write` 的插件命令执行前要过审批，视图里的按钮
  * 只是发起方，不是审批人。这一条不翻译成「插件坏了」。
+ *
+ * 审批卡已经是常驻浮层（`ApprovalOverlay`），所以用户看到 3001 的真实原因只剩
+ * 一种：卡弹出来过、没人理，闸门超时按拒绝处理。文案要把人引到「再点一次」上，
+ * 而不是让他去找一个不存在的入口——重试时卡会重新弹。
  */
 function describeActionError(error: unknown): string {
   const text = error instanceof Error ? error.message : String(error)
   if (text.includes('3001') || text.includes('未被放行')) {
-    return '这条命令需要审批才能执行：视图里的按钮只负责发起，审批入口在命令面板里（下一步接入）。'
+    return '这条命令需要审批才能执行，而审批卡已经超时关闭（超时按拒绝处理，命令没有执行）。再点一次按钮即可重新发起，届时窗口中央会弹出审批卡。'
   }
   return text.trim() === '' ? '命令执行失败（内核未给原因）。' : text
 }

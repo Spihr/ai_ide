@@ -17,7 +17,7 @@ import { useState } from 'react'
 import type { AgentMode, AgentRunStatus } from '@ai-ide/shared-types'
 
 import { useAi } from '../ai-store'
-import { decideApproval, startRun, stopRun, useAgent } from '../agent-store'
+import { decideApproval, runApprovals, startRun, stopRun, useAgent } from '../agent-store'
 import { ApprovalCard } from './ApprovalCard'
 
 const OUTCOME_TEXT: Record<AgentRunStatus, string> = {
@@ -142,13 +142,13 @@ export function AgentPanel(): React.JSX.Element {
         ))
       )}
 
-      {agent.approvals.length > 0 ? (
+      {runApprovals(agent).length > 0 ? (
         <h4 className="ai-section__subtitle" data-testid="agent-approval-count">
-          待裁决 {agent.approvals.length} 项
+          待裁决 {runApprovals(agent).length} 项
         </h4>
       ) : null}
 
-      {agent.approvals.map((approval) => (
+      {runApprovals(agent).map((approval) => (
         <ApprovalCard
           key={approval.approvalId}
           approval={approval}

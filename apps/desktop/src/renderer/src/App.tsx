@@ -5,6 +5,7 @@ import { useEffect, useState } from 'react'
 import type { CoreStatus } from '../../shared/ipc'
 import { disposeAi, initAi } from './ai-store'
 import { ActivityBar } from './components/ActivityBar'
+import { ApprovalOverlay } from './components/ApprovalOverlay'
 import { AiPanel } from './components/AiPanel'
 import { CheckpointPanel } from './components/CheckpointPanel'
 import { CodeEditor } from './components/CodeEditor'
@@ -268,6 +269,13 @@ export function App() {
 
       {/* P5：全局命令面板是浮层，放在 body 之外、notice 之前——浮层要压住所有面板。 */}
       <CommandPalette />
+
+      {/*
+        P5 切片二：运行之外的审批浮层（插件命令 / 插件写盘）。必须排在命令面板
+        **之后**，z-index 也更高——最常见的路径就是「在命令面板里回车」，那张卡
+        得压住面板本身，否则用户看不见它、命令只会等到超时。
+      */}
+      <ApprovalOverlay />
 
       {/* 切片二：Ctrl+T 的「转到符号」浮层，与命令面板同一个层级、同样的遮罩。 */}
       <SymbolPicker />

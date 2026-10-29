@@ -27,10 +27,13 @@ import {
 import type { AiEvent, AiIdeApi } from '../../shared/ipc'
 import { handleAiEvent } from './ai-store'
 import {
+  PLUGIN_HOST_RUN_ID,
   decideApproval,
   getAgentState,
   handleAgentEvent,
+  hostApprovals,
   resetAgentState,
+  runApprovals,
   startRun,
   stopRun,
   type AgentApproval,
@@ -360,6 +363,36 @@ describe('agent-store · 权限审批', () => {
 
     expect(getAgentState().runs).toHaveLength(0)
     expect(getAgentState().approvals.map((item) => item.approvalId)).toEqual(['ap-x'])
+  })
+
+  it('宿主通道（plugin-host）的询问入列，且只归浮层、不进 Agent 面板', () => {
+    // 插件命令与插件写盘都挂在这个固定 run_id 下——它不是一次 agent 运行。
+    handleAgentEvent({
+      method: Methods.event.agentApprovalRequired,
+      params: approvalEvent({ run_id: PLUGIN_HOST_RUN_ID, approval_id: 'ap-host', risk: 'high' })
+    })
+    handleAgentEvent({ method: Methods.event.agentApprovalRequired, params: approvalEvent() })
+
+    const current = getAgentState()
+    // 两条都在列里：漏掉任何一条，就意味着那一声询问没人渲染、命令等到超时。
+    expect(current.approvals.map((item) => item.approvalId)).toEqual(['ap-host', 'ap-1'])
+    // 但渲染分工互斥：同一条询问只能出现一次，否则用户会对同一件事裁决两遍。
+    expect(hostApprovals(current).map((item) => item.approvalId)).toEqual(['ap-host'])
+    expect(runApprovals(current).map((item) => item.approvalId)).toEqual(['ap-1'])
+  })
+
+  it('宿主询问的裁决走同一条 agent.decide，回执按 approval_id 派发', async () => {
+    handleAgentEvent({
+      method: Methods.event.agentApprovalRequired,
+      params: approvalEvent({ run_id: PLUGIN_HOST_RUN_ID, approval_id: 'ap-host' })
+    })
+
+    const ok = await decideApproval('ap-host', 'allow_once')
+
+    expect(ok).toBe(true)
+    expect(callAt().method).toBe(Methods.agent.decide)
+    expect(callAt().params).toMatchObject({ approval_id: 'ap-host', decision: 'allow_once' })
+    expect(getAgentState().approvals).toHaveLength(0)
   })
 
   it('裁决提交成功后出列，参数按面板选择', async () => {

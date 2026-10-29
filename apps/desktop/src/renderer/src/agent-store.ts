@@ -78,6 +78,20 @@ export interface AgentApproval {
   error: string | null
 }
 
+/**
+ * 插件宿主那条审批通道的固定 `run_id`。
+ *
+ * 与内核 `crates/core/src/agent_api.rs` 的 `PLUGIN_HOST_RUN_ID` 逐字一致。插件写盘
+ * （`fs.write`）与 `risk=write` 的插件命令都发生在**任何一次 agent 运行之外**，
+ * 没有真正的 run 可归属，内核就用这个名字记账，回执仍按 `approval_id` 派发。
+ *
+ * 外壳据此把询问分成两类：属于某次运行的交给 Agent 面板，属于这里的交给常驻的
+ * 审批浮层。少了这一刀，用户从命令面板执行导出命令时那张卡只会出现在 Agent 面板
+ * 里——而面板此刻正被命令面板的遮罩挡着，用户只看到命令一直不返回，最后等来一个
+ * 3001。这不是「插件坏了」，是没人看见的那一声询问超时了。
+ */
+export const PLUGIN_HOST_RUN_ID = 'plugin-host'
+
 /** 一次 Agent 运行的视图。 */
 export interface AgentRun {
   runId: string
@@ -127,6 +141,22 @@ export function subscribeAgent(listener: () => void): () => void {
 
 export function useAgent(): AgentState {
   return useSyncExternalStore(subscribeAgent, getAgentState, getAgentState)
+}
+
+/**
+ * 属于某次 agent 运行的询问（Agent 面板渲染这些）。
+ *
+ * 面板只该管「我正在跑的这一轮要问你什么」。把宿主的询问一起塞进去，会在同一个
+ * 屏幕上出现两张卡（面板一张、浮层一张），用户对同一件事裁决两次，第二次必然
+ * 报错——所以这里是**互斥**的切分，不是「面板多显示一点」。
+ */
+export function runApprovals(current: AgentState = state): AgentApproval[] {
+  return current.approvals.filter((item) => item.runId !== PLUGIN_HOST_RUN_ID)
+}
+
+/** 运行之外的询问（插件命令 / 插件写盘），由常驻审批浮层渲染。 */
+export function hostApprovals(current: AgentState = state): AgentApproval[] {
+  return current.approvals.filter((item) => item.runId === PLUGIN_HOST_RUN_ID)
 }
 
 /** 单测与「重启内核后重连」时重置。 */

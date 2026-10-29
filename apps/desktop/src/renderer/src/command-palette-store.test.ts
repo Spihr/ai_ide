@@ -261,7 +261,9 @@ describe('执行分发', () => {
       { code: 6102, expect: '插件没在运行' },
       { code: 6103, expect: '缺少这条命令所需的能力' },
       { code: 6106, expect: '没有在清单里声明' },
-      { code: 3001, expect: '拒绝了这次写操作的审批' },
+      // 3001 既可能是「点了拒绝」，也可能是「卡弹出后无人处理、闸门超时」；
+      // 断言钉在「需要审批 + 命令没执行」这个共同事实上，别把超时说成用户拒绝。
+      { code: 3001, expect: '这次操作需要审批，而审批没通过' },
       { code: 6109, expect: '过于频繁' }
     ]
 
@@ -301,7 +303,9 @@ describe('执行分发', () => {
       risk: 'write'
     })
     expect(getPaletteState().open).toBe(true)
-    expect(getEditorState().notice?.text).toContain('拒绝了这次写操作的审批')
+    // 3001 之后面板必须原地可用：用户重试一次，审批卡才会重新弹出来。
+    expect(getEditorState().notice?.text).toContain('这次操作需要审批')
+    expect(getEditorState().notice?.text).toContain('再执行一次')
   })
 
   it('没有插件标识的行不会发请求，只提示', async () => {
