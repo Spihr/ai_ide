@@ -8,7 +8,7 @@
 
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import type { ChildProcess } from 'node:child_process'
 import { afterEach, describe, expect, it } from 'vitest'
 
@@ -262,6 +262,42 @@ describe('ViewportHost.spawnViewport', () => {
     const spawnOptions = call?.options as { cwd: string; stdio: string }
     expect(spawnOptions.cwd).toBe(dir)
     expect(spawnOptions.stdio).toBe('ignore')
+  })
+
+  it('有 workspaceRoot 时补 --workspace，值就是工作区根', async () => {
+    const dir = makeInstallDir()
+    touch(join(dir, 'asset3d-gui.exe'))
+    const workspace = makeInstallDir()
+    const { host, calls } = harness()
+    const result = await host.spawnViewport({ ...viewportInput(dir), workspaceRoot: workspace })
+
+    const [call] = calls
+    // 顺序钉死 `--pipe` 在前：视口按 argv 顺序解析，多一个参数不该挪动既有那对。
+    expect(call?.args).toEqual(['--pipe', result.pipeName, '--workspace', resolve(workspace)])
+    expect(result.reused).toBe(false)
+  })
+
+  it('workspaceRoot 不存在时不加 --workspace', async () => {
+    const dir = makeInstallDir()
+    touch(join(dir, 'asset3d-gui.exe'))
+    const { host, calls } = harness()
+    const result = await host.spawnViewport({
+      ...viewportInput(dir),
+      workspaceRoot: join(dir, 'not-created-yet')
+    })
+
+    // 路径没了只是「少一个默认目录」，不该连累用户打不开视口。
+    expect(calls[0]?.args).toEqual(['--pipe', result.pipeName])
+  })
+
+  it('workspaceRoot 是文件时不加 --workspace', async () => {
+    const dir = makeInstallDir()
+    touch(join(dir, 'asset3d-gui.exe'))
+    const notADirectory = touch(join(dir, 'workspace.txt'), 'x')
+    const { host, calls } = harness()
+    const result = await host.spawnViewport({ ...viewportInput(dir), workspaceRoot: notADirectory })
+
+    expect(calls[0]?.args).toEqual(['--pipe', result.pipeName])
   })
 
   it('管道连不上时报 pipe_timeout 而不是静默成功', async () => {

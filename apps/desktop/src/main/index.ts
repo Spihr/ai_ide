@@ -12,7 +12,12 @@
 import { app, BrowserWindow, dialog, ipcMain, safeStorage } from 'electron'
 import { dirname, join } from 'node:path'
 
-import { Methods, type HelloResult, type PluginStatusResult } from '@ai-ide/shared-types'
+import {
+  Methods,
+  type HelloResult,
+  type PluginStatusResult,
+  type WorkspaceOpenResult
+} from '@ai-ide/shared-types'
 import { createCoreLogSink, type CoreLogSink } from './core-log-file'
 import { CoreRpcError, CoreSupervisor } from './core-supervisor'
 import { CredentialVault } from './credentials'
@@ -57,6 +62,44 @@ let vault: CredentialVault | null = null
  * 懒建：单测与「只看不打开视口」的场景不该因为模块里有 `new` 就多一份状态。
  */
 let viewportHost: ViewportHost | null = null
+
+/**
+ * 主进程自己掌握的已打开工作区：`workspace_id → 根目录绝对路径`，按打开顺序排列。
+ *
+ * 为什么要在这里再存一份：渲染进程虽然知道当前工作区，但视口的默认目录**不能**
+ * 由渲染进程递路径（那等于让网页内容决定视口去读哪个目录）。根目录只从内核
+ * 的回包（`workspace.open` 的 `root`）里取，内核才是那份状态的权威。
+ */
+const openWorkspaceRoots = new Map<string, string>()
+
+/** 把 `workspace.open` / `workspace.close` 的结果同步进 {@link openWorkspaceRoots}。 */
+function trackWorkspaceRoot(method: string, params: unknown, result: unknown): void {
+  if (method === Methods.workspace.open) {
+    const opened = result as Partial<WorkspaceOpenResult> | null | undefined
+    const id = opened?.workspace_id
+    const root = opened?.root
+    if (typeof id === 'string' && id.length > 0 && typeof root === 'string' && root.trim().length > 0) {
+      openWorkspaceRoots.set(id, root)
+    }
+    return
+  }
+  if (method === Methods.workspace.close) {
+    const closed = (params as { workspace_id?: unknown } | null | undefined)?.workspace_id
+    if (typeof closed === 'string' && closed.length > 0) openWorkspaceRoots.delete(closed)
+  }
+}
+
+/**
+ * 当前活动工作区根。
+ *
+ * 取最后打开且仍打开的那个：内核的「活动工作区」也是这个语义（`workspace.close`
+ * 关掉当前的之后回落到上一个），这里不额外发 RPC 去问，省一次跨进程往返。
+ */
+function activeWorkspaceRoot(): string | undefined {
+  let root: string | undefined
+  for (const value of openWorkspaceRoots.values()) root = value
+  return root
+}
 
 let currentStatus: CoreStatus = {
   state: 'idle',
@@ -271,6 +314,10 @@ async function startCore(): Promise<CoreStatus> {
     await supervisor.stop(false).catch(() => undefined)
     supervisor = null
   }
+  // 内核一重启，工作区状态就没了（它在内存里）：不清掉这份镜像，视口会拿到
+  // 一个「内核并不认、但磁盘上还在」的目录当默认位置。等用户重新打开工作区
+  // 时再由 `workspace.open` 的回包填回来。
+  openWorkspaceRoots.clear()
 
   setStatus({
     state: 'starting',
@@ -442,6 +489,10 @@ function toRendererError(method: string, error: unknown): unknown {
  *
  * 渲染侧只递 `pluginId + viewId`，因此「渲染进程被攻破」最多能让用户重复点开
  * 自己已经装过的插件窗口，变不成「拿 IDE 当启动器执行任意 exe」。
+ *
+ * 工作区根（`--workspace`）走同一条原则：只取主进程记录里的那一份（来源是
+ * `workspace.open` 的回包），渲染侧递不进路径；取不到就不带这个参数，视口
+ * 退回自己的兜底目录。
  */
 async function spawnExternalViewport(
   pluginId: unknown,
@@ -475,7 +526,10 @@ async function spawnExternalViewport(
       // 「请重新安装插件」，比按 `<data_dir>/plugins/<id>` 猜错目录安全。
       installDir: status.plugin.install_dir ?? '',
       program: view.external.program,
-      protocol: view.external.protocol
+      protocol: view.external.protocol,
+      // 工作区根是「让视口的目录按钮 / 导入对话框默认落在 IDE 当前工作区」的
+      // 那一份取值：取自上面主进程自己记的内核回包，渲染进程碰不到这条路径。
+      workspaceRoot: activeWorkspaceRoot()
     })
     return { reused: spawned.reused }
   } catch (error) {
@@ -551,6 +605,9 @@ function registerIpc(): void {
           .catch(() => false)
         broadcastCredentialStatus()
       }
+
+      // 工作区根顺手记一份（只认内核回包，不认渲染进程传进来的路径）。
+      trackWorkspaceRoot(method, params, result)
 
       return result
     }

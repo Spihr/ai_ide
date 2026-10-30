@@ -209,6 +209,39 @@ export interface SpawnViewportInput {
   program: string
   /** 清单里的 `external.protocol`。 */
   protocol: string
+  /**
+   * 当前 IDE 工作区根（`--workspace` 的取值）。
+   *
+   * 来源同样是主进程自己掌握的那一份（`workspace.open` 的结果），不接受渲染
+   * 进程递进来的绝对路径：视口会拿它当「目录」按钮与导入对话框的默认位置，
+   * 一个可被渲染进程任意指定的路径等于把「默认落在哪」交给网页内容决定。
+   *
+   * 可选：没有打开工作区时前端就不传，视口按自己的兜底逻辑走。
+   */
+  workspaceRoot?: string
+}
+
+/**
+ * 校验并规整 `--workspace` 的取值；不合法时返回 `null`。
+ *
+ * 这里**不抛错**：工作区根只是「让对话框默认落在哪」的锦上添花，路径没了
+ * （用户刚删了目录、网络盘掉线）不该连累用户打不开视口——少一个默认位置，
+ * 视口自己会退回它的兜底目录。
+ */
+export function resolveViewportWorkspaceRoot(value: string | undefined): string | null {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (trimmed.length === 0 || trimmed.includes('\0')) return null
+  // 视口按「绝对路径」理解这个参数，相对路径会在它自己的工作目录下被解析出
+  // 完全不同的目录，与其让它猜，不如不带。
+  if (!isAbsolute(trimmed)) return null
+  const normalized = resolve(trimmed)
+  try {
+    if (!statSync(normalized).isDirectory()) return null
+  } catch {
+    return null
+  }
+  return normalized
 }
 
 export interface SpawnViewportResult {
@@ -339,8 +372,13 @@ export class ViewportHost {
     const pipeName = buildViewportPipeName(input.pluginId)
 
     let child: ChildProcess
+    // `--workspace` 只在主进程侧校验通过时才拼进去：视口拿它当「目录」按钮与
+    // 导入对话框的默认位置，缺省时视口退回自己的兜底目录，不需要外壳替它猜。
+    const workspaceRoot = resolveViewportWorkspaceRoot(input.workspaceRoot)
+    const args = ['--pipe', pipeName]
+    if (workspaceRoot) args.push('--workspace', workspaceRoot)
     try {
-      child = this.spawnFn(program, ['--pipe', pipeName], {
+      child = this.spawnFn(program, args, {
         cwd: input.installDir,
         // `ignore` 而不是 `inherit`：视口的 stdout/stderr 一旦接上父进程，
         // 打包后的 Windows GUI 应用会拿到一份无用的控制台句柄。
